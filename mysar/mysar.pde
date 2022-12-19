@@ -9,12 +9,13 @@
  * Click the mouse to add a new boid.
  */
 
-int NUM_BOIDS = 150;
+int NUM_BOIDS = 100;
+int BACKGROUND_COLOUR = 0;
 
 Flock flock;
 
 void setup() {
-  size(640, 360); //<>//
+  size(1000, 500); //<>//
   flock = new Flock();
   // Add an initial set of boids into the system
   for (int i = 0; i < NUM_BOIDS; i++) {
@@ -23,7 +24,9 @@ void setup() {
 }
 
 void draw() {
-  background(50);
+  background(BACKGROUND_COLOUR);
+  noFill();
+  circle(width/2, height/2, height);
   flock.run();
 }
 

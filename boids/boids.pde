@@ -15,11 +15,11 @@ int BACKGROUND_COLOUR = 0;
 Flock flock;
 
 void setup() {
-  size(1000, 500); //<>//
+  size(1000, 500);
   flock = new Flock();
   // Add an initial set of boids into the system
   for (int i = 0; i < NUM_BOIDS; i++) {
-    flock.addBoid(new Boid(width/2,height/2));
+    flock.addBoid(new Boid(random(0, width), random(0, height)));
   }
 }
 

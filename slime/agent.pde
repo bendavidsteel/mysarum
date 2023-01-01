@@ -2,62 +2,99 @@
 int BOID_COLOUR = 255;
 float BOID_SIZE = 2.0;
 
+enum AgentSpawn {
+  RANDOM,
+  CENTRE,
+}
+
+
 public class Agent
 {
   PVector Position;
+  float Angle;
+  float[] SpeciesMask;
+  int SpeciesIndex;
   
-  public Agent()
+  public Agent(int species, int numSpecies, int mapHeight, int mapWidth, AgentSpawn spawnStrategy)
   {
-    RandomizePosition();
-  }
-  
-  void RandomizePosition()
-  {
-    Position = new PVector(random(0, width), random(0, height));
-  }
-  
-  void EnsureInBounds()
-  {
-    if ((Position.x < 0) || (Position.x > width) || (Position.y < 0) || (Position.y > height))
+    Spawn(mapHeight, mapWidth, spawnStrategy);
+    SpeciesIndex = species;
+    SpeciesMask = new float[numSpecies];
+    for (int i = 0; i < numSpecies; i++)
     {
-      RandomizePosition();
+      if (species == i)
+      {
+        SpeciesMask[i] = 1.0;
+      }
+      else
+      {
+        SpeciesMask[i] = 0.0;
+      }
     }
   }
   
-  int RandInt(int NumAgents)
+  void Spawn(int mapHeight, int mapWidth, AgentSpawn spawnStrategy)
   {
-    return (int)(Math.floor(Math.random()*(double)NumAgents));
+    if (spawnStrategy == AgentSpawn.RANDOM)
+    {
+      Position = new PVector(random(0, mapWidth), random(0, mapHeight));
+    }
+    else if (spawnStrategy == AgentSpawn.CENTRE)
+    {
+      Position = new PVector(mapWidth / 2, mapHeight / 2);
+    }
+    Angle = random(0.0, 2 * (float) Math.PI);
   }
   
-  void ReweightPosition(int NumAgents, double p, PVector vb, PVector vc, Agent Agents[], PVector weight[], PVector bestPositions)
+  void EnsureRebound(int mapHeight, int mapWidth)
   {
-    r=Math.random(); 
-    A=RandInt(NumAgents); 
-    B=RandInt(NumAgents);  
-    if(r<p)
+    PVector velocity = GetVelocity();
+    PVector normal = new PVector();
+    boolean rebound = false;
+    if (Position.x < 0)
     {
-      Position.x=bestPositions.x+vb.x*(weight[i].x*Agents[A].Position.x-Agents[B].Position.x);
-      Position.y=bestPositions.y+vb.y*(weight[i].y*Agents[A].Position.y-Agents[B].Position.y);  
+      normal = new PVector(1, 0);
+      rebound = true;
     }
-    else
+    if (Position.x >= mapWidth)
     {
-      Position.x=vc.x*Position.x;
-      Position.y=vc.y*Position.y;
+      normal = new PVector(-1, 0);
+      rebound = true;
+    }
+    if (Position.y < 0)
+    {
+      normal = new PVector(0, 1);
+      rebound = true;
+    }
+    if (Position.y >= mapHeight)
+    {
+      normal = new PVector(0, -1);
+      rebound = true;
+    }
+    
+    if (rebound)
+    {
+      PVector newVelocity = PVector.sub(velocity, PVector.mult(normal, 2 * PVector.dot(velocity, normal)));
+      float newAngle = atan2(newVelocity.y, newVelocity.x);
+      Rebound(mapHeight, mapWidth, newAngle);
     }
   }
   
-  void Render()
+  void Rebound(int mapHeight, int mapWidth, float randomAngle)
   {
-    fill(200, 100);
-    stroke(BOID_COLOUR);
-    fill(BOID_COLOUR);
-    pushMatrix();
-    translate(Position.x, Position.y);
-    beginShape(TRIANGLES);
-    vertex(0, -BOID_SIZE);
-    vertex(-BOID_SIZE, BOID_SIZE);
-    vertex(BOID_SIZE, BOID_SIZE);
-    endShape();
-    popMatrix();
+    Position.x = min(mapWidth-1, max(0, Position.x));
+    Position.y = min(mapHeight-1, max(0, Position.y));
+    Angle = randomAngle;
+  }
+  
+  PVector GetVelocity()
+  {
+    return new PVector(cos(Angle), sin(Angle));
+  }
+  
+  void UpdatePosition(float deltaTime, float moveSpeed)
+  {
+    PVector direction = GetVelocity();
+    Position = PVector.add(Position, PVector.mult(direction, deltaTime * moveSpeed));
   }
 }

@@ -4,7 +4,7 @@ public class Moulds
   Mould[] SpeciesSettings;
   int NumSpecies;
   
-  Agent[] Agents;
+  ArrayList<Agent> Agents;
   int NumAgents;
   
   int PixelScale;
@@ -15,15 +15,16 @@ public class Moulds
   
   float DeltaTime;
   
-  float TrailWeight;
   float DecayRate;
   float DiffuseRate;
+  float DeathRate;
   
   public Moulds(int NumAgents, int PixelScale)
   {
     this.NumAgents = NumAgents;
-    TrailWeight = 5;
+    int trailWeight = 5;
     DecayRate = 0.999;
+    DeathRate = 1.0;
     DiffuseRate = 0.01;
     DeltaTime = 1.0;
     
@@ -31,23 +32,40 @@ public class Moulds
     MapWidth = width / PixelScale;
     MapHeight = height / PixelScale;
     
-    NumSpecies = 1;
+    NumSpecies = 3;
     SpeciesSettings = new Mould[NumSpecies];
     // species 1
-    float[] speciesColour = new float[] {255, 255, 255, 0};
-    float moveSpeed = 0.5;
+    float[] speciesColour1 = new float[] {57, 255, 20, 0};
+    float[] speciesColour2 = new float[] {0, 192, 249, 0};
+    float[] speciesColour3 = new float[] {188, 0, 254, 0};
+    float moveSpeed = 0.8;
     float turnSpeed = 0.2;
-    float sensorAngleDegrees = 45;
-    float sensorOffsetDist = 15;
-    int sensorSize = 2;
-    SpeciesSettings[0] = new Mould(moveSpeed, turnSpeed, sensorAngleDegrees, sensorOffsetDist, sensorSize, speciesColour);
+    float sensorAngleDegrees = 60;
+    float sensorOffsetDist = 30;
+    int sensorSize = 1;
+    SpeciesSettings[0] = new Mould(moveSpeed, turnSpeed, sensorAngleDegrees, sensorOffsetDist, sensorSize, speciesColour1);
+    SpeciesSettings[1] = new Mould(moveSpeed, turnSpeed*2, sensorAngleDegrees/2, sensorOffsetDist/2, sensorSize, speciesColour2);
+    SpeciesSettings[2] = new Mould(moveSpeed, turnSpeed*1.5, sensorAngleDegrees/1.5, sensorOffsetDist/1.5, sensorSize, speciesColour3);
     
-    int species = 0;
-    AgentSpawn spawnStrategy = AgentSpawn.CENTRE;
-    Agents = new Agent[NumAgents];
-    for (int i = 0; i < NumAgents; i++)
+    int species1 = 0;
+    AgentSpawn spawnStrategy1 = AgentSpawn.CENTRE;
+    Agents = new ArrayList<Agent>();
+    for (int i = 0; i < NumAgents/3; i++)
     {
-      Agents[i] = new Agent(species, NumSpecies, MapHeight, MapWidth, spawnStrategy);
+      Agents.add(new Agent(species1, NumSpecies, MapHeight, MapWidth, spawnStrategy1, trailWeight));
+    }
+    
+    int species2 = 1;
+    AgentSpawn spawnStrategy2 = AgentSpawn.RANDOM;
+    for (int i = NumAgents/3; i < 2 * NumAgents/3; i++)
+    {
+      Agents.add(new Agent(species2, NumSpecies, MapHeight, MapWidth, spawnStrategy2, trailWeight));
+    }
+    
+    int species3 = 2;
+    for (int i = 2*NumAgents/3; i < NumAgents; i++)
+    {
+      Agents.add(new Agent(species3, NumSpecies, MapHeight, MapWidth, spawnStrategy2, trailWeight));
     }
     
     // initialize trail maps
@@ -191,9 +209,11 @@ public class Moulds
   
   void Update ()
   {
-    for (int i = 0; i < NumAgents; i++)
-    {
-      Agent agent = Agents[i];
+    for (Agent agent : Agents)
+    { 
+      // reduce trail weight
+      agent.TrailWeight *= DeathRate;
+      
       Mould species = SpeciesSettings[agent.SpeciesIndex];
     
       // Steer based on sensory data
@@ -231,8 +251,11 @@ public class Moulds
       int x = int(agent.Position.x);
       int y = int(agent.Position.y);
       float[] oldTrail = TrailMap[y][x];
-      TrailMap[y][x] = Min(Add(oldTrail, Mult(agent.SpeciesMask, TrailWeight * DeltaTime)), 1.0);
+      TrailMap[y][x] = Min(Add(oldTrail, Mult(agent.SpeciesMask, agent.TrailWeight * DeltaTime)), 1.0);
     } //<>//
+
+    Agents.removeIf(a -> (a.TrailWeight < 0.01));
+    
     Diffuse();
     UpdateColourMap(); //<>//
   }

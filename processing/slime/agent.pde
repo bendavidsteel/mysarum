@@ -14,9 +14,11 @@ public class Agent
   float Angle;
   float[] SpeciesMask;
   int SpeciesIndex;
+  float TrailWeight;
   
-  public Agent(int species, int numSpecies, int mapHeight, int mapWidth, AgentSpawn spawnStrategy)
+  public Agent(int species, int numSpecies, int mapHeight, int mapWidth, AgentSpawn spawnStrategy, float trailWeight)
   {
+    TrailWeight = trailWeight;
     Spawn(mapHeight, mapWidth, spawnStrategy);
     SpeciesIndex = species;
     SpeciesMask = new float[numSpecies];

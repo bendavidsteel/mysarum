@@ -1,1 +1,3 @@
 ofxGui
+ofxVideoRecorder
+ofxPoco

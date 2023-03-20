@@ -1,8 +1,8 @@
 #include "ofMain.h"
 #include "ofApp.h"
 
-const int screenHeight = 768;
-const int screenWidth = 1024;
+const int screenHeight = 960;
+const int screenWidth = 960;
 
 //========================================================================
 int main( ){

@@ -1,1 +1,3 @@
+ofxPoco
 ofxVideoRecorder
+ofxVolumetrics

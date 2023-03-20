@@ -16,13 +16,14 @@ layout(std140, binding=0) buffer particle{
     Agent agents[];
 };
 
-layout(rgba32f,binding=1) uniform restrict image2D trailMap;
-
-layout(std140, binding=2) buffer species{
+layout(std140, binding=1) buffer species{
     Species allSpecies[];
 };
 
-uniform ivec2 resolution;
+layout(rgba8,binding=2) uniform restrict image3D trailMap;
+layout(rgba8,binding=3) uniform restrict image3D flowMap;
+
+uniform ivec3 resolution;
 uniform float time;
 uniform float deltaTime;
 uniform float trailWeight;
@@ -123,30 +124,30 @@ void sense(vec3 pos, vec4 speciesMask, vec3 vecAhead, vec3 vecA, vec3 vecB, vec3
 	// TODO can we optimize in glsl?
 	vec4 senseWeight = (speciesMask * 2.0) - 1.0;
 
-	ivec2 coordAhead = min(resolution, max(ivec2(senseAhead.xy), 0));
+	ivec3 coordAhead = min(resolution, max(ivec3(senseAhead.xyz), 0));
 	vec4 trailAhead = imageLoad(trailMap, coordAhead);
 	weightAhead = dot(senseWeight, trailAhead);
 
-	ivec2 coordA = min(resolution, max(ivec2(senseA.xy), 0));
+	ivec3 coordA = min(resolution, max(ivec3(senseA.xyz), 0));
 	vec4 trailA = imageLoad(trailMap, coordA);
 	weightA = dot(senseWeight, trailA);
 
-	ivec2 coordB = min(resolution, max(ivec2(senseB.xy), 0));
+	ivec3 coordB = min(resolution, max(ivec3(senseB.xyz), 0));
 	vec4 trailB = imageLoad(trailMap, coordB);
 	weightB = dot(senseWeight, trailB);
 
-	ivec2 coordC = min(resolution, max(ivec2(senseC.xy), 0));
+	ivec3 coordC = min(resolution, max(ivec3(senseC.xyz), 0));
 	vec4 trailC = imageLoad(trailMap, coordC);
 	weightC = dot(senseWeight, trailC);
 
-	ivec2 coordD = min(resolution, max(ivec2(senseD.xy), 0));
+	ivec3 coordD = min(resolution, max(ivec3(senseD.xyz), 0));
 	vec4 trailD = imageLoad(trailMap, coordD);
 	weightD = dot(senseWeight, trailD);
 }
 
 void doRebound(inout vec3 pos)
 {
-	pos.xy = min(resolution, max(pos.xy, 0.0));
+	pos = min(resolution-1, max(pos, 0.0));
 }
 
 void ensureRebound(inout vec3 pos, inout vec3 vel){
@@ -172,7 +173,7 @@ void ensureRebound(inout vec3 pos, inout vec3 vel){
 		normal = vec3(0, 0, 1);
 		rebound = true;
 	}
-	if (pos.z >= resolution.y) {
+	if (pos.z >= resolution.z) {
 		normal = vec3(0, 0, -1);
 		rebound = true;
 	}
@@ -226,6 +227,12 @@ void main(){
 		force += vec3(0.);
 	}
 
+	// pushing agents around based on flow
+	ivec3 oldCoord = ivec3(pos.xyz);
+	vec3 flowForce = imageLoad(flowMap, oldCoord).xyz;
+	flowForce = (2 * flowForce) - 1; // convert to -1-1 range
+	force += 0.3 * flowForce;
+
 	// Update position
 	vec3 newVel = normalize(vel + (force * randomForceStrength * turnStrength * deltaTime));
 	vec3 newPos = pos + (newVel * deltaTime * moveSpeed);
@@ -236,7 +243,7 @@ void main(){
 	agents[gl_GlobalInvocationID.x].vel.xyz = newVel;
 	agents[gl_GlobalInvocationID.x].pos.xyz = newPos;
 
-	ivec2 newCoord = ivec2(newPos.xy);
+	ivec3 newCoord = ivec3(newPos.xyz);
 	vec4 oldTrail = imageLoad(trailMap, newCoord);
 	vec4 newTrail = max(min((oldTrail + (speciesMask * trailWeight * deltaTime)), 1.), 0.);
 	imageStore(trailMap, newCoord, newTrail);

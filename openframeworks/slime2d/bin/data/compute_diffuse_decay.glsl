@@ -1,6 +1,6 @@
 #version 440
 
-layout(rgba32f,binding=1) uniform restrict image2D trailMap;
+layout(rgba8,binding=2) uniform restrict image2D trailMap;
 
 uniform ivec2 resolution;
 uniform float time;
@@ -8,7 +8,7 @@ uniform float deltaTime;
 uniform float diffuseRate;
 uniform float decayRate;
 
-layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
 void main(){
 
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);

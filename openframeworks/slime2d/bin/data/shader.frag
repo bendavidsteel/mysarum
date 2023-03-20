@@ -1,18 +1,18 @@
 #version 440
 
 struct Species{
-	float moveSpeed;
-	float turnSpeed;
-	float sensorAngleRad;
-	float sensorOffsetDist;
 	vec4 colour;
+	vec4 sensorAttributes;
+	vec4 movementAttributes;
 };
 
-layout(rgba8,binding=1) uniform restrict image2D trailMap;
-
-layout(std140, binding=2) buffer species{
+layout(std140, binding=1) buffer species{
     Species allSpecies[];
 };
+
+layout(rgba8,binding=2) uniform restrict image2D trailMap;
+
+layout(rgba8,binding=3) uniform restrict image2D flowMap;
 
 out vec4 outputColor;
 

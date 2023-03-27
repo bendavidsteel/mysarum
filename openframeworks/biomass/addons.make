@@ -1,0 +1,4 @@
+ofxPoco
+ofxVideoRecorder
+ofxVolumetrics
+ofxOpenCv

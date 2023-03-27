@@ -231,7 +231,7 @@ void main(){
 	ivec3 oldCoord = ivec3(pos.xyz);
 	vec3 flowForce = imageLoad(flowMap, oldCoord).xyz;
 	flowForce = (2 * flowForce) - 1; // convert to -1-1 range
-	force += 0.3 * flowForce;
+	force += 2 * flowForce;
 
 	// Update position
 	vec3 newVel = normalize(vel + (force * randomForceStrength * turnStrength * deltaTime));

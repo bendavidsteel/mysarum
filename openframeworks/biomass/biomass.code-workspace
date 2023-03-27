@@ -1,0 +1,20 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path" : "${workspaceRoot}/../../../../addons/ofxPoco"
+		},
+		{
+			"path" : "${workspaceRoot}/../../../../addons/ofxVideoRecorder"
+		},
+		{
+			"path" : "${workspaceRoot}/../../../../addons/ofxVolumetrics"
+		},
+		{
+			"path": "${workspaceRoot}/../../../../libs/openFrameworks"
+		}
+	],
+	"settings": {}
+}

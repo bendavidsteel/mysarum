@@ -88,7 +88,7 @@ void main(){
 
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
 
-    vec2 p = vec2(0.5) * coord.xy/resolution.xy;
+    vec2 p = vec2(1.0) * coord/resolution.xy;
     vec3 p3_x = vec3(p, (time + 10000)*0.025);
     vec3 p3_y = vec3(p, time*0.025);
     
@@ -100,7 +100,14 @@ void main(){
     // takes it from -1 to 1 to 0 to 1
     flow_force = 0.5 + 0.5*flow_force;
 
-    vec4 flow = vec4(flow_force, 1., 1.);
+	float dist = distance(p, vec2(0.5, 0.5));
+
+	float flow_strength = 0.01;
+	if (dist < 0.3) {
+		flow_strength = 0.1;
+	}
+
+    vec4 flow = vec4(flow_force, flow_strength, 1.);
 
 	imageStore(flowMap, coord, flow);
 }

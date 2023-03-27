@@ -7,6 +7,8 @@ void ofApp::setup(){
 	sampleRate = 44100;
     channels = 2;
 
+	float_strength = 1;
+
 	fileName = "testMovie";
     fileExt = ".mov"; // ffmpeg uses the extension to determine the container type. run 'ffmpeg -formats' to see supported formats
 
@@ -50,11 +52,17 @@ void ofApp::setup(){
 	flowMap.allocate(ofGetWidth(), ofGetHeight(), GL_RGBA8);
 	flowMap.bindAsImage(2, GL_READ_WRITE);
 
+	diffusionMap.allocate(ofGetWidth(), ofGetHeight(), GL_RG16);
+	diffusionMap.bindAsImage(3, GL_READ_WRITE);
+
 	fbo.allocate(ofGetWidth(), ofGetHeight(), GL_RGBA8);
 
 	// load shaders
 	compute_flow.setupShaderFromFile(GL_COMPUTE_SHADER, "compute_flow.glsl");
 	compute_flow.linkProgram();
+
+	compute_diffusion.setupShaderFromFile(GL_COMPUTE_SHADER, "compute_diffusion.glsl");
+	compute_diffusion.linkProgram();
 
 	compute_feedkill.setupShaderFromFile(GL_COMPUTE_SHADER, "compute_feedkill.glsl");
 	compute_feedkill.linkProgram();
@@ -86,6 +94,13 @@ void ofApp::update(){
 	compute_flow.setUniform1f("time", time);
 	compute_flow.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
 	compute_flow.dispatchCompute(widthWorkGroups, heightWorkGroups, 1);
+	compute_flow.end();
+
+	compute_diffusion.begin();
+	compute_diffusion.setUniform1f("time", time);
+	compute_diffusion.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
+	compute_diffusion.dispatchCompute(widthWorkGroups, heightWorkGroups, 1);
+	compute_diffusion.end();
 
 	compute_feedkill.begin();
 	compute_feedkill.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
@@ -95,7 +110,7 @@ void ofApp::update(){
 	compute_reaction.begin();
 	compute_reaction.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
 	compute_reaction.setUniform1f("deltaTime", deltaTime);
-	compute_reaction.setUniform2f("diffusion", 1.0, 0.5);
+	compute_reaction.setUniform1f("float_strength", float_strength);
 	compute_reaction.dispatchCompute(widthWorkGroups, heightWorkGroups, 1);
 	compute_reaction.end();
 }
@@ -107,9 +122,11 @@ void ofApp::draw() {
 	fbo.begin();
 	ofClear(255,255,255, 0);
 	renderer.begin();
-	renderer.setUniform3f("colourA", 1., 0.5, 1.);
-	renderer.setUniform3f("colourB", 0., 0., 0.5);
+	renderer.setUniform3f("colourA", 1., 0., 0.);
+	renderer.setUniform3f("colourB", 0., 1., 0.);
 	renderer.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
+	renderer.setUniform3f("light", ofGetWidth(), 0., 0.1);
+	renderer.setUniform1f("height", 1000.);
 	ofSetColor(255);
 	ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
 	renderer.end();
@@ -141,7 +158,7 @@ void ofApp::exit(){
     ofRemoveListener(vidRecorder.outputFileCompleteEvent, this, &ofApp::recordingComplete);
     vidRecorder.close();
 
-	reactionMap.clear();
+	
 }
 
 //--------------------------------------------------------------

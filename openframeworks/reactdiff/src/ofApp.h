@@ -41,6 +41,7 @@ class ofApp : public ofBaseApp{
 		void recordingComplete(ofxVideoRecorderOutputFileCompleteEventArgs& args);
 
 		ofShader compute_flow;
+		ofShader compute_diffusion;
 		ofShader compute_feedkill;
 		ofShader compute_reaction;
 		ofShader renderer;
@@ -49,8 +50,10 @@ class ofApp : public ofBaseApp{
 		ofFbo fbo;
 
 		ofTexture flowMap;
+		ofTexture diffusionMap;
 		ofTexture feedkillMap;
 		ofTexture reactionMap;
 
 		int flowSizeFactor;
+		float float_strength;
 };

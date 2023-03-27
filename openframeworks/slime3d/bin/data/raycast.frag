@@ -12,9 +12,9 @@ struct Species{
 	vec4 movementAttributes;
 };
 
-layout(rgba8,binding=1) uniform restrict image3D trailMap;
+layout(rgba8,binding=2) uniform restrict image3D trailMap;
 
-layout(std140, binding=2) buffer species{
+layout(std140, binding=1) buffer species{
     Species allSpecies[];
 };
 

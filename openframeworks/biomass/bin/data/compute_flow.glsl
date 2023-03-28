@@ -1,0 +1,121 @@
+#version 440
+
+layout(rgba8,binding=0) uniform restrict image3D flowMap;
+layout(rgba8,binding=7) uniform restrict image2D opticalFlowMap; // TODO switch to readonly
+
+uniform float time;
+uniform ivec2 resolution;
+uniform int opticalFlowDownScale;
+
+/* discontinuous pseudorandom uniformly distributed in [-0.5, +0.5]^3 */
+vec3 random3(vec3 c) {
+	float j = 4096.0*sin(dot(c,vec3(17.0, 59.4, 15.0)));
+	vec3 r;
+	r.z = fract(512.0*j);
+	j *= .125;
+	r.x = fract(512.0*j);
+	j *= .125;
+	r.y = fract(512.0*j);
+	return r-0.5;
+}
+
+/* skew constants for 3d simplex functions */
+const float F3 =  0.3333333;
+const float G3 =  0.1666667;
+
+/* 3d simplex noise */
+float simplex3d(vec3 p) {
+	 /* 1. find current tetrahedron T and it's four vertices */
+	 /* s, s+i1, s+i2, s+1.0 - absolute skewed (integer) coordinates of T vertices */
+	 /* x, x1, x2, x3 - unskewed coordinates of p relative to each of T vertices*/
+	 
+	 /* calculate s and x */
+	 vec3 s = floor(p + dot(p, vec3(F3)));
+	 vec3 x = p - s + dot(s, vec3(G3));
+	 
+	 /* calculate i1 and i2 */
+	 vec3 e = step(vec3(0.0), x - x.yzx);
+	 vec3 i1 = e*(1.0 - e.zxy);
+	 vec3 i2 = 1.0 - e.zxy*(1.0 - e);
+	 	
+	 /* x1, x2, x3 */
+	 vec3 x1 = x - i1 + G3;
+	 vec3 x2 = x - i2 + 2.0*G3;
+	 vec3 x3 = x - 1.0 + 3.0*G3;
+	 
+	 /* 2. find four surflets and store them in d */
+	 vec4 w, d;
+	 
+	 /* calculate surflet weights */
+	 w.x = dot(x, x);
+	 w.y = dot(x1, x1);
+	 w.z = dot(x2, x2);
+	 w.w = dot(x3, x3);
+	 
+	 /* w fades from 0.6 at the center of the surflet to 0.0 at the margin */
+	 w = max(0.6 - w, 0.0);
+	 
+	 /* calculate surflet components */
+	 d.x = dot(random3(s), x);
+	 d.y = dot(random3(s + i1), x1);
+	 d.z = dot(random3(s + i2), x2);
+	 d.w = dot(random3(s + 1.0), x3);
+	 
+	 /* multiply d by w^4 */
+	 w *= w;
+	 w *= w;
+	 d *= w;
+	 
+	 /* 3. return the sum of the four surflets */
+	 return dot(d, vec4(52.0));
+}
+
+/* const matrices for 3d rotation */
+const mat3 rot1 = mat3(-0.37, 0.36, 0.85,-0.14,-0.93, 0.34,0.92, 0.01,0.4);
+const mat3 rot2 = mat3(-0.55,-0.39, 0.74, 0.33,-0.91,-0.24,0.77, 0.12,0.63);
+const mat3 rot3 = mat3(-0.71, 0.52,-0.47,-0.08,-0.72,-0.68,-0.7,-0.45,0.56);
+
+/* directional artifacts can be reduced by rotating each octave */
+float simplex3d_fractal(vec3 m) {
+    return   0.5333333*simplex3d(m*rot1)
+			+0.2666667*simplex3d(2.0*m*rot2)
+			+0.1333333*simplex3d(4.0*m*rot3)
+			+0.0666667*simplex3d(8.0*m);
+}
+
+
+
+layout(local_size_x = 20, local_size_y = 20, local_size_z = 1) in;
+void main(){
+
+    ivec3 coord = ivec3(gl_GlobalInvocationID.xyz);
+
+    vec2 p = vec2(1.0) * coord.xy/resolution.xy;
+    vec3 p3_x = vec3(p, (time + 10000)*0.025);
+    vec3 p3_y = vec3(p, time*0.025);
+    
+    float flow_x = simplex3d_fractal(p3_x*8.0+8.0);
+    float flow_y = simplex3d_fractal(p3_y*8.0+8.0);
+
+	vec2 simplex_force = vec2(flow_x, flow_y);
+	float simplex_factor = 1;
+	simplex_force *= simplex_factor;
+	
+	vec2 optical_flow = imageLoad(opticalFlowMap, coord.xy / opticalFlowDownScale).xy;
+	float optical_factor = 1;
+	optical_flow = clamp(optical_factor * ((2 * optical_flow) - 1), -1, 1);
+	vec2 flow_force = simplex_force + optical_flow;
+
+	// scale to 0-1 for image storage
+	flow_force = 0.5 + (0.5 * flow_force);
+
+	float dist = distance(p, vec2(0.5, 0.5));
+	float flow_strength = 0.05;
+	if (dist < 0.3) {
+		flow_strength = 0.05;
+	}
+
+    vec4 flow = vec4(flow_force, 0., flow_strength);
+
+	imageStore(flowMap, coord, flow);
+}

@@ -373,6 +373,11 @@ void ofApp::update(){
 void ofApp::draw() {
 
 	// opticalFlowTexture.draw(0, 0, ofGetWidth(), ofGetHeight());
+	float time = ofGetElapsedTimef();
+	float days = time / 30;
+	float sun_x = (ofGetWidth() / 2) + (2 * ofGetWidth() / 3) * cos(days);
+	float sun_y = (ofGetHeight() / 2) + (2 * ofGetHeight() / 3) * sin(days);
+	float sun_z = 25. + 15. * cos(days / 10);
 
 	fbo.begin();
 	ofClear(255,255,255, 0);
@@ -381,8 +386,9 @@ void ofApp::draw() {
 	renderer.setUniform1i("trail_depth", volDepth);
 	renderer.setUniform3f("colourA", 1., 0., 0.);
 	renderer.setUniform3f("colourB", 0., 1., 0.);
-	renderer.setUniform3f("light", ofGetWidth(), 0., 0.1);
-	renderer.setUniform1f("height", 1000.);
+	renderer.setUniform3f("light", sun_x, sun_y, sun_z);
+	renderer.setUniform1f("chem_height", 1.);
+	renderer.setUniform1f("trail_height", 2.);
 	ofSetColor(255);
 	ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
 	renderer.end();

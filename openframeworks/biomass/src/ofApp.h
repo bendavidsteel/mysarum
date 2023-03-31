@@ -3,7 +3,6 @@
 #include "ofMain.h"
 #include "ofBufferObject.h"
 #include "ofxVideoRecorder.h"
-#include "ofxVolumetrics.h"
 #include "ofxOpenCv.h"
 
 enum Spawn{
@@ -47,19 +46,19 @@ class ofApp : public ofBaseApp{
 		ofShader compute_flow;
 		ofShader renderer;
 
-		ofxTexture3d flowMap;
+		ofTexture flowMap;
 
 		// slime
 		struct Agent{
-			glm::vec4 pos;
-			glm::vec4 vel;
+			glm::vec2 pos;
+			glm::vec2 vel;
 			glm::vec4 attributes;
 		};
 
 		struct Species{
 			glm::vec4 colour;
-			glm::vec4 sensorAttributes;
 			glm::vec4 movementAttributes;
+			glm::vec4 sensorAttributes;
 		};
 
 		ofShader compute_agents;
@@ -73,11 +72,10 @@ class ofApp : public ofBaseApp{
 		ofBufferObject particlesBuffer;
 		vector<Species> allSpecies;
 		ofBufferObject allSpeciesBuffer;
-		ofxTexture3d trailMap;
+		ofTexture trailMap;
 
 		int volWidth;
 		int volHeight;
-		int volDepth;
 
 		float diffuseRate;
 		float decayRate;

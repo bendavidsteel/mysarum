@@ -1,7 +1,6 @@
 #version 440
 
-layout(rgba8,binding=0) uniform restrict image3D flowMap;
-layout(rgba8,binding=7) uniform restrict image2D opticalFlowMap; // TODO switch to readonly
+layout(rgba8,binding=0) uniform restrict image2D flowMap;
 
 uniform float time;
 uniform ivec2 resolution;
@@ -88,7 +87,7 @@ float simplex3d_fractal(vec3 m) {
 layout(local_size_x = 20, local_size_y = 20, local_size_z = 1) in;
 void main(){
 
-    ivec3 coord = ivec3(gl_GlobalInvocationID.xyz);
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
 
     vec2 p = vec2(1.0) * coord.xy/resolution.xy;
     vec3 p3_x = vec3(p, (time + 10000)*0.025);
@@ -97,22 +96,15 @@ void main(){
     float flow_x = simplex3d_fractal(p3_x*8.0+8.0);
     float flow_y = simplex3d_fractal(p3_y*8.0+8.0);
 
-	vec2 simplex_force = vec2(flow_x, flow_y);
-	float simplex_factor = 1;
-	simplex_force *= simplex_factor;
-	
-	vec2 optical_flow = imageLoad(opticalFlowMap, coord.xy / opticalFlowDownScale).xy;
-	float optical_factor = 1;
-	optical_flow = clamp(optical_factor * ((2 * optical_flow) - 1), -1, 1);
-	vec2 flow_force = simplex_force + optical_flow;
+	vec2 flow_force = vec2(flow_x, flow_y);
 
 	// scale to 0-1 for image storage
 	flow_force = 0.5 + (0.5 * flow_force);
 
 	float dist = distance(p, vec2(0.5, 0.5));
-	float flow_strength = 0.05;
+	float flow_strength = 0.01;
 	if (dist < 0.3) {
-		flow_strength = 0.05;
+		flow_strength = 0.01;
 	}
 
     vec4 flow = vec4(flow_force, 0., flow_strength);

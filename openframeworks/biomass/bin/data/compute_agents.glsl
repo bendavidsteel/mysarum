@@ -1,15 +1,15 @@
 #version 440
 
 struct Agent{
-	vec4 pos;
-	vec4 vel;
+	vec2 pos;
+	vec2 vel;
 	vec4 attributes;
 };
 
 struct Species{
 	vec4 colour;
-	vec4 sensorAttributes;
 	vec4 movementAttributes;
+	vec4 sensorAttributes;
 };
 
 layout(std140, binding=4) buffer particle{
@@ -20,13 +20,16 @@ layout(std140, binding=5) buffer species{
     Species allSpecies[];
 };
 
-layout(rgba8,binding=6) uniform restrict image3D trailMap;
-layout(rgba8,binding=0) uniform restrict image3D flowMap;
+layout(rgba8,binding=6) uniform restrict image2D trailMap;
+layout(rgba8,binding=0) uniform restrict image2D flowMap;
+layout(rg16,binding=7) uniform restrict image2D opticalFlowMap; // TODO switch to readonly
+layout(rg16,binding=3) uniform restrict image2D reactionMap;
 
-uniform ivec3 resolution;
+uniform ivec2 resolution;
 uniform float time;
 uniform float deltaTime;
 uniform float trailWeight;
+uniform int opticalFlowDownScale;
 
 // A single iteration of Bob Jenkins' One-At-A-Time hashing algorithm.
 uint hash( uint x ) {
@@ -76,105 +79,67 @@ vec4 toMask(int idx) {
 	return ret;
 }
 
-void getOrthoVecs(vec3 vec, out vec3 vecA, out vec3 vecB) {
-	vecA = vec3(0.);
-	vecB = vec3(0.);
-	if (vec.x != 0) {
-		vecA.y = vec.x;
-		vecA.x = -1 * vec.y;
-		vecB.z = vec.x;
-		vecB.x = -1 * vec.z;
-	} else if (vec.y != 0) {
-		vecA.z = vec.y;
-		vecA.y = -1 * vec.z;
-		vecB.x = vec.y;
-		vecB.y = -1 * vec.x;
-	} else {
-		vecA.x = vec.z;
-		vecA.z = -1 * vec.x;
-		vecB.y = vec.z;
-		vecB.z = -1 * vec.y;
-	}
-	vecA = normalize(vecA);
-	vecB = normalize(vecB);
+
+vec2 vecFromAngle(float angle) {
+	return vec2(cos(angle), sin(angle));
 }
 
-void getSenseVecs(vec3 pos, vec3 vel, float sensorDist, float sensorOffset, float sensorOffDist, out vec3 vecAhead, out vec3 vecA, out vec3 vecB, out vec3 vecC, out vec3 vecD) {
-	vec3 velNorm = normalize(vel);
-	vecAhead = velNorm * sensorDist;
-	
-	vec3 vecX;
-	vec3 vecY;
-	getOrthoVecs(vel, vecX, vecY);
+float sense(vec2 pos, float angle, vec4 speciesMask, float sensorOffsetDist, float sensorAngleOffset) {
+	float sensorAngle = angle + sensorAngleOffset;
+	vec2 sensorDir = vecFromAngle(sensorAngle);
 
-	vecA = (velNorm * sensorOffDist) + (vecX * sensorOffset);
-	vecB = (velNorm * sensorOffDist) + (vecX * -1 * sensorOffset);
-	vecC = (velNorm * sensorOffDist) + (vecY * sensorOffset);
-	vecD = (velNorm * sensorOffDist) + (vecY * -1 * sensorOffset);
-}
+	vec2 sensorPos = pos + (sensorDir * sensorOffsetDist);
+	int sensorCentreX = int(sensorPos.x);
+	int sensorCentreY = int(sensorPos.y);
 
-void sense(vec3 pos, vec4 speciesMask, vec3 vecAhead, vec3 vecA, vec3 vecB, vec3 vecC, vec3 vecD, out float weightAhead, out float weightA, out float weightB, out float weightC, out float weightD) {
-	
-	vec3 senseAhead = pos + vecAhead;
-	vec3 senseA = pos + vecA;
-	vec3 senseB = pos + vecB;
-	vec3 senseC = pos + vecC;
-	vec3 senseD = pos + vecD;
+	float sum = 0;
+	const int sensorSize = 0;
 
 	// TODO can we optimize in glsl?
 	vec4 senseWeight = (speciesMask * 2.0) - 1.0;
+	for (int offsetX = -sensorSize; offsetX <= sensorSize; offsetX ++) {
+		for (int offsetY = -sensorSize; offsetY <= sensorSize; offsetY ++) {
+			ivec2 sampleCoord = min(resolution, max(ivec2(sensorCentreX + offsetX, sensorCentreY + offsetY), 0));
+			vec4 trailWeight = imageLoad(trailMap, sampleCoord);
+			sum += dot(senseWeight, trailWeight);
 
-	ivec3 coordAhead = min(resolution, max(ivec3(senseAhead.xyz), 0));
-	vec4 trailAhead = imageLoad(trailMap, coordAhead);
-	weightAhead = dot(senseWeight, trailAhead);
+			// repel from optical flow
+			vec2 opticalFlow = imageLoad(opticalFlowMap, sampleCoord / opticalFlowDownScale).xy;
+			opticalFlow = opticalFlow * 2.0 - 1.0;
+			float opticalFlowMag = length(opticalFlow);
+			sum -= 10 * opticalFlowMag;
 
-	ivec3 coordA = min(resolution, max(ivec3(senseA.xyz), 0));
-	vec4 trailA = imageLoad(trailMap, coordA);
-	weightA = dot(senseWeight, trailA);
+			// repel from reaction peaks
+			float chem_y = imageLoad(reactionMap, sampleCoord).y;
+			sum -= 5 * chem_y;
+		}
+	}
 
-	ivec3 coordB = min(resolution, max(ivec3(senseB.xyz), 0));
-	vec4 trailB = imageLoad(trailMap, coordB);
-	weightB = dot(senseWeight, trailB);
-
-	ivec3 coordC = min(resolution, max(ivec3(senseC.xyz), 0));
-	vec4 trailC = imageLoad(trailMap, coordC);
-	weightC = dot(senseWeight, trailC);
-
-	ivec3 coordD = min(resolution, max(ivec3(senseD.xyz), 0));
-	vec4 trailD = imageLoad(trailMap, coordD);
-	weightD = dot(senseWeight, trailD);
+	return sum;
 }
 
-void doRebound(inout vec3 pos)
+void doRebound(inout vec2 pos)
 {
 	pos = min(resolution-1, max(pos, 0.0));
 }
 
-void ensureRebound(inout vec3 pos, inout vec3 vel){
-	vec3 normal;
+void ensureRebound(inout vec2 pos, inout vec2 vel){
+	vec2 normal;
 	bool rebound = false;
 	if (pos.x < 0) {
-		normal = vec3(1, 0, 0);
+		normal = vec2(1, 0);
 		rebound = true;
 	}
 	if (pos.x >= resolution.x) {
-		normal = vec3(-1, 0, 0);
+		normal = vec2(-1, 0);
 		rebound = true;
 	}
 	if (pos.y < 0) {
-		normal = vec3(0, 1, 0);
+		normal = vec2(0, 1);
 		rebound = true;
 	}
 	if (pos.y >= resolution.y) {
-		normal = vec3(0, -1, 0);
-		rebound = true;
-	}
-	if (pos.z < 0) {
-		normal = vec3(0, 0, 1);
-		rebound = true;
-	}
-	if (pos.z >= resolution.z) {
-		normal = vec3(0, 0, -1);
+		normal = vec2(0, -1);
 		rebound = true;
 	}
 
@@ -188,62 +153,63 @@ void ensureRebound(inout vec3 pos, inout vec3 vel){
 
 layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
 void main(){
-	vec3 pos = agents[gl_GlobalInvocationID.x].pos.xyz;
-	vec3 vel = agents[gl_GlobalInvocationID.x].vel.xyz;
+	vec2 pos = agents[gl_GlobalInvocationID.x].pos.xy;
+	vec2 vel = agents[gl_GlobalInvocationID.x].vel.xy;
 	int speciesIdx = int(agents[gl_GlobalInvocationID.x].attributes.x);
 	vec4 speciesMask = toMask(speciesIdx);
 
 	// Steer based on sensory data
-	float sensorDist = allSpecies[speciesIdx].sensorAttributes.x;
-	float sensorOffset = allSpecies[speciesIdx].sensorAttributes.y;
-	float sensorOffDist = allSpecies[speciesIdx].sensorAttributes.z;
+	float sensorAngleRad = allSpecies[speciesIdx].sensorAttributes.x;
+	float sensorOffsetDist = allSpecies[speciesIdx].sensorAttributes.y;
 	float moveSpeed = allSpecies[speciesIdx].movementAttributes.x;
-	float turnStrength = allSpecies[speciesIdx].movementAttributes.y;
+	float turnSpeed = allSpecies[speciesIdx].movementAttributes.y;
 
-	vec3 vecAhead, vecA, vecB, vecC, vecD;
-	getSenseVecs(pos, vel, sensorDist, sensorOffset, sensorOffDist, vecAhead, vecA, vecB, vecC, vecD);
-	float weightAhead, weightA, weightB, weightC, weightD;
-	sense(pos, speciesMask, vecAhead, vecA, vecB, vecC, vecD, weightAhead, weightA, weightB, weightC, weightD);
-	
-	float randomForceStrength = random(vec4(pos, time));
-	vec3 agentUid = pos * time * gl_GlobalInvocationID.x;
-	float randomX = (random(vec4(agentUid, vel.x)) * 2) - 1;
-	float randomY = (random(vec4(agentUid, vel.y)) * 2) - 1;
-	float randomZ = (random(vec4(agentUid, vel.z)) * 2) - 1;
-	vec3 randomForce = normalize(vec3(randomX, randomY, randomZ));
+	float angle = atan(vel.y, vel.x);
 
-	vec3 force = randomForce * 0.01;
-	if (weightAhead < weightA && weightAhead < weightB && weightAhead < weightC && weightAhead < weightD) {
-		force += randomForce;
-	} else if (weightA > weightAhead && weightA > weightB && weightA > weightC && weightA > weightD) {
-		force += normalize(vecA);
-	} else if (weightB > weightAhead && weightB > weightA && weightB > weightC && weightB > weightD) {
-		force += normalize(vecB);
-	} else if (weightC > weightAhead && weightC > weightA && weightC > weightB && weightC > weightD) {
-		force += normalize(vecC);
-	} else if (weightD > weightAhead && weightD > weightA && weightD > weightB && weightD > weightC) {
-		force += normalize(vecD);
-	} else if (weightAhead > weightA && weightAhead > weightB && weightAhead > weightC && weightAhead > weightD) {
-		force += vec3(0.);
+	float weightForward = sense(pos, angle, speciesMask, sensorOffsetDist, 0);
+	float weightLeft = sense(pos, angle, speciesMask, sensorOffsetDist, sensorAngleRad);
+	float weightRight = sense(pos, angle, speciesMask, sensorOffsetDist, -sensorAngleRad);
+
+	float randomSteerStrength = random(vec3(pos, time));
+
+	if (weightForward < weightLeft && weightForward < weightRight) { // TODO does this make sense?
+		angle += (randomSteerStrength - 0.5) * 2 * turnSpeed * deltaTime;
+	}
+	// Turn right
+	else if (weightRight > weightLeft) {
+		angle -= randomSteerStrength * turnSpeed * deltaTime;
+	}
+	// Turn left
+	else if (weightLeft > weightRight) {
+		angle += randomSteerStrength * turnSpeed * deltaTime;
+	} else {
+		angle += (randomSteerStrength - 0.5) * 0.5 * turnSpeed * deltaTime;
 	}
 
+	vel = vecFromAngle(angle);
+
 	// pushing agents around based on flow
-	ivec3 oldCoord = ivec3(pos.xyz);
-	vec3 flowForce = imageLoad(flowMap, oldCoord).xyz;
-	flowForce = (2 * flowForce) - 1; // convert to -1-1 range
-	force += 0.2 * flowForce;
+	ivec2 oldCoord = ivec2(pos.xy);
+	vec2 simplexFlowForce = imageLoad(flowMap, oldCoord).xy;
+	simplexFlowForce = (2 * simplexFlowForce) - 1; // convert to -1-1 range
+
+	vec2 opticalFlowForce = imageLoad(opticalFlowMap, oldCoord / opticalFlowDownScale).xy;
+	opticalFlowForce = (2 * opticalFlowForce) - 1; // convert to -1-1 range
+	float opticalFlowMag = length(opticalFlowForce);
+
+	vec2 force = (2 * opticalFlowMag + 1) * simplexFlowForce;
 
 	// Update position
-	vec3 newVel = normalize(vel + (force * randomForceStrength * turnStrength * deltaTime));
-	vec3 newPos = pos + (newVel * deltaTime * moveSpeed);
+	vec2 newVel = normalize(vel + (force * deltaTime));
+	vec2 newPos = pos + (newVel * deltaTime * moveSpeed) + (5 * opticalFlowForce * deltaTime);
 
 	// Clamp position to map boundaries, and pick new random move dir if hit boundary
 	ensureRebound(newPos, newVel);
 
-	agents[gl_GlobalInvocationID.x].vel.xyz = newVel;
-	agents[gl_GlobalInvocationID.x].pos.xyz = newPos;
+	agents[gl_GlobalInvocationID.x].vel.xy = newVel;
+	agents[gl_GlobalInvocationID.x].pos.xy = newPos;
 
-	ivec3 newCoord = ivec3(newPos.xyz);
+	ivec2 newCoord = ivec2(newPos.xy);
 	vec4 oldTrail = imageLoad(trailMap, newCoord);
 	vec4 newTrail = max(min((oldTrail + (speciesMask * trailWeight * deltaTime)), 1.), 0.);
 	imageStore(trailMap, newCoord, newTrail);

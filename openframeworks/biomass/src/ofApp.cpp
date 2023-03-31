@@ -9,7 +9,6 @@ void ofApp::setup(){
 	// slime constants
 	volWidth = ofGetWidth();
 	volHeight = ofGetHeight();
-	volDepth = 1;
 
 	diffuseRate = 0.2;
 	decayRate = 0.98;
@@ -25,25 +24,21 @@ void ofApp::setup(){
 	// slime setup
 	int numSpecies = 2;
 	allSpecies.resize(numSpecies);
-	float angle = 30 * PI / 180;
 	allSpecies[0].movementAttributes.x = 1.1; // moveSpeed
-	allSpecies[0].movementAttributes.y = 1.0; // turnStrength
+	allSpecies[0].movementAttributes.y = 0.05 * 2 * PI; // turnSpeed
 	allSpecies[0].movementAttributes.z = CIRCLE; //spawn
-	allSpecies[0].sensorAttributes.x = 30; // sensorDist
-	allSpecies[0].sensorAttributes.y = allSpecies[0].sensorAttributes.x * sin(angle); // sensorOffset
-	allSpecies[0].sensorAttributes.z = allSpecies[0].sensorAttributes.y / tan(angle); // sensorOffDist
+	allSpecies[0].sensorAttributes.x = 40 * PI / 180; // sensorAngleRad
+	allSpecies[0].sensorAttributes.y = 15; // sensorOffsetDist
 	allSpecies[0].colour = glm::vec4(0.796, 0.2, 1., 1.);
 
-	angle = 60 * PI / 180;
-	allSpecies[1].movementAttributes.x = 0.9;
-	allSpecies[1].movementAttributes.y = 0.6;
+	allSpecies[1].movementAttributes.x = 0.9; // moveSpeed
+	allSpecies[1].movementAttributes.y = 0.1 * 2 * PI; // turnSpeed
 	allSpecies[1].movementAttributes.z = RING;
-	allSpecies[1].sensorAttributes.x = 40;
-	allSpecies[1].sensorAttributes.y = allSpecies[1].sensorAttributes.x * sin(angle);
-	allSpecies[1].sensorAttributes.z = allSpecies[1].sensorAttributes.y / tan(angle);
+	allSpecies[1].sensorAttributes.x = 50 * PI/ 180; // sensorAngleRad
+	allSpecies[1].sensorAttributes.y = 25; //sensorOffsetDist
 	allSpecies[1].colour = glm::vec4(0.1, 0.969, 1., 1.);
 
-	int numParticles = 1024 * 256;
+	int numParticles = 1024 * 64;
 	particles.resize(numParticles);
 
 	int speciesIdx = 0;
@@ -53,21 +48,17 @@ void ofApp::setup(){
 		if (allSpecies[speciesIdx].movementAttributes.z == RANDOM) {
 			p.pos.x = ofRandom(0, volWidth);
 			p.pos.y = ofRandom(0, volHeight);
-			p.pos.z = ofRandom(0, volDepth);
 		} else if (allSpecies[speciesIdx].movementAttributes.z == CIRCLE) {
 			p.pos.x = volWidth / 2;
 			p.pos.y = volHeight / 2;
-			p.pos.z = volDepth / 2;
 		} else if (allSpecies[speciesIdx].movementAttributes.z == RING) {
 			float angle = ofRandom(0, 2*PI);
 			float radius = 0.4 * volWidth;
 			p.pos.x = (volWidth / 2) + (radius * ofRandom(0.999, 1.001) * cos(angle));
 			p.pos.y = (volHeight / 2) + (radius * ofRandom(0.999, 1.001) * sin(angle));
-			p.pos.z = ofRandom(0, volDepth);
 		}
 		p.vel.x = ofRandom(-1, 1);
 		p.vel.y = ofRandom(-1, 1);
-		p.vel.z = ofRandom(-1, 1);
 		p.vel = glm::normalize(p.vel);
 		p.vel = p.vel * allSpecies[speciesIdx].movementAttributes.x;
 		p.attributes.x = speciesIdx;
@@ -79,27 +70,13 @@ void ofApp::setup(){
 	allSpeciesBuffer.allocate(allSpecies, GL_DYNAMIC_DRAW);
 	allSpeciesBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 5);
 
-	float * volumeData = new float[volWidth*volHeight*volDepth*4];
-    for(int z=0; z<volDepth; z++)
-    {
-        for(int x=0; x<volWidth; x++)
-        {
-            for(int y=0; y<volHeight; y++)
-            {
-                // convert from greyscale to RGBA, false color
-                int i4 = ((x+volWidth*y)+z*volWidth*volHeight)*4;
-                ofColor c(0., 0., 0., 0.);
+	ofPixels initialTrail;
+	initialTrail.allocate(ofGetWidth(), ofGetHeight(), OF_PIXELS_RGBA);
+	ofColor initialTrailColor(0., 0., 0., 0.);
+	initialTrail.setColor(initialTrailColor);
 
-                volumeData[i4] = c.r;
-                volumeData[i4+1] = c.g;
-                volumeData[i4+2] = c.b;
-                volumeData[i4+3] = c.a;
-            }
-        }
-    }
-
-	trailMap.allocate(volWidth, volHeight, volDepth, GL_RGBA8);
-	trailMap.loadData(volumeData, volWidth, volHeight, volDepth, 0, 0, 0, GL_RGBA);
+	trailMap.allocate(volWidth, volHeight, GL_RGBA8);
+	trailMap.loadData(initialTrail);
 	trailMap.bindAsImage(6, GL_READ_WRITE);
 
 	// reaction diffusion setup
@@ -146,7 +123,7 @@ void ofApp::setup(){
 
 	// general setup
 
-	flowMap.allocate(volWidth, volHeight, volDepth, GL_RGBA8);
+	flowMap.allocate(volWidth, volHeight, GL_RGBA8);
 	flowMap.bindAsImage(0, GL_READ_WRITE);
 
 	fbo.allocate(ofGetWidth(), ofGetHeight(), GL_RGBA8);
@@ -218,7 +195,7 @@ void ofApp::setup(){
 	flowMat = cv::Mat(scaledHeight, scaledWidth, CV_32FC2);
 
 	opticalFlowPixels.allocate(scaledWidth, scaledHeight, OF_IMAGE_COLOR);
-	opticalFlowTexture.allocate(scaledWidth, scaledHeight, GL_RGBA8);
+	opticalFlowTexture.allocate(scaledWidth, scaledHeight, GL_RG16);
 	opticalFlowTexture.bindAsImage(7, GL_READ_WRITE);
 }
 
@@ -284,7 +261,7 @@ void ofApp::update(){
 			const cv::Point2f& fxy = flowMat.at<cv::Point2f>(y, x);
 			glm::vec2 flowVector( fxy.x, fxy.y );
 			if( glm::length2(flowVector) > minLengthSquared ) {
-				ofFloatColor color( 0.5 + 0.5 * ofClamp(flowVector.x, -1, 1), 0.5 + 0.5 * ofClamp(flowVector.y, -1, 1), 0 );
+				ofFloatColor color( 0.5 + 0.25 * ofClamp(flowVector.x, -2, 2), 0.5 + 0.25 * ofClamp(flowVector.y, -2, 2), 0 );
 				opticalFlowPixels.setColor(x, y, color);
 			} else {
 				opticalFlowPixels.setColor(x, y, ofFloatColor(0.5,0.5,0));
@@ -298,49 +275,42 @@ void ofApp::update(){
 	compute_flow.setUniform1f("time", time);
 	compute_flow.setUniform2i("resolution", volWidth, volHeight);
 	compute_flow.setUniform1i("opticalFlowDownScale", cvDownScale);
-	compute_flow.dispatchCompute(widthWorkGroups, heightWorkGroups, volDepth/1);
+	compute_flow.dispatchCompute(widthWorkGroups, heightWorkGroups, 1);
 	compute_flow.end();
 
 	// slime updates
 	// horizontal blur
 	compute_diffuse.begin();
-	compute_diffuse.setUniform3i("resolution", volWidth, volHeight, volDepth);
+	compute_diffuse.setUniform2i("resolution", volWidth, volHeight);
 	compute_diffuse.setUniform1f("deltaTime", deltaTime);
 	compute_diffuse.setUniform1f("diffuseRate", diffuseRate);
-	compute_diffuse.setUniform3i("blurDir", 1, 0, 0);
-	compute_diffuse.dispatchCompute(widthWorkGroups, heightWorkGroups, volDepth/1);
+	compute_diffuse.setUniform2i("blurDir", 1, 0);
+	compute_diffuse.dispatchCompute(widthWorkGroups, heightWorkGroups, 1);
 	compute_diffuse.end();
 
 	// vertical blur
 	compute_diffuse.begin();
-	compute_diffuse.setUniform3i("resolution", volWidth, volHeight, volDepth);
+	compute_diffuse.setUniform2i("resolution", volWidth, volHeight);
 	compute_diffuse.setUniform1f("deltaTime", deltaTime);
 	compute_diffuse.setUniform1f("diffuseRate", diffuseRate);
-	compute_diffuse.setUniform3i("blurDir", 0, 1, 0);
-	compute_diffuse.dispatchCompute(widthWorkGroups, heightWorkGroups, volDepth/1);
-	compute_diffuse.end();
-
-	// depth blur
-	compute_diffuse.begin();
-	compute_diffuse.setUniform3i("resolution", volWidth, volHeight, volDepth);
-	compute_diffuse.setUniform1f("deltaTime", deltaTime);
-	compute_diffuse.setUniform1f("diffuseRate", diffuseRate);
-	compute_diffuse.setUniform3i("blurDir", 0, 0, 1);
-	compute_diffuse.dispatchCompute(widthWorkGroups, heightWorkGroups, volDepth/1);
+	compute_diffuse.setUniform2i("blurDir", 0, 1);
+	compute_diffuse.dispatchCompute(widthWorkGroups, heightWorkGroups, 1);
 	compute_diffuse.end();
 
 	compute_decay.begin();
-	compute_decay.setUniform3i("resolution", volWidth, volHeight, volDepth);
+	compute_decay.setUniform2i("resolution", volWidth, volHeight);
 	compute_decay.setUniform1f("deltaTime", deltaTime);
 	compute_decay.setUniform1f("decayRate", decayRate);
-	compute_decay.dispatchCompute(widthWorkGroups, heightWorkGroups, volDepth/1);
+	compute_decay.setUniform1i("opticalFlowDownScale", cvDownScale);
+	compute_decay.dispatchCompute(widthWorkGroups, heightWorkGroups, 1);
 	compute_decay.end();
 
 	compute_agents.begin();
-	compute_agents.setUniform3i("resolution", volWidth, volHeight, volDepth);
+	compute_agents.setUniform2i("resolution", volWidth, volHeight);
 	compute_agents.setUniform1f("deltaTime", deltaTime);
 	compute_agents.setUniform1f("time", time);
 	compute_agents.setUniform1f("trailWeight", trailWeight);
+	compute_agents.setUniform1i("opticalFlowDownScale", cvDownScale);
 	
 	// since each work group has a local_size of 1024 (this is defined in the shader)
 	// we only have to issue 1 / 1024 workgroups to cover the full workload.
@@ -365,6 +335,7 @@ void ofApp::update(){
 	compute_reaction.begin();
 	compute_reaction.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
 	compute_reaction.setUniform1f("deltaTime", deltaTime);
+	compute_reaction.setUniform1i("opticalFlowDownScale", cvDownScale);
 	compute_reaction.dispatchCompute(widthWorkGroups, heightWorkGroups, 1);
 	compute_reaction.end();
 }
@@ -383,7 +354,6 @@ void ofApp::draw() {
 	ofClear(255,255,255, 0);
 	renderer.begin();
 	renderer.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
-	renderer.setUniform1i("trail_depth", volDepth);
 	renderer.setUniform3f("colourA", 1., 0., 0.);
 	renderer.setUniform3f("colourB", 0., 1., 0.);
 	renderer.setUniform3f("light", sun_x, sun_y, sun_z);

@@ -2,7 +2,7 @@
 
 #include "ofMain.h"
 #include "ofBufferObject.h"
-#include "ofxVideoRecorder.h"
+#include "ofxAudioAnalyzer.h"
 
 enum InitialPattern{
 	CIRCLE,
@@ -28,9 +28,23 @@ class ofApp : public ofBaseApp{
 		void windowResized(int w, int h);
 		void dragEvent(ofDragInfo dragInfo);
 		void gotMessage(ofMessage msg);
+		void audioIn(ofSoundBuffer & input);
 
-		ofShader audio_render;
-		ofFbo fbo;
+		struct MelBand{
+			glm::vec4 value;
+		};
+
+		int sampleRate;
+		int bufferSize;
+		int channels;
+
+		ofSoundStream soundStream;
+		ofxAudioAnalyzer audioAnalyzer;
+
+		ofBufferObject melBandsBuffer;
+
+		ofShader compute_audio;
+		ofTexture audio_texture;
 
 		float smoothing;
 };

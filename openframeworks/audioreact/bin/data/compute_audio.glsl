@@ -7,6 +7,7 @@ struct SpectralComponent{
 };
 
 layout(rgba16,binding=0) uniform restrict image2D audioMap;
+layout(rgba8,binding=1) uniform restrict image2D flowMap;
 
 layout(std140, binding=1) buffer spectrum{
     SpectralComponent allSpectrum[];
@@ -16,6 +17,9 @@ uniform ivec2 resolution;
 uniform float deltaTime;
 uniform int numBands;
 uniform float angle;
+uniform float rms;
+uniform float dissonance;
+uniform float numPoints;
 
 float map(float val, float a, float b, float c, float d) {
     float normVal = (val - a) / (b - a);
@@ -26,7 +30,26 @@ float easeIn(float x) {
     return pow(x, 2);
 }
 
-layout(local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
+float sum(vec2 v) {
+    return dot(v, vec2(1., 1.));
+}
+
+float getSpectrum(float cassini) {
+    float scale = sqrt(cassini) / rms;
+    // float scale = length(from_centre) * 2;
+    float index = scale * numBands;
+    if (ceil(index) >= numBands) {
+        index = numBands - 1 - (index - numBands);
+    }
+
+    float lowerSpectrumVal = allSpectrum[max(int(floor(index)), 0)].value.x;
+    float upperSpectrumVal = allSpectrum[min(int(ceil(index)), numBands-1)].value.x;
+    float spectrumVal = mix(lowerSpectrumVal, upperSpectrumVal, pow(fract(index), 2.));
+    float spectrumMapped = exp((spectrumVal - 1) / 4);
+    return spectrumMapped;
+}
+
+layout(local_size_x = 20, local_size_y = 20, local_size_z = 1) in;
 void main(){
 
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
@@ -34,53 +57,27 @@ void main(){
     vec2 centre = vec2(0.5, 0.5);
     vec2 from_centre = uv - centre;
     float this_angle = atan(from_centre.y, from_centre.x);
-    float alt_angle = mod(this_angle + 2 * PI, 2 * PI) - PI;
+    float this_r = length(from_centre);
 
-    int type = 0;
-
-    vec4 vals = vec4(0., 0., 0., 1.);
-    if (type == 0) {
-        vals = imageLoad(audioMap, coord).xyzw;
-        vals.zw = vec2(0., 1.);
-
-        float scale = easeIn(length(from_centre) * 2);
-        // float scale = length(from_centre) * 2;
-        float index = scale * numBands;
-        if (index >= numBands) {
-            index = numBands - 1 - (index - numBands);
-        }
-
-        float lowerSpectrumVal = allSpectrum[int(floor(index))].value.x;
-        float upperSpectrumVal = allSpectrum[int(ceil(index))].value.x;
-        float spectrumVal = mix(lowerSpectrumVal, upperSpectrumVal, fract(index));
-        // float spectrumMapped = map(spectrumVal, -12., 1., 0., 1.);
-        float spectrumMapped = exp((spectrumVal - 1) / 4);
-        vals.x = spectrumMapped;
-    } else if (type == 1) {
-        if (coord.x == resolution.x - 1) {
-            int index = int((1 - uv.y) * numBands);
-            float spectrumVal = allSpectrum[index].value.x;
-            float spectrumMapped = exp((spectrumVal - 1) / 4);
-            vals.xyz = vec3(spectrumMapped);
-        } else {
-            vals.xyz = imageLoad(audioMap, coord + ivec2(1, 0)).xyz;
-        }
+    float a = pow(rms, 5) / 2;
+    float cassini;
+    if (this_angle >= 0) {
+        float frac = abs(this_angle - PI) / PI;
+        float a_cassini = pow(this_r, 4.) - 2 * pow(a, 2.) * pow(this_r, 2.) * cos(numPoints * (angle + this_angle)) + pow(a, 4.);
+        float b_cassini = pow(this_r, 4.) - 2 * pow(a, 2.) * pow(this_r, 2.) * cos(numPoints * -PI) + pow(a, 4.);
+        cassini = mix(b_cassini, a_cassini, pow(1 - frac, 3.));
+    } else if (this_angle < 0) {
+        float frac = abs(this_angle + PI) / PI;
+        float a_cassini = pow(this_r, 4.) - 2 * pow(a, 2.) * pow(this_r, 2.) * cos(numPoints * (angle + this_angle)) + pow(a, 4.);
+        float b_cassini = pow(this_r, 4.) - 2 * pow(a, 2.) * pow(this_r, 2.) * cos(numPoints * PI) + pow(a, 4.);
+        cassini = mix(b_cassini, a_cassini, pow(1 - frac, 3.));
     }
 
-    // neural network idea
-    // vec4 layer1 = vec4(0.);
-    // layer1.x = dot(uv, vec2(-0.2, 0.1));
-    // layer1.y = dot(uv, vec2(0.3, -0.57));
-    // layer1.z = dot(uv, vec2(-0.22, 0.17));
-    // layer1.w = dot(uv, vec2(0.67, 0.11));
+    vec4 vals = vec4(0., 0., 0., 1.);
+    vals = imageLoad(audioMap, coord).xyzw;
+    vals.zw = vec2(0., 1.);
 
-    // layer1 = max(layer1, 0.);
+    vals.x = getSpectrum(cassini);
 
-    // vec3 layer2 = vec3(0.);
-    // layer2.x = dot(layer1, vec4(0.1, 0.2, 0.3, 0.4));
-    // layer2.y = dot(layer1, vec4(0.5, 0.6, 0.7, 0.8));
-    // layer2.z = dot(layer1, vec4(0.9, 0.1, 0.2, 0.3));
-    
-    
 	imageStore(audioMap, coord, vals);
 }

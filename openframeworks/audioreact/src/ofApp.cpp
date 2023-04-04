@@ -3,7 +3,9 @@
 
 //--------------------------------------------------------------
 void ofApp::setup(){
-	smoothing = 0.6;
+	lowSmoothing = 0.6;
+	highSmoothing = 0.8;
+	numPoints = 3.;
 
 	sampleRate = 44100;
     bufferSize = 512;
@@ -21,6 +23,12 @@ void ofApp::setup(){
 
 	audio_texture.allocate(ofGetWidth(), ofGetHeight(), GL_RGBA16);
 	audio_texture.bindAsImage(0, GL_READ_WRITE);
+
+	flowMap.allocate(ofGetWidth(), ofGetHeight(), GL_RGBA8);
+	flowMap.bindAsImage(1, GL_READ_WRITE);
+
+	compute_flow.setupShaderFromFile(GL_COMPUTE_SHADER,"compute_flow.glsl");
+	compute_flow.linkProgram();
 
 	compute_audio.setupShaderFromFile(GL_COMPUTE_SHADER,"compute_audio.glsl");
 	compute_audio.linkProgram();
@@ -63,12 +71,15 @@ void ofApp::update(){
 	float time = ofGetElapsedTimef();
 
 	bool normalize = true;
-	float dissonance = audioAnalyzer.getValue(DISSONANCE, 0, smoothing, normalize);
-	float inharmonicity = audioAnalyzer.getValue(INHARMONICITY, 0, smoothing, normalize);
-	float centroid = audioAnalyzer.getValue(CENTROID, 0, smoothing, normalize);
+	float rms = audioAnalyzer.getValue(RMS, 0, highSmoothing, normalize);
+	float dissonance = audioAnalyzer.getValue(DISSONANCE, 0, highSmoothing, normalize);
+	float inharmonicity = audioAnalyzer.getValue(INHARMONICITY, 0, highSmoothing, normalize);
+	float centroid = audioAnalyzer.getValue(CENTROID, 0, highSmoothing, normalize);
 
-	vector<float> tristimulus = audioAnalyzer.getValues(TRISTIMULUS, 0, smoothing);
-	vector<float> melBands = audioAnalyzer.getValues(MEL_BANDS, 0, smoothing);
+	vector<float> tristimulus = audioAnalyzer.getValues(TRISTIMULUS, 0, lowSmoothing);
+	vector<float> melBands = audioAnalyzer.getValues(MEL_BANDS, 0, lowSmoothing);
+
+	bool isOnset = audioAnalyzer.getOnsetValue(0);
 
 	int numBands = 24;
 	vector<MelBand> melBandsComponents(numBands);
@@ -77,7 +88,7 @@ void ofApp::update(){
 	}
 	melBandsBuffer.updateData(melBandsComponents);
 
-	int workGroupSize = 32;
+	int workGroupSize = 20;
 
 	int widthWorkGroups = ceil(ofGetWidth()/workGroupSize);
 	int heightWorkGroups = ceil(ofGetHeight()/workGroupSize);
@@ -90,11 +101,20 @@ void ofApp::update(){
 	float sun_y = (ofGetHeight() / 2) + (2 * ofGetHeight() / 3) * sin(time_of_day);
 	float sun_z = 25. + 15. * cos(days / 10);
 
+	compute_flow.begin();
+	compute_flow.setUniform1f("time", time);
+	compute_flow.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
+	compute_flow.dispatchCompute(widthWorkGroups, heightWorkGroups, 1);
+	compute_flow.end();
+
 	compute_audio.begin();
 	compute_audio.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
 	compute_audio.setUniform1f("deltaTime", deltaTime);
 	compute_audio.setUniform1i("numBands", numBands);
 	compute_audio.setUniform1f("angle", time_of_day);
+	compute_audio.setUniform1f("rms", rms);
+	compute_audio.setUniform1f("dissonance", dissonance);
+	compute_audio.setUniform1f("numPoints", numPoints);
 	compute_audio.dispatchCompute(widthWorkGroups, heightWorkGroups, 1);
 	compute_audio.end();
 }

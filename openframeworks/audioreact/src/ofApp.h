@@ -44,7 +44,12 @@ class ofApp : public ofBaseApp{
 		ofBufferObject melBandsBuffer;
 
 		ofShader compute_audio;
-		ofTexture audio_texture;
+		ofShader compute_flow;
 
-		float smoothing;
+		ofTexture audio_texture;
+		ofTexture flowMap;
+
+		float lowSmoothing;
+		float highSmoothing;
+		float numPoints;
 };

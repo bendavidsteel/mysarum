@@ -20,7 +20,7 @@ void main(){
     vec2 opticalFlowForce = imageLoad(opticalFlowMap, coord / opticalFlowDownScale).xy;
     opticalFlowForce = opticalFlowForce * 2. - 1.;
     float opticalFlowMag = length(opticalFlowForce);
-    float opticalDecayRate = 1. - opticalFlowMag;
+    float opticalDecayRate = 1. - 0.8 * opticalFlowMag;
     
     vec4 newTrail = min(max((blurredTrail * opticalDecayRate * decayRate * deltaTime), 0.), 1.);
 	imageStore(trailMap, coord, newTrail);

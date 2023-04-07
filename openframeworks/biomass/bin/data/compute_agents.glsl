@@ -30,6 +30,7 @@ uniform float time;
 uniform float deltaTime;
 uniform float trailWeight;
 uniform int opticalFlowDownScale;
+uniform float agentFlowMag;
 
 // A single iteration of Bob Jenkins' One-At-A-Time hashing algorithm.
 uint hash( uint x ) {
@@ -197,11 +198,11 @@ void main(){
 	opticalFlowForce = (2 * opticalFlowForce) - 1; // convert to -1-1 range
 	float opticalFlowMag = length(opticalFlowForce);
 
-	vec2 force = (2 * opticalFlowMag + 1) * simplexFlowForce;
+	vec2 force = (2 * opticalFlowMag + agentFlowMag) * simplexFlowForce;
 
 	// Update position
 	vec2 newVel = normalize(vel + (force * deltaTime));
-	vec2 newPos = pos + (newVel * deltaTime * moveSpeed) + (5 * opticalFlowForce * deltaTime);
+	vec2 newPos = pos + (newVel * deltaTime * moveSpeed) + (4 * opticalFlowForce * deltaTime);
 
 	// Clamp position to map boundaries, and pick new random move dir if hit boundary
 	ensureRebound(newPos, newVel);

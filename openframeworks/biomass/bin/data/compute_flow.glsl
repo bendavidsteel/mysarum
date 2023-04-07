@@ -4,7 +4,6 @@ layout(rgba8,binding=0) uniform restrict image2D flowMap;
 
 uniform float time;
 uniform ivec2 resolution;
-uniform int opticalFlowDownScale;
 
 /* discontinuous pseudorandom uniformly distributed in [-0.5, +0.5]^3 */
 vec3 random3(vec3 c) {
@@ -101,13 +100,7 @@ void main(){
 	// scale to 0-1 for image storage
 	flow_force = 0.5 + (0.5 * flow_force);
 
-	float dist = distance(p, vec2(0.5, 0.5));
-	float flow_strength = 0.01;
-	if (dist < 0.3) {
-		flow_strength = 0.01;
-	}
-
-    vec4 flow = vec4(flow_force, 0., flow_strength);
+    vec4 flow = vec4(flow_force, 1., 1.);
 
 	imageStore(flowMap, coord, flow);
 }

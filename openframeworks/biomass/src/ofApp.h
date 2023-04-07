@@ -4,14 +4,19 @@
 #include "ofBufferObject.h"
 #include "ofxVideoRecorder.h"
 #include "ofxOpenCv.h"
+#include "ofxAudioAnalyzer.h"
+#include "ofxMidi.h"
 
 enum Spawn{
-	RANDOM,
-	CIRCLE,
-	RING
+	RANDOM=0,
+	CIRCLE=1,
+	RING=2,
+	SMALL_RING=3,
+	VERTICAL_LINE=4,
+	HORIZONTAL_LINE=5
 };
 
-class ofApp : public ofBaseApp{
+class ofApp : public ofBaseApp, public ofxMidiListener{
 
 	public:
 		void setup();
@@ -21,22 +26,22 @@ class ofApp : public ofBaseApp{
 
 		void keyPressed(int key);
 		void keyReleased(int key);
-		void mouseMoved(int x, int y );
-		void mouseDragged(int x, int y, int button);
-		void mousePressed(int x, int y, int button);
-		void mouseReleased(int x, int y, int button);
-		void mouseEntered(int x, int y);
-		void mouseExited(int x, int y);
-		void windowResized(int w, int h);
-		void dragEvent(ofDragInfo dragInfo);
-		void gotMessage(ofMessage msg);
-		void audioIn(float * input, int bufferSize, int nChannels);
+		void audioIn(ofSoundBuffer & input);
+		void newMidiMessage(ofxMidiMessage& eventArgs);
+
+		void copyVariables();
+		void moveToVariables();
+		void reSpawnAgents();
 
 		ofxVideoRecorder vidRecorder;
 		ofSoundStream soundStream;
+		ofxMidiIn midiIn;
+
 		bool bRecording;
 		int sampleRate;
+		int bufferSize;
 		int channels;
+		float volume;
 		string fileName;
 		string fileExt;
 
@@ -45,6 +50,7 @@ class ofApp : public ofBaseApp{
 		// both
 		ofShader compute_flow;
 		ofShader renderer;
+		ofShader simple_renderer;
 
 		ofTexture flowMap;
 
@@ -71,15 +77,16 @@ class ofApp : public ofBaseApp{
 		vector<Agent> particles;
 		ofBufferObject particlesBuffer;
 		vector<Species> allSpecies;
+		vector<Species> newSpecies;
 		ofBufferObject allSpeciesBuffer;
 		ofTexture trailMap;
 
-		int volWidth;
-		int volHeight;
-
 		float diffuseRate;
+		float newDiffuseRate;
 		float decayRate;
+		float newDecayRate;
 		float trailWeight;
+		float newTrailWeight;
 
 		// reaction diffusion
 		ofShader compute_diffusion;
@@ -110,4 +117,57 @@ class ofApp : public ofBaseApp{
 		float cvDownScale;
 		bool bContrastStretch;
 		float minLengthSquared;
+
+		// audio analysis
+		struct Component{
+			glm::vec4 value;
+		};
+
+		ofxAudioAnalyzer audioAnalyzer;
+
+		ofBufferObject melBandsBuffer;
+		ofBufferObject pointsBuffer;
+
+		ofShader compute_audio;
+		ofTexture audio_texture;
+
+		float lowSmoothing;
+		float highSmoothing;
+
+		vector<Component> points;
+		vector<Component> newPoints;
+
+		// variables
+		float days;
+		float time_of_day;
+
+		float dayRate;
+		float newDayRate;
+		float sunZ;
+		float newSunZ;
+		float chemHeight;
+		float newChemHeight;
+		float trailHeight;
+		float newTrailHeight;
+
+		float feedMin;
+		float newFeedMin;
+		float feedRange;
+		float newFeedRange;
+
+		float reactionFlowMag;
+		float newReactionFlowMag;
+		float agentFlowMag;
+		float newAgentFlowMag;
+
+		glm::vec3 colourA;
+		glm::vec3 newColourA;
+		glm::vec3 colourB;
+		glm::vec3 newColourB;
+		glm::vec3 colourC;
+		glm::vec3 newColourC;
+		glm::vec3 colourD;
+		glm::vec3 newColourD;
+
+		int display;
 };

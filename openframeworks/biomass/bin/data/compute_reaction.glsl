@@ -3,12 +3,13 @@
 layout(rg16,binding=3) uniform restrict image2D reactionMap;
 layout(rg16,binding=2) uniform restrict image2D feedkillMap;
 layout(rgba8,binding=0) uniform restrict image2D flowMap;
-layout(rg16,binding=1) uniform restrict image2D diffusionMap;
+layout(rg16,binding=8) uniform restrict image2D audioMap;
 layout(rg16,binding=7) uniform restrict image2D opticalFlowMap; // TODO switch to readonly
 
 uniform ivec2 resolution;
 uniform float deltaTime;
 uniform int opticalFlowDownScale;
+uniform float reactionFlowMag;
 
 layout(local_size_x = 20, local_size_y = 20, local_size_z = 1) in;
 void main(){
@@ -22,14 +23,13 @@ void main(){
 
     // get flow map
     vec2 simplex_flow = imageLoad(flowMap, coord).xy;
-    float flow_strength = 100. * imageLoad(flowMap, coord).w; // scale back up 
     simplex_flow = (2 * simplex_flow) - 1; //convert flow to -1 to 1 range
 
     vec2 optical_flow = imageLoad(opticalFlowMap, coord / opticalFlowDownScale).xy;
     optical_flow = (2 * optical_flow) - 1; //convert flow to -1 to 1 range
     float opticalFlowMag = length(optical_flow);
 
-    vec2 flow = 100 * opticalFlowMag * flow_strength * simplex_flow;
+    vec2 flow = (reactionFlowMag + 15 * opticalFlowMag) * simplex_flow;
     float flow_left = 0.2 + 0.2 * flow.x;
     float flow_right = 0.2 - 0.2 * flow.x;
     float flow_up = 0.2 + 0.2 * flow.y;
@@ -85,7 +85,9 @@ void main(){
     float kill = -1 * (k + f) * b;
     vec2 feedkillVec = vec2(feed, kill);
 
-    vec2 diffusion = imageLoad(diffusionMap, coord).xy;
+    vec3 audio = imageLoad(audioMap, coord).xyz;
+    float audioMag = length(audio);
+    vec2 diffusion = vec2(1.0, 0.5) + audioMag * vec2(0.2, 0.1);
 
     vec2 newValues = previous + (deltaTime * ((diffusion * laplacian) + reactionVec + feedkillVec));
 

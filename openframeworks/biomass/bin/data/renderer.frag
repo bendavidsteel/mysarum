@@ -11,13 +11,14 @@ layout(std140, binding=5) buffer species{
 };
 
 layout(rgba8,binding=6) uniform restrict image2D trailMap;
-
 layout(rgba8,binding=0) uniform restrict image2D flowMap;
-
 layout(rg16,binding=3) uniform restrict image2D reactionMap;
+layout(rg16,binding=8) uniform restrict image2D audioMap;
 
 uniform vec3 colourA;
 uniform vec3 colourB;
+uniform vec3 colourC;
+uniform vec3 colourD;
 uniform ivec2 resolution;
 uniform vec3 light;
 uniform float chem_height;
@@ -30,17 +31,23 @@ void main()
 	ivec2 coord = ivec2(gl_FragCoord.xy);
 
 	vec2 chems = imageLoad(reactionMap, coord).xy;
+	vec2 audio = imageLoad(audioMap, coord).xy;
+
+	vec3 audioColour = colourC * audio.x;
+	audioColour += colourD * audio.y;
+
+	float this_chem_height = chem_height * (1 + length(audio));
 
 	vec3 pos = vec3(coord, chems.y);
-	float pos_height = chems.y * chem_height;
+	float pos_height = chems.y * this_chem_height;
 	float dist_to_light = distance(pos.xy, light.xy);
 
 	vec3 lighting = vec3(1.);
 	float falloff = resolution.x / 3;
-	vec3 light_falloff = exp(-dist_to_light / (30 * falloff)) + 0.3 * vec3(sin(-dist_to_light / falloff), sin(1 - (dist_to_light / falloff)), sin(2 - (dist_to_light / falloff)));
+	vec3 light_falloff = vec3(exp(-dist_to_light / (50 * falloff))) + 0.8 * audioColour;
 
 	float height_to_light = light.z - pos_height;
-	float max_dist_to_other_peak = dist_to_light * (chem_height - pos_height) / height_to_light;
+	float max_dist_to_other_peak = dist_to_light * (this_chem_height - pos_height) / height_to_light;
 	vec2 dir_to_light = normalize(light.xy - pos.xy);
 	
 	for (float dist = 0.; dist < max_dist_to_other_peak; dist++)
@@ -50,11 +57,11 @@ void main()
 			break;
 		}
 
-		float other_peak_height = imageLoad(reactionMap, ivec2(other_peak)).y * chem_height;
+		float other_peak_height = imageLoad(reactionMap, ivec2(other_peak)).y * this_chem_height;
 		float light_height = pos_height + (dist * height_to_light / dist_to_light);
 		if (other_peak_height > light_height) {
 			// in shadow
-			lighting = vec3(0.4);
+			lighting *= vec3(0.4);
 			break;
 		}
 	}

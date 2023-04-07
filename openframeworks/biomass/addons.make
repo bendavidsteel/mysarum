@@ -1,4 +1,5 @@
 ofxPoco
 ofxVideoRecorder
-ofxVolumetrics
 ofxOpenCv
+ofxAudioAnalyzer
+ofxMidi

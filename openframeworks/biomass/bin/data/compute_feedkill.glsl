@@ -5,6 +5,8 @@ layout(rg16,binding=2) uniform restrict image2D feedkillMap;
 uniform ivec2 resolution;
 uniform float time;
 uniform float speed;
+uniform float feedMin;
+uniform float feedRange;
 
 float get_third_degree_polynomial_out(float x, vec4 coefs) {
     vec4 xs = vec4(1.);
@@ -21,10 +23,8 @@ void main(){
     
     float kill_min = 0.045;
     float kill_range = 0.025;
-    float feed_min = 0.01;
-    float feed_range = 0.09;
 
-    float feed = feed_min + (feed_range * uv.y);
+    float feed = feedMin + (feedRange * uv.y);
 
     vec4 kill_low_coefs = vec4(0.01412, 1.91897, -25.11451, 100.75403);
     float kill_low = get_third_degree_polynomial_out(feed, kill_low_coefs);

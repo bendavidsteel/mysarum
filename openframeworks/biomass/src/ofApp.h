@@ -28,10 +28,12 @@ class ofApp : public ofBaseApp, public ofxMidiListener{
 		void keyReleased(int key);
 		void audioIn(ofSoundBuffer & input);
 		void newMidiMessage(ofxMidiMessage& eventArgs);
+		void newInput(int key);
 
 		void copyVariables();
 		void moveToVariables();
 		void reSpawnAgents();
+		void reSpawnReaction();
 
 		ofxVideoRecorder vidRecorder;
 		ofSoundStream soundStream;
@@ -170,4 +172,7 @@ class ofApp : public ofBaseApp, public ofxMidiListener{
 		glm::vec3 newColourD;
 
 		int display;
+
+		bool bReSpawnAgents;
+		bool bReSpawnReaction;
 };

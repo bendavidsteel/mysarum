@@ -97,40 +97,7 @@ void ofApp::setup(){
 	trailMap.bindAsImage(6, GL_READ_WRITE);
 
 	// reaction diffusion setup
-
-	ofPixels initialReaction;
-	initialReaction.allocate(ofGetWidth(), ofGetHeight(), OF_PIXELS_RGBA);
-	ofColor baseReactionColour(255., 0., 0., 0.);
-	initialReaction.setColor(baseReactionColour);
-
-	Spawn initialPattern = RANDOM;
-
-	ofColor reactantColour(255., 255., 0., 0.);
-	if (initialPattern == CIRCLE) {
-		int circleSize = ofGetHeight() / 32;
-		glm::vec2 centre = glm::vec2(ofGetWidth() / 2, ofGetHeight() / 2);
-		for (int j = 0; j < ofGetHeight(); j++) {
-			for (int i = 0; i < ofGetWidth(); i++) {
-				glm::vec2 point = glm::vec2(i, j);
-				float radius = glm::distance(point, centre);
-				if (radius < circleSize) {
-					initialReaction.setColor(i, j, reactantColour);
-				}
-			}
-		}
-	} else if (initialPattern == RANDOM) {
-		for (int j = 0; j < ofGetHeight(); j++) {
-			for (int i = 0; i < ofGetWidth(); i++) {
-				if (ofRandom(1) < 0.1) {
-					initialReaction.setColor(i, j, reactantColour);
-				}
-			}
-		}
-	}
-
-	reactionMap.allocate(ofGetWidth(), ofGetHeight(), GL_RG16);
-	reactionMap.loadData(initialReaction);
-	reactionMap.bindAsImage(3, GL_READ_WRITE);
+	reSpawnReaction();
 
 	feedkillMap.allocate(ofGetWidth(), ofGetHeight(), GL_RG16);
 	feedkillMap.bindAsImage(2, GL_READ_WRITE);
@@ -376,6 +343,16 @@ void ofApp::update(){
 	}
 	pointsBuffer.updateData(thesePoints);
 
+	if (bReSpawnAgents) {
+		reSpawnAgents();
+		bReSpawnAgents = false;
+	}
+
+	if (bReSpawnReaction) {
+		reSpawnReaction();
+		bReSpawnReaction = false;
+	}
+
 	int workGroupSize = 20;
 
 	int widthWorkGroups = ceil(ofGetWidth()/workGroupSize);
@@ -555,14 +532,12 @@ void ofApp::newMidiMessage(ofxMidiMessage& message) {
 
 	if (message.status < MIDI_SYSEX) {
 		if (message.status == MIDI_NOTE_ON) {
-			if (message.pitch == 36) {
-
-			} else if (message.pitch = 96) {
-
-			}
+			// 36 - 96
+			newInput(message.pitch);
 		} else if (message.status == MIDI_CONTROL_CHANGE) {
 			int val = message.value;
 			// 0 - 127
+			newDayRate = ofMap(val, 0, 127, 4, 30);
 		} else if (message.status == MIDI_PITCH_BEND) {
 			int val = message.value;
 			// 0 - 16383
@@ -572,7 +547,108 @@ void ofApp::newMidiMessage(ofxMidiMessage& message) {
 
 //--------------------------------------------------------------
 void ofApp::keyPressed(int key){
-	if (key == '0') {
+	newInput(key);
+}
+
+void ofApp::newInput(int key) {
+	
+	if (key == 36) {
+		bReSpawnAgents = true;
+	} else if (key == 37) {
+		display = 0;
+	} else if (key == 38) {
+		display = 1;
+	} else if (key == 39) {
+		display = 2;
+	} else if (key == 40) {
+		display = 3;
+	} else if (key == 41) {
+		display = 4;
+	} else if (key == 42) {
+		display = 5;
+	} else if (key == 43) {
+		newColourA = glm::vec3(1., 0., 0.);
+		newColourB = glm::vec3(0., 1., 0.);
+	} else if (key == 44) {
+		newColourA = glm::vec3(1.0, 0.906, 0.51);
+		newColourB = glm::vec3(0.98, 0.345, 0.118);
+	} else if (key == 45) {
+		newColourA = glm::vec3(0.494, 0.921, 0.063);
+		newColourB = glm::vec3(0.839, 0.812, 0.153);
+	} else if (key == 46) {
+		newColourC = glm::vec3(0.839, 0.02, 0.004);
+		newColourD = glm::vec3(0., 0., 1.);
+	} else if (key == 47) {
+		newColourC = glm::vec3(1., 0., 0.);
+		newColourD = glm::vec3(0., 0., 1.);
+	} else if (key == 48) {
+		newColourC = glm::vec3(191./255., 11./255., 59./255.);
+		newColourD = glm::vec3(213./255., 13./255., 216./255.);
+	} else if (key == 49) {
+		newSpecies[0].colour = glm::vec4(0.796, 0.2, 1., 1.);
+		newSpecies[1].colour = glm::vec4(0.1, 0.969, 1., 1.);
+	} else if (key == 50) {
+		newSpecies[0].colour = glm::vec4(0.263, 0.31, 0.98, 1.);
+		newSpecies[1].colour = glm::vec4(0.396, 0.839, 0.749, 1.);
+	} else if (key == 51) {
+		newSpecies[0].movementAttributes.x = ofRandom(0.9, 1.4); // moveSpeed
+	} else if (key == 52) {
+		newSpecies[0].movementAttributes.y = ofRandom(0.03, 0.07) * 2 * PI; // turnSpeed
+	} else if (key == 53) {
+		newSpecies[0].sensorAttributes.x = ofRandom(30, 50) * PI / 180; // sensorAngleRad
+	} else if (key == 54) {
+		newSpecies[0].sensorAttributes.y = ofRandom(10, 30); // sensorOffsetDist
+	} else if (key == 55) {
+		newSpecies[1].movementAttributes.x = ofRandom(0.6, 1.1); // moveSpeed
+	} else if (key == 56) {
+		newSpecies[1].movementAttributes.y = ofRandom(0.08, 0.13) * 2 * PI; // turnSpeed
+	} else if (key == 57) {
+		newSpecies[1].sensorAttributes.x = ofRandom(50, 70) * PI/ 180; // sensorAngleRad
+	} else if (key == 58) {
+		newSpecies[1].sensorAttributes.y = ofRandom(30, 50); //sensorOffsetDist
+	} else if (key == 59) {
+		newTrailHeight = ofRandom(5, 10);
+	} else if (key == 60) {
+		newDiffuseRate = ofRandom(0.05, 0.4);
+	} else if (key == 61) {
+		newDecayRate = 1 - std::pow(0.1, ofRandom(1, 3.1));
+	} else if (key == 62) {
+		if (newAgentFlowMag == 0) {
+			newAgentFlowMag = 20;
+		} else if (newAgentFlowMag = 20) {
+			newAgentFlowMag = 0;
+		}
+	} else if (key == 63) {
+		if (newReactionFlowMag == 0) {
+			newReactionFlowMag = 20;
+		} else if (newReactionFlowMag = 20) {
+			newReactionFlowMag = 0;
+		}
+	} else if (key == 64) {
+		newSunZ = ofRandom(20, 50);
+	} else if (key == 65) {
+		newChemHeight = ofRandom(1, 9);
+	} else if (key == 66) {
+		newFeedMin = 0.01;
+		newFeedRange = 0.09;
+		bReSpawnReaction = true;
+	} else if (key == 67) {
+		newFeedMin = 0.01;
+		newFeedRange = 0.025;
+		bReSpawnReaction = true;
+	} else if (key == 68) {
+		newFeedMin = 0.035;
+		newFeedRange = 0.025;
+		bReSpawnReaction = true;
+	} else if (key == 69) {
+		newFeedMin = 0.06;
+		newFeedRange = 0.015;
+		bReSpawnReaction = true;
+	} else if (key == 70) {
+		newFeedMin = 0.075;
+		newFeedRange = 0.015;
+		bReSpawnReaction = true;
+	} else if (key == 71) {
 		for (int i = 0; i < 1; i++) {
 			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 0;
@@ -583,8 +659,7 @@ void ofApp::keyPressed(int key){
 		for (int i = 1; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
-	}
-	if (key == '1') {
+	} else if (key == 72) {
 		for (int i = 0; i < 2; i++) {
 			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 1;
@@ -595,7 +670,7 @@ void ofApp::keyPressed(int key){
 		for (int i = 2; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
-	} else if (key == '2') {
+	} else if (key == 73) {
 		for (int i = 0; i < 2; i++) {
 			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 0.5 + 0.5 * i;
@@ -606,7 +681,7 @@ void ofApp::keyPressed(int key){
 		for (int i = 2; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
-	} else if (key == '3') {
+	} else if (key == 74) {
 		for (int i = 0; i < 2; i++) {
 			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 0.5 + 0.5 * i;
@@ -617,7 +692,7 @@ void ofApp::keyPressed(int key){
 		for (int i = 2; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
-	} else if (key == '4') {
+	} else if (key == 75) {
 		for (int i = 0; i < 3; i++) {
 			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 1;
@@ -628,7 +703,7 @@ void ofApp::keyPressed(int key){
 		for (int i = 3; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
-	} else if (key == '5') {
+	} else if (key == 76) {
 		for (int i = 0; i < 3; i++) {
 			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 1;
@@ -639,7 +714,7 @@ void ofApp::keyPressed(int key){
 		for (int i = 3; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
-	} else if (key == '6') {
+	} else if (key == 77) {
 		for (int i = 0; i < 3; i++) {
 			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 0.5 + i * 0.5;
@@ -650,7 +725,7 @@ void ofApp::keyPressed(int key){
 		for (int i = 3; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
-	} else if (key == '7') {
+	} else if (key == 78) {
 		for (int i = 0; i < 4; i++) {
 			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 1;
@@ -659,7 +734,7 @@ void ofApp::keyPressed(int key){
 			newPoints[i].value.w = 1 - z;
 		}
 		newPoints[4].value = glm::vec4(0);
-	} else if (key == '8') {
+	} else if (key == 79) {
 		for (int i = 0; i < 4; i++) {
 			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 1;
@@ -668,7 +743,7 @@ void ofApp::keyPressed(int key){
 			newPoints[i].value.w =  1 - z;
 		}
 		newPoints[4].value = glm::vec4(0);
-	} else if (key == '9') {
+	} else if (key == 80) {
 		for (int i = 0; i < 4; i++) {
 			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 0.3 + 0.3 * i;
@@ -677,7 +752,7 @@ void ofApp::keyPressed(int key){
 			newPoints[i].value.w = 1 - z;
 		}
 		newPoints[4].value = glm::vec4(0);
-	} else if (key == '10') {
+	} else if (key == 81) {
 		for (int i = 0; i < 5; i++) {
 			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 1;
@@ -685,7 +760,7 @@ void ofApp::keyPressed(int key){
 			newPoints[i].value.z = z;
 			newPoints[i].value.w = 1 - z;
 		}
-	} else if (key == '11') {
+	} else if (key == 82) {
 		for (int i = 0; i < 5; i++) {
 			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 0.2 + 0.2 * i;
@@ -693,7 +768,7 @@ void ofApp::keyPressed(int key){
 			newPoints[i].value.z = z;
 			newPoints[i].value.w = 1 - z;
 		}
-	} else if (key == '12') {
+	} else if (key == 83) {
 		for (int i = 0; i < 5; i++) {
 			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 0.3 + 0.3 * i;
@@ -701,83 +776,6 @@ void ofApp::keyPressed(int key){
 			newPoints[i].value.z = z;
 			newPoints[i].value.w = 1 - z;
 		}
-	} else if (key == 'q') {
-		display = 0;
-	} else if (key == 'w') {
-		display = 1;
-	} else if (key == 'e') {
-		display = 2;
-	} else if (key == 'r') {
-		display = 3;
-	} else if (key == 't') {
-		display = 4;
-	} else if (key == 'y') {
-		display = 5;
-	} else if (key == 'a') {
-		newColourA = glm::vec3(1.0, 0.906, 0.51);
-		newColourB = glm::vec3(0.98, 0.345, 0.118);
-	} else if (key == 's') {
-		newColourC = glm::vec3(0.839, 0.02, 0.004);
-		newColourD = glm::vec3(0., 0., 1.);
-	} else if (key == 'd') {
-		newSpecies[0].colour = glm::vec4(0.796, 0.2, 1., 1.);
-		newSpecies[1].colour = glm::vec4(0.1, 0.969, 1., 1.);
-	} else if (key == 'f') {
-		newColourA = glm::vec3(0.494, 0.921, 0.063);
-		newColourB = glm::vec3(0.839, 0.812, 0.153);
-	} else if (key == 'g') {
-		newColourC = glm::vec3(191./255., 11./255., 59./255.);
-		newColourD = glm::vec3(213./255., 13./255., 216./255.);
-	} else if (key == 'h') {
-		newSpecies[0].colour = glm::vec4(0.263, 0.31, 0.98, 1.);
-		newSpecies[1].colour = glm::vec4(0.396, 0.839, 0.749, 1.);
-	} else if (key == 'z') {
-		newSpecies[0].movementAttributes.x = ofRandom(0.9, 1.4); // moveSpeed
-	} else if (key == 'x') {
-		newSpecies[0].movementAttributes.y = ofRandom(0.03, 0.07) * 2 * PI; // turnSpeed
-	} else if (key == 'c') {
-		newSpecies[0].sensorAttributes.x = ofRandom(30, 50) * PI / 180; // sensorAngleRad
-	} else if (key == 'v') {
-		newSpecies[0].sensorAttributes.y = ofRandom(10, 30); // sensorOffsetDist
-	} else if (key == 'b') {
-		newSpecies[1].movementAttributes.x = ofRandom(0.6, 1.1); // moveSpeed
-	} else if (key == 'n') {
-		newSpecies[1].movementAttributes.y = ofRandom(0.08, 0.13) * 2 * PI; // turnSpeed
-	} else if (key == 'm') {
-		newSpecies[1].sensorAttributes.x = ofRandom(50, 70) * PI/ 180; // sensorAngleRad
-	} else if (key == ',') {
-		newSpecies[1].sensorAttributes.y = ofRandom(30, 50); //sensorOffsetDist
-	} else if (key == '.') {
-		newReactionFlowMag = ofRandom(0, 5);
-	} else if (key == '/') {
-		newAgentFlowMag = ofRandom(0, 1);
-	} else if (key == '13') {
-		newSunZ = ofRandom(20, 50);
-	} else if (key == '14') {
-		newChemHeight = ofRandom(1, 9);
-	} else if (key == '15') {
-		newTrailHeight = ofRandom(10, 20);
-	} else if (key == '16') {
-		newDiffuseRate = ofRandom(0.05, 0.4);
-	} else if (key == '17') {
-		newDecayRate = 1 - std::pow(0.1, ofRandom(1, 3.1));
-	} else if (key == '18') {
-		newFeedMin = 0.01;
-		newFeedRange = 0.09;
-	} else if (key == '19') {
-		newFeedMin = 0.01;
-		newFeedRange = 0.025;
-	} else if (key == '20') {
-		newFeedMin = 0.035;
-		newFeedRange = 0.025;
-	} else if (key == '21') {
-		newFeedMin = 0.06;
-		newFeedRange = 0.015;
-	} else if (key == '22') {
-		newFeedMin = 0.075;
-		newFeedRange = 0.9;
-	} else if (key == ']') {
-		reSpawnAgents();
 	}
 }
 
@@ -846,17 +844,19 @@ void ofApp::copyVariables() {
 }
 
 void ofApp::moveToVariables() {
-	float rate = 0.01;
+	float rate = 0.02;
 
 	for (int i = 0; i < points.size(); i++) {
 		points[i].value = glm::mix(points[i].value, newPoints[i].value, rate);
 	}
 
 	for (int i = 0; i < 2; i++) {
-		allSpecies[i].movementAttributes = glm::mix(allSpecies[i].movementAttributes, newSpecies[i].movementAttributes, rate);
+		allSpecies[i].movementAttributes.x = (1 - rate) * allSpecies[i].movementAttributes.x + rate * newSpecies[i].movementAttributes.x;
+		allSpecies[i].movementAttributes.y = (1 - rate) * allSpecies[i].movementAttributes.y + rate * newSpecies[i].movementAttributes.y;
 		allSpecies[i].sensorAttributes = glm::mix(allSpecies[i].sensorAttributes, newSpecies[i].sensorAttributes, rate);
 		allSpecies[i].colour = glm::mix(allSpecies[i].colour, newSpecies[i].colour, rate);
 	}
+	allSpeciesBuffer.updateData(allSpecies);
 
 	colourA = glm::mix(colourA, newColourA, rate);
 	colourB = glm::mix(colourB, newColourB, rate);
@@ -872,10 +872,12 @@ void ofApp::moveToVariables() {
 	trailWeight = (1 - rate) * trailWeight + rate * newTrailWeight;
 
 	feedMin = (1 - rate) * feedMin + rate * newFeedMin;
-	feedRange = (1 - rate) * feedRange + rate * feedRange;
+	feedRange = (1 - rate) * feedRange + rate * newFeedRange;
 
 	reactionFlowMag = (1 - rate) * reactionFlowMag + rate * newReactionFlowMag;
 	agentFlowMag = (1 - rate) * agentFlowMag + rate * newAgentFlowMag;
+
+	dayRate = (1 - rate) * dayRate + rate * newDayRate;
 }
 
 void ofApp::reSpawnAgents() {
@@ -916,4 +918,26 @@ void ofApp::reSpawnAgents() {
 		p.attributes.x = speciesIdx;
 	}
 	particlesBuffer.updateData(particles);
+}
+
+void ofApp::reSpawnReaction() {
+	ofPixels initialReaction;
+	initialReaction.allocate(ofGetWidth(), ofGetHeight(), OF_PIXELS_RGBA);
+	ofColor baseReactionColour(255., 0., 0., 0.);
+	initialReaction.setColor(baseReactionColour);
+
+	Spawn initialPattern = RANDOM;
+
+	ofColor reactantColour(255., 255., 0., 0.);
+	for (int j = 0; j < ofGetHeight(); j++) {
+		for (int i = 0; i < ofGetWidth(); i++) {
+			if (ofRandom(1) < 0.1) {
+				initialReaction.setColor(i, j, reactantColour);
+			}
+		}
+	}
+
+	reactionMap.allocate(ofGetWidth(), ofGetHeight(), GL_RG16);
+	reactionMap.loadData(initialReaction);
+	reactionMap.bindAsImage(3, GL_READ_WRITE);
 }

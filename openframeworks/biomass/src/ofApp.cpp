@@ -32,7 +32,7 @@ void ofApp::setup(){
 	sampleRate = 44100;
 	bufferSize = 512;
     channels = 2;
-	volume = 0.5;
+	volume = 0.1;
 
 	fileName = "testMovie";
     fileExt = ".mov"; // ffmpeg uses the extension to determine the container type. run 'ffmpeg -formats' to see supported formats

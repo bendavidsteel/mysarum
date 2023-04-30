@@ -829,6 +829,7 @@ void ofApp::copyVariables() {
 	newColourD = colourD;
 
 	newSunZ = sunZ;
+	newDayRate = dayRate;
 	newChemHeight = chemHeight;
 	newTrailHeight = trailHeight;
 

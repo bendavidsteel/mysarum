@@ -173,7 +173,7 @@ void main(){
 
 	float randomSteerStrength = random(vec3(pos, time));
 
-	if (weightForward < weightLeft && weightForward < weightRight) { // TODO does this make sense?
+	if (weightForward < weightLeft && weightForward < weightRight) {
 		angle += (randomSteerStrength - 0.5) * 2 * turnSpeed * deltaTime;
 	}
 	// Turn right

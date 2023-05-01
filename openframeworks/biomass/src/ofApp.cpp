@@ -547,7 +547,41 @@ void ofApp::newMidiMessage(ofxMidiMessage& message) {
 
 //--------------------------------------------------------------
 void ofApp::keyPressed(int key){
-	newInput(key);
+	if (key == '1') {
+		newInput(36);
+	} else if (key == '2') {
+		newInput(37);
+	} else if (key == '3') {
+		newInput(38);
+	} else if (key == '4') {
+		newInput(39);
+	} else if (key == '5') {
+		newInput(40);
+	} else if (key == 'q') {
+		newInput(43);
+	} else if (key == 'w') {
+		newInput(44);
+	} else if (key == 'e') {
+		newInput(45);
+	} else if (key == 'r') {
+		newInput(49);
+	} else if (key == 't') {
+		newInput(50);
+	} else if (key == 'a') {
+		newInput(62);
+	} else if (key == 's') {
+		newInput(63);
+	} else if (key == 'z') {
+		newInput(66);
+	} else if (key == 'x') {
+		newInput(67);
+	} else if (key == 'c') {
+		newInput(68);
+	} else if (key == 'v') {
+		newInput(69);
+	} else if (key == 'b') {
+		newInput(70);
+	}
 }
 
 void ofApp::newInput(int key) {

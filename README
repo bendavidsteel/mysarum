@@ -1,4 +1,14 @@
-# Inspiration
+# Mysarum
+
+Ongoing project featuring generally biologically inspired works, using Processing for experimentation, and Open Frameworks for final versions.
+
+## Biomass
+
+An installation focused 2D version of the project. Reactive to audio, video motion, and through a keyboard based controller.
+
+![image of biomass](./biomass.jpg)
+
+## Inspiration
 
 https://www.reddit.com/r/generative/comments/z6rzhc/physarum/
 https://www.reddit.com/r/generative/comments/vf4511/figures_of_discomfort_is_a_generative_art_project/

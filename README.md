@@ -2,7 +2,7 @@
 
 Ongoing project featuring generally biologically inspired works, using Processing for experimentation, and Open Frameworks for final versions.
 
-## Biomass
+## [Biomass](openframeworks/biomass)
 
 An installation focused 2D version of the project. Reactive to audio, video motion, and through a keyboard based controller.
 

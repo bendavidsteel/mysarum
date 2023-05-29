@@ -1,9 +1,9 @@
 #version 440
 
-layout(rgba8,binding=0) uniform restrict image2D flowMap;
-
 uniform float time;
 uniform ivec2 resolution;
+
+out vec4 out_color;
 
 /* discontinuous pseudorandom uniformly distributed in [-0.5, +0.5]^3 */
 vec3 random3(vec3 c) {
@@ -81,12 +81,9 @@ float simplex3d_fractal(vec3 m) {
 			+0.0666667*simplex3d(8.0*m);
 }
 
-
-
-layout(local_size_x = 20, local_size_y = 20, local_size_z = 1) in;
 void main(){
 
-    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 coord = ivec2(gl_FragCoord.xy);
 
     vec2 p = vec2(1.0) * coord.xy/resolution.xy;
     vec3 p3_x = vec3(p, (time + 10000)*0.025);
@@ -100,7 +97,5 @@ void main(){
 	// scale to 0-1 for image storage
 	flow_force = 0.5 + (0.5 * flow_force);
 
-    vec4 flow = vec4(flow_force, 1., 1.);
-
-	imageStore(flowMap, coord, flow);
+    out_color = vec4(flow_force, 1., 1.);
 }

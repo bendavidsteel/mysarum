@@ -56,7 +56,7 @@ void ofApp::setup(){
 	compute_decay.setupShaderFromFile(GL_COMPUTE_SHADER,"compute_diffuse_decay.glsl");
 	compute_decay.linkProgram();
 
-	render.load("generic.vert", "shader.frag");
+	renderer.load("generic.vert", "shader.frag");
 }
 
 //--------------------------------------------------------------
@@ -90,9 +90,9 @@ void ofApp::update(){
 //--------------------------------------------------------------
 void ofApp::draw(){
 	ofSetColor(255);
-    render.begin();
+    renderer.begin();
     ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
-    render.end();
+    renderer.end();
 
 	ofDrawBitmapString(ofGetFrameRate(),20,20);
 }

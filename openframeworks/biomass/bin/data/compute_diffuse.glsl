@@ -1,6 +1,6 @@
 #version 440
 
-layout(rgba8,binding=6) uniform restrict image2D trailMap;
+layout(rgba8,binding=3) uniform restrict image2D trailMap;
 
 uniform ivec2 resolution;
 uniform float deltaTime;

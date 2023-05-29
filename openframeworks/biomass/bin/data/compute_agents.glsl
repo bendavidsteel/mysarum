@@ -12,18 +12,20 @@ struct Species{
 	vec4 sensorAttributes;
 };
 
-layout(std140, binding=4) buffer particle{
+layout(std140, binding=1) buffer particle{
     Agent agents[];
 };
 
-layout(std140, binding=5) buffer species{
+layout(std140, binding=2) buffer species{
     Species allSpecies[];
 };
 
-layout(rgba8,binding=6) uniform restrict image2D trailMap;
-layout(rgba8,binding=0) uniform restrict image2D flowMap;
-layout(rg16,binding=7) uniform restrict image2D opticalFlowMap; // TODO switch to readonly
-layout(rg16,binding=3) uniform restrict image2D reactionMap;
+layout(rgba8,binding=3) uniform restrict image2D trailMap;
+layout(rg16,binding=4) uniform restrict image2D optFlowMap; // TODO switch to readonly
+layout(rg16,binding=0) uniform restrict image2D reactionMap;
+layout(rg16,binding=7) uniform restrict image2D audioMap;
+
+uniform sampler2DRect flowMap;
 
 uniform ivec2 resolution;
 uniform float time;
@@ -105,14 +107,14 @@ float sense(vec2 pos, float angle, vec4 speciesMask, float sensorOffsetDist, flo
 			sum += dot(senseWeight, trailWeight);
 
 			// repel from optical flow
-			vec2 opticalFlow = imageLoad(opticalFlowMap, sampleCoord / opticalFlowDownScale).xy;
+			vec2 opticalFlow = imageLoad(optFlowMap, sampleCoord / opticalFlowDownScale).xy;
 			opticalFlow = opticalFlow * 2.0 - 1.0;
 			float opticalFlowMag = length(opticalFlow);
 			sum -= 10 * opticalFlowMag;
 
 			// repel from reaction peaks
 			float chem_y = imageLoad(reactionMap, sampleCoord).y;
-			sum -= 5 * chem_y;
+			sum -= 20 * chem_y;
 		}
 	}
 
@@ -191,14 +193,16 @@ void main(){
 
 	// pushing agents around based on flow
 	ivec2 oldCoord = ivec2(pos.xy);
-	vec2 simplexFlowForce = imageLoad(flowMap, oldCoord).xy;
+	vec2 simplexFlowForce = texture(flowMap, oldCoord).xy;
 	simplexFlowForce = (2 * simplexFlowForce) - 1; // convert to -1-1 range
 
-	vec2 opticalFlowForce = imageLoad(opticalFlowMap, oldCoord / opticalFlowDownScale).xy;
+	vec2 opticalFlowForce = imageLoad(optFlowMap, oldCoord / opticalFlowDownScale).xy;
 	opticalFlowForce = (2 * opticalFlowForce) - 1; // convert to -1-1 range
 	float opticalFlowMag = length(opticalFlowForce);
 
-	vec2 force = (2 * opticalFlowMag + agentFlowMag) * simplexFlowForce;
+	float audioMag = length(imageLoad(audioMap, oldCoord).xy);
+
+	vec2 force = 2 * opticalFlowMag + ((0.3 * audioMag + agentFlowMag) * simplexFlowForce);
 
 	// Update position
 	vec2 newVel = normalize(vel + (force * deltaTime));

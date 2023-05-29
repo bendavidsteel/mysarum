@@ -6,15 +6,16 @@ struct Species{
 	vec4 movementAttributes;
 };
 
-layout(std140, binding=5) buffer species{
+layout(std140, binding=2) buffer species{
     Species allSpecies[];
 };
 
-layout(rgba8,binding=6) uniform restrict image2D trailMap;
-layout(rgba8,binding=0) uniform restrict image2D flowMap;
-layout(rg16,binding=7) uniform restrict image2D opticalFlowMap;
-layout(rg16,binding=3) uniform restrict image2D reactionMap;
-layout(rg16,binding=8) uniform restrict image2D audioMap;
+layout(rgba8,binding=3) uniform restrict image2D trailMap;
+layout(rg16,binding=4) uniform restrict image2D optFlowMap;
+layout(rg16,binding=0) uniform restrict image2D reactionMap;
+layout(rg16,binding=7) uniform restrict image2D audioMap;
+
+uniform sampler2DRect flowMap;
 
 uniform vec3 colourA;
 uniform vec3 colourB;
@@ -47,7 +48,7 @@ void main()
 	vec3 colour = vec3(0.);
 
 	if (display == 4) {
-		vec2 opticalFlowForce = imageLoad(opticalFlowMap, coord / opticalFlowDownScale).xy;
+		vec2 opticalFlowForce = imageLoad(optFlowMap, coord / opticalFlowDownScale).xy;
 		opticalFlowForce = (2 * opticalFlowForce) - 1; // convert to -1-1 range
 		colour = vec3(opticalFlowForce.x, opticalFlowForce.y, -opticalFlowForce.x);
 
@@ -91,7 +92,7 @@ void main()
         vec2 trail_coord = pos.xy + (dir_to_light * trail_d);
         vec4 trail_shadow = imageLoad(trailMap, ivec2(trail_coord));
 
-		vec3 flow = imageLoad(flowMap, coord).xyz;
+		vec3 flow = texture(flowMap, coord).xyz;
 		colour = 0.2 * flow;
 
         if (trail_shadow.r > 0.1) {

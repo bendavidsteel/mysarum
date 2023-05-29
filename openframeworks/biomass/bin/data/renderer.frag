@@ -6,14 +6,16 @@ struct Species{
 	vec4 movementAttributes;
 };
 
-layout(std140, binding=5) buffer species{
+layout(std140, binding=2) buffer species{
     Species allSpecies[];
 };
 
-layout(rgba8,binding=6) uniform restrict image2D trailMap;
-layout(rgba8,binding=0) uniform restrict image2D flowMap;
-layout(rg16,binding=3) uniform restrict image2D reactionMap;
-layout(rg16,binding=8) uniform restrict image2D audioMap;
+layout(rgba8,binding=3) uniform restrict image2D trailMap;
+layout(rg16,binding=0) uniform restrict image2D reactionMap;
+layout(rg16,binding=4) uniform restrict image2D optFlowMap;
+layout(rg16,binding=7) uniform restrict image2D audioMap;
+
+uniform sampler2DRect flowMap;
 
 uniform vec3 colourA;
 uniform vec3 colourB;
@@ -36,7 +38,7 @@ void main()
 	vec3 audioColour = colourC * audio.x;
 	audioColour += colourD * audio.y;
 
-	float this_chem_height = chem_height * (1 + length(audio));
+	float this_chem_height = chem_height * (1 + 2 * length(audio));
 
 	vec3 pos = vec3(coord, chems.y);
 	float pos_height = chems.y * this_chem_height;
@@ -44,7 +46,7 @@ void main()
 
 	vec3 lighting = vec3(1.);
 	float falloff = resolution.x / 3;
-	vec3 light_falloff = vec3(exp(-dist_to_light / (50 * falloff))) + 0.8 * audioColour;
+	vec3 light_falloff = vec3(exp(-dist_to_light / (100 * falloff)));
 
 	float height_to_light = light.z - pos_height;
 	float max_dist_to_other_peak = dist_to_light * (this_chem_height - pos_height) / height_to_light;
@@ -102,5 +104,7 @@ void main()
 		colour = mix(colour, allSpecies[3].colour.rgb * light_falloff, trail.a);
 	}
 
+	colour *= 1. + 0.5 * audio.x * vec3(0., 0., 1.);
+	colour *= 1. - 0.5 * audio.y * vec3(1., 0., 0.);
 	out_color = vec4(colour, 1.);
 }

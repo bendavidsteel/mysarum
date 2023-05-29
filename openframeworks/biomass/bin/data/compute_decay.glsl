@@ -1,7 +1,7 @@
 #version 440
 
-layout(rgba8,binding=6) uniform restrict image2D trailMap;
-layout(rg16,binding=7) uniform restrict image2D opticalFlowMap; // TODO switch to readonly
+layout(rgba8,binding=3) uniform restrict image2D trailMap;
+layout(rg16,binding=4) uniform restrict image2D optFlowMap; // TODO switch to readonly
 
 uniform ivec2 resolution;
 uniform float deltaTime;
@@ -17,7 +17,7 @@ void main(){
     vec4 blurredTrail = imageLoad(trailMap, coord);
 
     // read optical flow
-    vec2 opticalFlowForce = imageLoad(opticalFlowMap, coord / opticalFlowDownScale).xy;
+    vec2 opticalFlowForce = imageLoad(optFlowMap, coord / opticalFlowDownScale).xy;
     opticalFlowForce = opticalFlowForce * 2. - 1.;
     float opticalFlowMag = length(opticalFlowForce);
     float opticalDecayRate = 1. - 0.8 * opticalFlowMag;

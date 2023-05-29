@@ -4,6 +4,8 @@
 //--------------------------------------------------------------
 void ofApp::setup(){
 
+	ofSetFrameRate(60);
+
 	// constants
 	display = 0;
 
@@ -14,7 +16,7 @@ void ofApp::setup(){
 	sunZ = 25;
 	chemHeight = 1.;
 	trailHeight = 2.;
-	dayRate = 5.;
+	dayRate = 10.;
 
 	feedMin = 0.01;
     feedRange = 0.09;
@@ -32,7 +34,7 @@ void ofApp::setup(){
 	sampleRate = 44100;
 	bufferSize = 512;
     channels = 2;
-	volume = 0.1;
+	volume = 1.0;
 
 	fileName = "testMovie";
     fileExt = ".mov"; // ffmpeg uses the extension to determine the container type. run 'ffmpeg -formats' to see supported formats
@@ -41,17 +43,17 @@ void ofApp::setup(){
 	int numSpecies = 2;
 	allSpecies.resize(numSpecies);
 	allSpecies[0].movementAttributes.x = 1.1; // moveSpeed
-	allSpecies[0].movementAttributes.y = 0.05 * 2 * PI; // turnSpeed
+	allSpecies[0].movementAttributes.y = 0.04 * 2 * PI; // turnSpeed
 	allSpecies[0].movementAttributes.z = CIRCLE; //spawn
-	allSpecies[0].sensorAttributes.x = 40 * PI / 180; // sensorAngleRad
-	allSpecies[0].sensorAttributes.y = 15; // sensorOffsetDist
+	allSpecies[0].sensorAttributes.x = 30 * PI / 180; // sensorAngleRad
+	allSpecies[0].sensorAttributes.y = 10; // sensorOffsetDist
 	allSpecies[0].colour = glm::vec4(0.796, 0.2, 1., 1.);
 
 	allSpecies[1].movementAttributes.x = 0.9; // moveSpeed
-	allSpecies[1].movementAttributes.y = 0.1 * 2 * PI; // turnSpeed
+	allSpecies[1].movementAttributes.y = 0.08 * 2 * PI; // turnSpeed
 	allSpecies[1].movementAttributes.z = RING;
-	allSpecies[1].sensorAttributes.x = 50 * PI/ 180; // sensorAngleRad
-	allSpecies[1].sensorAttributes.y = 25; //sensorOffsetDist
+	allSpecies[1].sensorAttributes.x = 40 * PI/ 180; // sensorAngleRad
+	allSpecies[1].sensorAttributes.y = 20; //sensorOffsetDist
 	allSpecies[1].colour = glm::vec4(0.1, 0.969, 1., 1.);
 	newSpecies.resize(numSpecies);
 
@@ -82,10 +84,10 @@ void ofApp::setup(){
 	}
 	
 	particlesBuffer.allocate(particles, GL_DYNAMIC_DRAW);
-	particlesBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 4);
+	particlesBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 1);
 
 	allSpeciesBuffer.allocate(allSpecies, GL_DYNAMIC_DRAW);
-	allSpeciesBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 5);
+	allSpeciesBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 2);
 
 	ofPixels initialTrail;
 	initialTrail.allocate(ofGetWidth(), ofGetHeight(), OF_PIXELS_RGBA);
@@ -94,18 +96,18 @@ void ofApp::setup(){
 
 	trailMap.allocate(ofGetWidth(), ofGetHeight(), GL_RGBA8);
 	trailMap.loadData(initialTrail);
-	trailMap.bindAsImage(6, GL_READ_WRITE);
+	trailMap.bindAsImage(3, GL_READ_WRITE);
 
 	// reaction diffusion setup
-	reSpawnReaction();
+	reactionMap.allocate(ofGetWidth(), ofGetHeight(), GL_RG16);
+	reactionMap.bindAsImage(0, GL_READ_WRITE);
+	bool keepPattern = false;
+	reSpawnReaction(keepPattern);
 
-	feedkillMap.allocate(ofGetWidth(), ofGetHeight(), GL_RG16);
-	feedkillMap.bindAsImage(2, GL_READ_WRITE);
+	// feedkillFbo.allocate(ofGetWidth(), ofGetHeight(), GL_RGBA16);
 
 	// general setup
-
-	flowMap.allocate(ofGetWidth(), ofGetHeight(), GL_RGBA8);
-	flowMap.bindAsImage(0, GL_READ_WRITE);
+	flowFbo.allocate(ofGetWidth(), ofGetHeight(), GL_RGBA8);
 
 	fbo.allocate(ofGetWidth(), ofGetHeight(), GL_RGBA8);
 
@@ -120,31 +122,30 @@ void ofApp::setup(){
 	compute_diffuse.linkProgram();
 
 	// load reaction diffusion shaders
-	compute_feedkill.setupShaderFromFile(GL_COMPUTE_SHADER, "compute_feedkill.glsl");
-	compute_feedkill.linkProgram();
+	compute_feedkill.load("generic.vert", "compute_feedkill.frag");
 
 	compute_reaction.setupShaderFromFile(GL_COMPUTE_SHADER,"compute_reaction.glsl");
 	compute_reaction.linkProgram();
 
 	// load general shaders
+	compute_flow.load("generic.vert", "compute_flow.frag");
 
-	compute_flow.setupShaderFromFile(GL_COMPUTE_SHADER,"compute_flow.glsl");
-	compute_flow.linkProgram();
-
-	renderer.load("renderer.vert", "renderer.frag");
-	simple_renderer.load("renderer.vert", "simple_renderer.frag");
+	renderer.load("generic.vert", "renderer.frag");
+	simple_renderer.load("generic.vert", "simple_renderer.frag");
 
 	// video recording
 	ofAddListener(vidRecorder.outputFileCompleteEvent, this, &ofApp::recordingComplete);
 
 	bRecording = false;
 
+	pixels.allocate(ofGetWidth(), ofGetHeight(), OF_PIXELS_RGBA);
+
 	// sound
 	ofSoundStreamSettings settings;
 
 	auto devices = soundStream.getDeviceList();
 	if(!devices.empty()){
-		settings.setInDevice(devices[0]);
+		settings.setInDevice(devices[1]);
 	}
 
 	settings.setInListener(this);
@@ -167,15 +168,15 @@ void ofApp::setup(){
 		melBands[i].value.x = float(i) / numBands;
 	}
 	melBandsBuffer.allocate(melBands, GL_DYNAMIC_DRAW);
-	melBandsBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 9);
+	melBandsBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 5);
 
 	int maxPoints = 4;
 	points.resize(maxPoints);
 	for (int i = 0; i < 2; i++) {
 		points[i].value.x = 1;
 		points[i].value.y = float(i) / 2;
-		points[i].value.z = 0;
-		points[i].value.w = 1;
+		points[i].value.z = i;
+		points[i].value.w = 1 - i;
 	}
 	for (int i = 2; i < 4; i++) {
 		points[i].value.x = 0;
@@ -186,13 +187,13 @@ void ofApp::setup(){
 	newPoints.resize(maxPoints);
 	
 	pointsBuffer.allocate(points, GL_DYNAMIC_DRAW);
-	pointsBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 10);
+	pointsBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 6);
 
-	audio_texture.allocate(ofGetWidth(), ofGetHeight(), GL_RG16);
-	audio_texture.bindAsImage(8, GL_READ_WRITE);
-
-	compute_audio.setupShaderFromFile(GL_COMPUTE_SHADER,"compute_audio.glsl");
+	compute_audio.setupShaderFromFile(GL_COMPUTE_SHADER, "compute_audio.glsl");
 	compute_audio.linkProgram();
+
+	audioTexture.allocate(ofGetWidth(), ofGetHeight(), GL_RG16);
+	audioTexture.bindAsImage(7, GL_READ_WRITE);
 
 	// video and optical flow setup
 	vidGrabber.setVerbose(true);
@@ -225,8 +226,8 @@ void ofApp::setup(){
 	flowMat = cv::Mat(scaledHeight, scaledWidth, CV_32FC2);
 
 	opticalFlowPixels.allocate(scaledWidth, scaledHeight, OF_IMAGE_COLOR);
-	opticalFlowTexture.allocate(scaledWidth, scaledHeight, GL_RG16);
-	opticalFlowTexture.bindAsImage(7, GL_READ_WRITE);
+	optFlowTexture.allocate(scaledWidth, scaledHeight, GL_RG16);
+	optFlowTexture.bindAsImage(4, GL_READ_WRITE);
 
 	// setup midi
 	// open port by number (you may need to change this)
@@ -311,16 +312,11 @@ void ofApp::update(){
 			}
 		}
 	}
-	opticalFlowTexture.loadData(opticalFlowPixels);
+	optFlowTexture.loadData(opticalFlowPixels);
 
 	// audio analysis
 	bool normalize = true;
 	float rms = audioAnalyzer.getValue(RMS, 0, highSmoothing, normalize);
-	float dissonance = audioAnalyzer.getValue(DISSONANCE, 0, highSmoothing, normalize);
-	float inharmonicity = audioAnalyzer.getValue(INHARMONICITY, 0, highSmoothing, normalize);
-	float centroid = audioAnalyzer.getValue(CENTROID, 0, highSmoothing, normalize);
-
-	vector<float> tristimulus = audioAnalyzer.getValues(TRISTIMULUS, 0, lowSmoothing);
 	vector<float> melBands = audioAnalyzer.getValues(MEL_BANDS, 0, lowSmoothing);
 
 	bool isOnset = audioAnalyzer.getOnsetValue(0);
@@ -334,7 +330,7 @@ void ofApp::update(){
 
 	moveToVariables();
 	vector<Component> thesePoints(points.size());
-	float a = pow(rms, 5) / 2;
+	float a = pow(rms, 3) / 2;
 	for (int i = 0; i < points.size(); i++) {
 		thesePoints[i].value.x = a * points[i].value.x * cos((2 * PI * points[i].value.y) + time_of_day);
 		thesePoints[i].value.y = a * points[i].value.x * sin((2 * PI * points[i].value.y) + time_of_day);
@@ -349,7 +345,8 @@ void ofApp::update(){
 	}
 
 	if (bReSpawnReaction) {
-		reSpawnReaction();
+		bool keepPattern = true;
+		reSpawnReaction(keepPattern);
 		bReSpawnReaction = false;
 	}
 
@@ -359,11 +356,15 @@ void ofApp::update(){
 	int heightWorkGroups = ceil(ofGetHeight()/workGroupSize);
 
 	// general updates
+	flowFbo.begin();
+	ofClear(255,255,255, 0);
 	compute_flow.begin();
 	compute_flow.setUniform1f("time", time);
 	compute_flow.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
-	compute_flow.dispatchCompute(widthWorkGroups, heightWorkGroups, 1);
+	ofSetColor(255);
+	ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
 	compute_flow.end();
+	flowFbo.end();
 
 	compute_audio.begin();
 	compute_audio.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
@@ -371,7 +372,6 @@ void ofApp::update(){
 	compute_audio.setUniform1i("numBands", numBands);
 	compute_audio.setUniform1f("angle", time_of_day);
 	compute_audio.setUniform1f("rms", rms);
-	compute_audio.setUniform1f("dissonance", dissonance);
 	compute_audio.dispatchCompute(widthWorkGroups, heightWorkGroups, 1);
 	compute_audio.end();
 
@@ -409,6 +409,7 @@ void ofApp::update(){
 	compute_agents.setUniform1f("trailWeight", trailWeight);
 	compute_agents.setUniform1i("opticalFlowDownScale", cvDownScale);
 	compute_agents.setUniform1f("agentFlowMag", agentFlowMag);
+	compute_agents.setUniformTexture("flowMap", flowFbo.getTexture(), 0);
 	
 	// since each work group has a local_size of 1024 (this is defined in the shader)
 	// we only have to issue 1 / 1024 workgroups to cover the full workload.
@@ -418,19 +419,14 @@ void ofApp::update(){
 	compute_agents.dispatchCompute((particles.size() + 1024 -1 )/1024, 1, 1);
 	compute_agents.end();
 
-	// reaction diffusion updates
-	compute_feedkill.begin();
-	compute_feedkill.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
-	compute_feedkill.setUniform1f("feedMin", feedMin);
-	compute_feedkill.setUniform1f("feedRange", feedRange);
-	compute_feedkill.dispatchCompute(widthWorkGroups, heightWorkGroups, 1);
-	compute_feedkill.end();
-
 	compute_reaction.begin();
 	compute_reaction.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
 	compute_reaction.setUniform1f("deltaTime", deltaTime);
 	compute_reaction.setUniform1i("opticalFlowDownScale", cvDownScale);
 	compute_reaction.setUniform1f("reactionFlowMag", reactionFlowMag);
+	compute_reaction.setUniform1f("feedMin", feedMin);
+	compute_reaction.setUniform1f("feedRange", feedRange);
+	compute_reaction.setUniformTexture("flowMap", flowFbo.getTexture(), 2);
 	compute_reaction.dispatchCompute(widthWorkGroups, heightWorkGroups, 1);
 	compute_reaction.end();
 }
@@ -453,6 +449,7 @@ void ofApp::draw() {
 		renderer.setUniform3f("light", sun_x, sun_y, sunZ);
 		renderer.setUniform1f("chem_height", chemHeight);
 		renderer.setUniform1f("trail_height", trailHeight);
+		renderer.setUniformTexture("flowMap", flowFbo.getTexture(), 0);
 		ofSetColor(255);
 		ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
 		renderer.end();
@@ -472,17 +469,17 @@ void ofApp::draw() {
 		simple_renderer.setUniform1f("trail_height", trailHeight);
 		simple_renderer.setUniform1i("opticalFlowDownScale", cvDownScale);
 		simple_renderer.setUniform1i("display", display);
+		simple_renderer.setUniformTexture("flowMap", flowFbo.getTexture(), 0);
 		ofSetColor(255);
 		ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
 		simple_renderer.end();
 		fbo.end();
 		fbo.draw(0, 0);
 	} else if (display == 5) {
-		flowMap.draw(0, 0, ofGetWidth(), ofGetHeight());
+		flowFbo.draw(0, 0, ofGetWidth(), ofGetHeight());
 	}
 
 	if(bRecording){
-		// const ofFbo fbo = volume.getFbo();
 		fbo.readToPixels(pixels);
 		bool recordSuccess = vidRecorder.addFrame(pixels);
 		if (!recordSuccess) {
@@ -509,17 +506,21 @@ void ofApp::exit(){
 	trailMap.clear();
 	reactionMap.clear();
 
+	soundStream.close();
+
 	midiIn.closePort();
 	midiIn.removeListener(this);
 }
 
 //--------------------------------------------------------------
 void ofApp::audioIn(ofSoundBuffer & buffer){
-	buffer *= volume;
-    audioAnalyzer.analyze(buffer);
+	if (buffer.getNumChannels() == audioAnalyzer.getChannelAnalyzersPtrs().size()) {
+		buffer *= volume;
+		audioAnalyzer.analyze(buffer);
+	}
 	
-	// if(bRecording)
-        // vidRecorder.addAudioSamples(input, bufferSize, nChannels);
+	if(bRecording)
+        vidRecorder.addAudioSamples(buffer.getBuffer().data(), bufferSize, channels);
 }
 
 //--------------------------------------------------------------
@@ -537,10 +538,15 @@ void ofApp::newMidiMessage(ofxMidiMessage& message) {
 		} else if (message.status == MIDI_CONTROL_CHANGE) {
 			int val = message.value;
 			// 0 - 127
-			newDayRate = ofMap(val, 0, 127, 4, 30);
+			newReactionFlowMag = ofMap(val, 0, 127, 0., 30.);
 		} else if (message.status == MIDI_PITCH_BEND) {
 			int val = message.value;
 			// 0 - 16383
+			if (val > 8192) {
+				newAgentFlowMag = ofMap(val, 8192, 16383, 0., 30.);
+			} else {
+				newAgentFlowMag = 0.;
+			}
 		}
 	}
 }
@@ -815,28 +821,28 @@ void ofApp::newInput(int key) {
 
 //--------------------------------------------------------------
 void ofApp::keyReleased(int key){
-	// if(key=='r'){
-	// 	bRecording = !bRecording;
-	// 	if(bRecording && !vidRecorder.isInitialized()) {
-	// 		vidRecorder.setup(fileName+ofGetTimestampString()+fileExt, ofGetWidth(), ofGetHeight(), 30, sampleRate, channels);
-	// 	//          vidRecorder.setup(fileName+ofGetTimestampString()+fileExt, vidGrabber.getWidth(), vidGrabber.getHeight(), 30); // no audio
-	// 	//            vidRecorder.setup(fileName+ofGetTimestampString()+fileExt, 0,0,0, sampleRate, channels); // no video
-	// 	//          vidRecorder.setupCustomOutput(vidGrabber.getWidth(), vidGrabber.getHeight(), 30, sampleRate, channels, "-vcodec mpeg4 -b 1600k -acodec mp2 -ab 128k -f mpegts udp://localhost:1234"); // for custom ffmpeg output string (streaming, etc)
+	if(key=='['){
+		bRecording = !bRecording;
+		if(bRecording && !vidRecorder.isInitialized()) {
+			vidRecorder.setup(fileName+ofGetTimestampString()+fileExt, ofGetWidth(), ofGetHeight(), 60, sampleRate, channels);
+		    // vidRecorder.setup(fileName+ofGetTimestampString()+fileExt, vidGrabber.getWidth(), vidGrabber.getHeight(), 30); // no audio
+		    // vidRecorder.setup(fileName+ofGetTimestampString()+fileExt, 0,0,0, sampleRate, channels); // no video
+		    // vidRecorder.setupCustomOutput(vidGrabber.getWidth(), vidGrabber.getHeight(), 30, sampleRate, channels, "-vcodec mpeg4 -b 1600k -acodec mp2 -ab 128k -f mpegts udp://localhost:1234"); // for custom ffmpeg output string (streaming, etc)
 
-	// 	// Start recording
-	// 		vidRecorder.start();
-	// 	}
-	// 	else if(!bRecording && vidRecorder.isInitialized()) {
-	// 		vidRecorder.setPaused(true);
-	// 	}
-	// 	else if(bRecording && vidRecorder.isInitialized()) {
-	// 		vidRecorder.setPaused(false);
-	// 	}
-	// }
-	// if(key=='c'){
-	// 	bRecording = false;
-	// 	vidRecorder.close();
-	// }
+			// Start recording
+			vidRecorder.start();
+		}
+		else if(!bRecording && vidRecorder.isInitialized()) {
+			vidRecorder.setPaused(true);
+		}
+		else if(bRecording && vidRecorder.isInitialized()) {
+			vidRecorder.setPaused(false);
+		}
+	}
+	if(key==']'){
+		bRecording = false;
+		vidRecorder.close();
+	}
 }
 
 
@@ -955,14 +961,17 @@ void ofApp::reSpawnAgents() {
 	particlesBuffer.updateData(particles);
 }
 
-void ofApp::reSpawnReaction() {
+void ofApp::reSpawnReaction(bool keepPattern) {
 	ofPixels initialReaction;
 	initialReaction.allocate(ofGetWidth(), ofGetHeight(), OF_PIXELS_RGBA);
-	ofColor baseReactionColour(255., 0., 0., 0.);
-	initialReaction.setColor(baseReactionColour);
 
-	Spawn initialPattern = RANDOM;
-
+	if (keepPattern) {
+		reactionMap.readToPixels(initialReaction);
+	} else {
+		ofColor baseReactionColour(255., 0., 0., 0.);
+		initialReaction.setColor(baseReactionColour);
+	}
+	
 	ofColor reactantColour(255., 255., 0., 0.);
 	for (int j = 0; j < ofGetHeight(); j++) {
 		for (int i = 0; i < ofGetWidth(); i++) {
@@ -972,7 +981,5 @@ void ofApp::reSpawnReaction() {
 		}
 	}
 
-	reactionMap.allocate(ofGetWidth(), ofGetHeight(), GL_RG16);
 	reactionMap.loadData(initialReaction);
-	reactionMap.bindAsImage(3, GL_READ_WRITE);
 }

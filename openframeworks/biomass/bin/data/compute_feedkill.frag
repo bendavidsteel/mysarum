@@ -1,12 +1,12 @@
 #version 440
 
-layout(rg16,binding=2) uniform restrict image2D feedkillMap;
-
 uniform ivec2 resolution;
 uniform float time;
 uniform float speed;
 uniform float feedMin;
 uniform float feedRange;
+
+out vec4 out_color;
 
 float get_third_degree_polynomial_out(float x, vec4 coefs) {
     vec4 xs = vec4(1.);
@@ -16,10 +16,9 @@ float get_third_degree_polynomial_out(float x, vec4 coefs) {
     return dot(xs, coefs);
 }
 
-layout(local_size_x = 20, local_size_y = 20, local_size_z = 1) in;
 void main(){
-    vec2 coord = gl_GlobalInvocationID.xy;
-    vec2 uv = coord / resolution;
+    vec2 coord = gl_FragCoord.xy;
+    vec2 uv = coord / vec2(resolution);
     
     float kill_min = 0.045;
     float kill_range = 0.025;
@@ -34,7 +33,5 @@ void main(){
     kill_high = min(kill_high, kill_min + kill_range);
     float kill = kill_low + ((kill_high - kill_low) * uv.x);
 
-    vec4 vals = vec4(feed, kill, 0., 0.);
-
-	imageStore(feedkillMap, ivec2(coord), vals);
+    out_color = vec4(feed, kill, 1., 1.);
 }

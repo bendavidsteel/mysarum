@@ -8,22 +8,21 @@ struct Component{
     vec4 value;
 };
 
-layout(rg16,binding=8) uniform restrict image2D audioMap;
-
-layout(std140, binding=9) buffer spectrum{
+layout(std140, binding=5) buffer spectrum{
     Component allSpectrum[];
 };
 
-layout(std140, binding=10) buffer points{
+layout(std140, binding=6) buffer points{
     Component allPoints[];
 };
+
+layout(rg16,binding=7) uniform restrict image2D audioMap;
 
 uniform ivec2 resolution;
 uniform float deltaTime;
 uniform int numBands;
 uniform float angle;
 uniform float rms;
-uniform float dissonance;
 
 float map(float val, float a, float b, float c, float d) {
     float normVal = (val - a) / (b - a);
@@ -83,10 +82,5 @@ void main(){
     }
     float b_spec = getSpectrum(b_cassini, b);
 
-    vec4 vals = vec4(0.);
-
-    vals.x = a_spec;
-    vals.y = b_spec;
-
-	imageStore(audioMap, coord, vals);
+    imageStore(audioMap, coord, vec4(a_spec, b_spec, 0., 1.));
 }

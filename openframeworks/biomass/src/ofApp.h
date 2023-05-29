@@ -33,7 +33,7 @@ class ofApp : public ofBaseApp, public ofxMidiListener{
 		void copyVariables();
 		void moveToVariables();
 		void reSpawnAgents();
-		void reSpawnReaction();
+		void reSpawnReaction(bool keepPattern);
 
 		ofxVideoRecorder vidRecorder;
 		ofSoundStream soundStream;
@@ -54,7 +54,7 @@ class ofApp : public ofBaseApp, public ofxMidiListener{
 		ofShader renderer;
 		ofShader simple_renderer;
 
-		ofTexture flowMap;
+		ofFbo flowFbo;
 
 		// slime
 		struct Agent{
@@ -96,8 +96,8 @@ class ofApp : public ofBaseApp, public ofxMidiListener{
 		ofShader compute_reaction;
 
 		ofTexture diffusionMap;
-		ofTexture feedkillMap;
 		ofTexture reactionMap;
+		ofFbo feedkillFbo;
 
 		int flowSizeFactor;
 		float floatStrength;
@@ -113,7 +113,7 @@ class ofApp : public ofBaseApp, public ofxMidiListener{
 		cv::Mat flowMat;
 
 		ofPixels opticalFlowPixels;
-		ofTexture opticalFlowTexture;
+		ofTexture optFlowTexture;
 		
 		int blurAmount;
 		float cvDownScale;
@@ -131,7 +131,7 @@ class ofApp : public ofBaseApp, public ofxMidiListener{
 		ofBufferObject pointsBuffer;
 
 		ofShader compute_audio;
-		ofTexture audio_texture;
+		ofTexture audioTexture;
 
 		float lowSmoothing;
 		float highSmoothing;

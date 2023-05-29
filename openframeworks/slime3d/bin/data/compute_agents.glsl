@@ -205,18 +205,22 @@ void main(){
 	float weightAhead, weightA, weightB, weightC, weightD;
 	sense(pos, speciesMask, vecAhead, vecA, vecB, vecC, vecD, weightAhead, weightA, weightB, weightC, weightD);
 	
-	float randomForceStrength = random(vec4(pos, time));
-	vec3 agentUid = pos * time * gl_GlobalInvocationID.x;
-	float randomX = (random(vec4(agentUid, vel.x)) * 2) - 1;
-	float randomY = (random(vec4(agentUid, vel.y)) * 2) - 1;
-	float randomZ = (random(vec4(agentUid, vel.z)) * 2) - 1;
-	vec3 randomForce = normalize(vec3(randomX, randomY, randomZ));
+	float randomThetaStrength = random(vec4(pos, time));
+	float randomPhiStrength = random(vec4(pos, time));
+	// vec3 agentUid = pos * time * gl_GlobalInvocationID.x;
+	// float randomX = (random(vec4(agentUid, vel.x)) * 2) - 1;
+	// float randomY = (random(vec4(agentUid, vel.y)) * 2) - 1;
+	// float randomZ = (random(vec4(agentUid, vel.z)) * 2) - 1;
+	// vec3 randomForce = normalize(vec3(randomX, randomY, randomZ));
 
-	vec3 force = randomForce * 0.01;
+	float theta = atan(vel.y, vel.x);
+	float phi = atan(vel.z, sqrt(vel.x * vel.x + vel.y * vel.y));
+
 	if (weightAhead < weightA && weightAhead < weightB && weightAhead < weightC && weightAhead < weightD) {
-		force += randomForce;
+		angle += (randomThetaStrength - 0.5) * 2 * turnSpeed * deltaTime;
+		phi += (randomPhiStrength - 0.5) * 2 * turnSpeed * deltaTime;
 	} else if (weightA > weightAhead && weightA > weightB && weightA > weightC && weightA > weightD) {
-		force += normalize(vecA);
+		
 	} else if (weightB > weightAhead && weightB > weightA && weightB > weightC && weightB > weightD) {
 		force += normalize(vecB);
 	} else if (weightC > weightAhead && weightC > weightA && weightC > weightB && weightC > weightD) {

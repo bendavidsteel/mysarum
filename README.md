@@ -6,6 +6,8 @@ Ongoing project featuring generally biologically inspired works, using Processin
 
 An installation focused 2D version of the project. Reactive to audio, video motion, and through a keyboard based controller.
 
+You can check out videos of the project [here](https://www.instagram.com/p/Cq3PrTjptFB/), [here](https://www.instagram.com/p/Cs1ndPFgOTU/), [here](https://www.instagram.com/p/Cs1oU_9guEw/), and [here](https://www.instagram.com/p/Cs1oxdngl8R/)
+
 ![image of biomass](./biomass.jpg)
 
 ## Inspiration

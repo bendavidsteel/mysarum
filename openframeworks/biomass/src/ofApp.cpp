@@ -13,10 +13,10 @@ void ofApp::setup(){
 	colourB = glm::vec3(0., 1., 0.);
 	colourC = glm::vec3(1., 0., 0.);
 	colourD = glm::vec3(0., 0., 1.);
-	sunZ = 25;
 	chemHeight = 1.;
 	trailHeight = 2.;
 	dayRate = 10.;
+	monthRate = 300.;
 
 	feedMin = 0.01;
     feedRange = 0.09;
@@ -27,17 +27,14 @@ void ofApp::setup(){
 	trailWeight = 1;
 
 	// audio constants
-	lowSmoothing = 0.6;
-	highSmoothing = 0.8;
+	lowSmoothing = 0.4;
+	highSmoothing = 0.6;
 
 	// general constants
-	sampleRate = 44100;
-	bufferSize = 512;
+	sampleRate = 48000;
+	bufferSize = 1024;
     channels = 2;
-	volume = 1.0;
-
-	fileName = "testMovie";
-    fileExt = ".mov"; // ffmpeg uses the extension to determine the container type. run 'ffmpeg -formats' to see supported formats
+	volume = 5.0;
 
 	// slime setup
 	int numSpecies = 2;
@@ -132,21 +129,17 @@ void ofApp::setup(){
 
 	renderer.load("generic.vert", "renderer.frag");
 	simple_renderer.load("generic.vert", "simple_renderer.frag");
-
-	// video recording
-	ofAddListener(vidRecorder.outputFileCompleteEvent, this, &ofApp::recordingComplete);
-
-	bRecording = false;
-
-	pixels.allocate(ofGetWidth(), ofGetHeight(), OF_PIXELS_RGBA);
+	postprocess.load("generic.vert", "postprocess.frag");
 
 	// sound
 	ofSoundStreamSettings settings;
 
+	// auto devices = soundStream.getDeviceList(ofSoundDevice::Api::ALSA);
 	auto devices = soundStream.getDeviceList();
 	if(!devices.empty()){
 		settings.setInDevice(devices[1]);
 	}
+	// settings.setApi(ofSoundDevice::Api::ALSA);
 
 	settings.setInListener(this);
 	settings.sampleRate = sampleRate;
@@ -162,23 +155,41 @@ void ofApp::setup(){
 	// audio analysis setup
 	audioAnalyzer.setup(sampleRate, bufferSize, channels);
 
-	int numBands = 24;
-	vector<Component> melBands(numBands);
-	for (int i = 0; i < numBands; i++) {
-		melBands[i].value.x = float(i) / numBands;
+	audioType = AudioType::TIME;
+	if (audioType == AudioType::SPECTRAL) {
+		int numBands = 24;
+		vector<Component> melBands(numBands);
+		for (int i = 0; i < numBands; i++) {
+			melBands[i].value.x = float(i) / numBands;
+		}
+		audioBuffer.allocate(melBands, GL_DYNAMIC_DRAW);
+	} else if (audioType == AudioType::TIME) {
+		audioArraySize = 100;
+		audioArray.resize(audioArraySize);
+		for (int i = 0; i < audioArraySize; i++) {
+			audioArray[i].value.x = 0;
+		}
+		audioBuffer.allocate(audioArray, GL_DYNAMIC_DRAW);
+	} else if (audioType == AudioType::HEARTBEAT) {
+		audioArraySize = 100;
+		audioArray.resize(audioArraySize);
+		for (int i = 0; i < audioArraySize; i++) {
+			audioArray[i].value.x = 0;
+		}
+		audioBuffer.allocate(audioArray, GL_DYNAMIC_DRAW);
 	}
-	melBandsBuffer.allocate(melBands, GL_DYNAMIC_DRAW);
-	melBandsBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 5);
+
+	audioBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 5);
 
 	int maxPoints = 4;
 	points.resize(maxPoints);
-	for (int i = 0; i < 2; i++) {
-		points[i].value.x = 1;
-		points[i].value.y = float(i) / 2;
-		points[i].value.z = i;
-		points[i].value.w = 1 - i;
+	for (int i = 0; i < 1; i++) {
+		points[i].value.x = 0;
+		points[i].value.y = 0;
+		points[i].value.z = 1;
+		points[i].value.w = 0;
 	}
-	for (int i = 2; i < 4; i++) {
+	for (int i = 1; i < 4; i++) {
 		points[i].value.x = 0;
 		points[i].value.y = 0;
 		points[i].value.z = 0;
@@ -242,6 +253,12 @@ void ofApp::setup(){
 	// add ofApp as a listener
 	midiIn.addListener(this);
 
+	ofxUDPSettings udpSettings;
+	udpSettings.receiveOn(11999);
+	udpSettings.blocking = false;
+
+	udpConnection.Setup(udpSettings);
+
 	copyVariables();
 }
 
@@ -250,8 +267,10 @@ void ofApp::update(){
 	double deltaTime = 1.; //ofGetLastFrameTime();
 
 	float time = ofGetElapsedTimef();
-	days = time / dayRate;
+	float days = time / dayRate;
+	float months = time / monthRate;
 	time_of_day = fmod(days, float(2 * PI)) - PI;
+	time_of_month = fmod(months, float(2 * PI)) - PI;
 
 	// video and optical flow
 	vidGrabber.update();
@@ -316,21 +335,10 @@ void ofApp::update(){
 
 	// audio analysis
 	bool normalize = true;
-	float rms = audioAnalyzer.getValue(RMS, 0, highSmoothing, normalize);
-	vector<float> melBands = audioAnalyzer.getValues(MEL_BANDS, 0, lowSmoothing);
+	vector<float> melBands = audioAnalyzer.getValues(MEL_BANDS, 0, highSmoothing);
 
-	bool isOnset = audioAnalyzer.getOnsetValue(0);
-
-	int numBands = 24;
-	vector<Component> melBandsComponents(numBands);
-	for(int i = 0; i < numBands; i++){
-		melBandsComponents[i].value.x = ofMap(melBands[i], DB_MIN, DB_MAX, 0.0, 1.0, true);//clamped value
-	}
-	melBandsBuffer.updateData(melBandsComponents);
-
-	moveToVariables();
 	vector<Component> thesePoints(points.size());
-	float a = pow(rms, 3) / 2;
+	float a = 1;//pow(melBands[0], 3) / 2;
 	for (int i = 0; i < points.size(); i++) {
 		thesePoints[i].value.x = a * points[i].value.x * cos((2 * PI * points[i].value.y) + time_of_day);
 		thesePoints[i].value.y = a * points[i].value.x * sin((2 * PI * points[i].value.y) + time_of_day);
@@ -338,6 +346,75 @@ void ofApp::update(){
 		thesePoints[i].value.w = points[i].value.w;
 	}
 	pointsBuffer.updateData(thesePoints);
+
+	if (audioType == AudioType::SPECTRAL)
+	{
+		audioArraySize = 24;
+		vector<Component> melBandsComponents(audioArraySize);
+		for(int i = 0; i < audioArraySize; i++){
+			melBandsComponents[i].value.x = ofMap(melBands[i], DB_MIN, DB_MAX, 0.0, 1.0, true);//clamped value
+		}
+		audioBuffer.updateData(melBandsComponents);
+	}
+	else if (audioType == AudioType::TIME)
+	{
+		audioArraySize = 100;
+		audioArray[0].value.x = ofMap(melBands[0], DB_MIN, DB_MAX, 0.0, 1.0, true);
+		for (int i = audioArraySize - 1; i > 0; i--) {
+			audioArray[i].value.x = audioArray[i - 1].value.x;
+		}
+		audioBuffer.updateData(audioArray);
+	}
+	else if (audioType == AudioType::HEARTBEAT)
+	{
+		// receive network data
+		char udpMessage[100000];
+		udpConnection.Receive(udpMessage,100000);
+		string allMessages = udpMessage;
+		if (allMessages != "") {
+			float x,y;
+			vector<string> messages = ofSplitString(allMessages,"\n");
+			// remove empty messages
+			for (int i = 0; i < messages.size(); i++) {
+				if (messages[i] == "") {
+					messages.erase(messages.begin() + i);
+				}
+			}
+			if (messages.size() > 0) {
+				for (int i = audioArraySize - 1; i >= messages.size(); i--) {
+					audioArray[i].value.x = audioArray[i - 1].value.x;
+				}
+			}
+			for(int i=0;i<messages.size();i++){
+				vector<string> message = ofSplitString(messages[i],",");
+				float bpm = atof(message[0].c_str());
+				float heartbeat = atof(message[1].c_str());
+				audioArray[messages.size() - i - 1].value.x = heartbeat;
+			}
+			if (messages.size() > 0) {
+				audioBuffer.updateData(audioArray);
+			}
+		}	
+	}
+
+	// evolve physarum
+	if (abs(time_of_day - 0) < 0.1) {
+		newSpecies[0].movementAttributes.x = min(max(allSpecies[0].movementAttributes.x + ofRandom(-0.01, 0.01), float(0.6)), float(1.4)); // moveSpeed
+		newSpecies[0].movementAttributes.y = min(max(allSpecies[0].movementAttributes.y + ofRandom(-0.001, 0.001), float(0.03)), float(0.13)) * 2 * PI; // turnSpeed
+		newSpecies[0].sensorAttributes.x = min(max(allSpecies[0].sensorAttributes.x + ofRandom(-0.5, 0.5), float(30.)), float(70.)) * PI / 180; // sensorAngleRad
+		newSpecies[0].sensorAttributes.y = min(max(allSpecies[0].sensorAttributes.y + ofRandom(-0.5, 0.5), float(10.)), float(50.)); // sensorOffsetDist
+		
+		newSpecies[1].movementAttributes.x = min(max(allSpecies[1].movementAttributes.x + ofRandom(-0.01, 0.01), float(0.6)), float(1.4)); // moveSpeed
+		newSpecies[1].movementAttributes.y = min(max(allSpecies[1].movementAttributes.y + ofRandom(-0.001, 0.001), float(0.03)), float(0.13)) * 2 * PI; // turnSpeed
+		newSpecies[1].sensorAttributes.x = min(max(allSpecies[1].sensorAttributes.x + ofRandom(-0.5, 0.5), float(30.)), float(70.)) * PI / 180; // sensorAngleRad
+		newSpecies[1].sensorAttributes.y = min(max(allSpecies[1].sensorAttributes.y + ofRandom(-0.5, 0.5), float(10.)), float(50.)); // sensorOffsetDist
+
+		newDiffuseRate = min(max(diffuseRate + ofRandom(-0.01, 0.01), float(0.05)), float(0.4));
+		newDecayRate = min(max(decayRate + ofRandom(-0.001, 0.001), float(0.9)), float(0.999));
+	}
+
+	// handle inputs
+	moveToVariables();
 
 	if (bReSpawnAgents) {
 		reSpawnAgents();
@@ -369,9 +446,9 @@ void ofApp::update(){
 	compute_audio.begin();
 	compute_audio.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
 	compute_audio.setUniform1f("deltaTime", deltaTime);
-	compute_audio.setUniform1i("numBands", numBands);
+	compute_audio.setUniform1i("numBands", audioArraySize);
 	compute_audio.setUniform1f("angle", time_of_day);
-	compute_audio.setUniform1f("rms", rms);
+	compute_audio.setUniform1f("rms", 1);
 	compute_audio.dispatchCompute(widthWorkGroups, heightWorkGroups, 1);
 	compute_audio.end();
 
@@ -434,9 +511,12 @@ void ofApp::update(){
 //--------------------------------------------------------------
 void ofApp::draw() {
 
+	float time = ofGetElapsedTimef();
 	float sun_x = (ofGetWidth() / 2) + (2 * ofGetWidth() / 3) * cos(time_of_day);
 	float sun_y = (ofGetHeight() / 2) + (2 * ofGetHeight() / 3) * sin(time_of_day);
+	float sun_z = 25 + (10 * sin(time_of_month));
 
+	ofTexture tex;
 	if (display == 0) {
 		fbo.begin();
 		ofClear(255,255,255, 0);
@@ -446,7 +526,7 @@ void ofApp::draw() {
 		renderer.setUniform3f("colourB", colourB.x, colourB.y, colourB.z);
 		renderer.setUniform3f("colourC", colourC.x, colourC.y, colourC.z);
 		renderer.setUniform3f("colourD", colourD.x, colourD.y, colourD.z);
-		renderer.setUniform3f("light", sun_x, sun_y, sunZ);
+		renderer.setUniform3f("light", sun_x, sun_y, sun_z);
 		renderer.setUniform1f("chem_height", chemHeight);
 		renderer.setUniform1f("trail_height", trailHeight);
 		renderer.setUniformTexture("flowMap", flowFbo.getTexture(), 0);
@@ -454,7 +534,8 @@ void ofApp::draw() {
 		ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
 		renderer.end();
 		fbo.end();
-		fbo.draw(0, 0);
+		tex = fbo.getTexture();
+
 	}  else if (display == 1 || display == 2 || display == 3 || display == 4){
 		fbo.begin();
 		ofClear(255,255,255, 0);
@@ -464,7 +545,7 @@ void ofApp::draw() {
 		simple_renderer.setUniform3f("colourB", colourB.x, colourB.y, colourB.z);
 		simple_renderer.setUniform3f("colourC", colourC.x, colourC.y, colourC.z);
 		simple_renderer.setUniform3f("colourD", colourD.x, colourD.y, colourD.z);
-		simple_renderer.setUniform3f("light", sun_x, sun_y, sunZ);
+		simple_renderer.setUniform3f("light", sun_x, sun_y, sun_z);
 		simple_renderer.setUniform1f("chem_height", chemHeight);
 		simple_renderer.setUniform1f("trail_height", trailHeight);
 		simple_renderer.setUniform1i("opticalFlowDownScale", cvDownScale);
@@ -474,35 +555,26 @@ void ofApp::draw() {
 		ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
 		simple_renderer.end();
 		fbo.end();
-		fbo.draw(0, 0);
+		tex = fbo.getTexture();
 	} else if (display == 5) {
-		flowFbo.draw(0, 0, ofGetWidth(), ofGetHeight());
+		tex = flowFbo.getTexture();
 	}
 
-	if(bRecording){
-		fbo.readToPixels(pixels);
-		bool recordSuccess = vidRecorder.addFrame(pixels);
-		if (!recordSuccess) {
-			ofLogWarning("This frame was not added!");
-		}
-	}
-
-    // Check if the video recorder encountered any error while writing video frame or audio smaples.
-    if (vidRecorder.hasVideoError()) {
-        ofLogWarning("The video recorder failed to write some frames!");
-    }
-
-    if (vidRecorder.hasAudioError()) {
-        ofLogWarning("The video recorder failed to write some audio samples!");
-    }
+	fbo.begin();
+	postprocess.begin();
+	postprocess.setUniformTexture("tex", tex, 0);
+	postprocess.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
+	postprocess.setUniform1f("time", time);
+	ofSetColor(255);
+	ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
+	postprocess.end();
+	fbo.end();
+	fbo.draw(0, 0);
 
 	ofDrawBitmapString(ofGetFrameRate(),20,20);
 }
 
 void ofApp::exit(){
-    ofRemoveListener(vidRecorder.outputFileCompleteEvent, this, &ofApp::recordingComplete);
-    vidRecorder.close();
-
 	trailMap.clear();
 	reactionMap.clear();
 
@@ -518,15 +590,8 @@ void ofApp::audioIn(ofSoundBuffer & buffer){
 		buffer *= volume;
 		audioAnalyzer.analyze(buffer);
 	}
-	
-	if(bRecording)
-        vidRecorder.addAudioSamples(buffer.getBuffer().data(), bufferSize, channels);
 }
 
-//--------------------------------------------------------------
-void ofApp::recordingComplete(ofxVideoRecorderOutputFileCompleteEventArgs& args){
-    cout << "The recoded video file is now complete." << endl;
-}
 
 //--------------------------------------------------------------
 void ofApp::newMidiMessage(ofxMidiMessage& message) {
@@ -630,28 +695,6 @@ void ofApp::newInput(int key) {
 	} else if (key == 50) {
 		newSpecies[0].colour = glm::vec4(0.263, 0.31, 0.98, 1.);
 		newSpecies[1].colour = glm::vec4(0.396, 0.839, 0.749, 1.);
-	} else if (key == 51) {
-		newSpecies[0].movementAttributes.x = ofRandom(0.9, 1.4); // moveSpeed
-	} else if (key == 52) {
-		newSpecies[0].movementAttributes.y = ofRandom(0.03, 0.07) * 2 * PI; // turnSpeed
-	} else if (key == 53) {
-		newSpecies[0].sensorAttributes.x = ofRandom(30, 50) * PI / 180; // sensorAngleRad
-	} else if (key == 54) {
-		newSpecies[0].sensorAttributes.y = ofRandom(10, 30); // sensorOffsetDist
-	} else if (key == 55) {
-		newSpecies[1].movementAttributes.x = ofRandom(0.6, 1.1); // moveSpeed
-	} else if (key == 56) {
-		newSpecies[1].movementAttributes.y = ofRandom(0.08, 0.13) * 2 * PI; // turnSpeed
-	} else if (key == 57) {
-		newSpecies[1].sensorAttributes.x = ofRandom(50, 70) * PI/ 180; // sensorAngleRad
-	} else if (key == 58) {
-		newSpecies[1].sensorAttributes.y = ofRandom(30, 50); //sensorOffsetDist
-	} else if (key == 59) {
-		newTrailHeight = ofRandom(5, 10);
-	} else if (key == 60) {
-		newDiffuseRate = ofRandom(0.05, 0.4);
-	} else if (key == 61) {
-		newDecayRate = 1 - std::pow(0.1, ofRandom(1, 3.1));
 	} else if (key == 62) {
 		if (newAgentFlowMag == 0) {
 			newAgentFlowMag = 20;
@@ -664,10 +707,6 @@ void ofApp::newInput(int key) {
 		} else if (newReactionFlowMag = 20) {
 			newReactionFlowMag = 0;
 		}
-	} else if (key == 64) {
-		newSunZ = ofRandom(20, 50);
-	} else if (key == 65) {
-		newChemHeight = ofRandom(1, 9);
 	} else if (key == 66) {
 		newFeedMin = 0.01;
 		newFeedRange = 0.09;
@@ -690,160 +729,79 @@ void ofApp::newInput(int key) {
 		bReSpawnReaction = true;
 	} else if (key == 71) {
 		for (int i = 0; i < 1; i++) {
-			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 0;
 			newPoints[i].value.y = 0;
-			newPoints[i].value.z = z;
-			newPoints[i].value.w = 1 - z;
+			newPoints[i].value.z = 1;
+			newPoints[i].value.w = 0;
 		}
 		for (int i = 1; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
 	} else if (key == 72) {
 		for (int i = 0; i < 2; i++) {
-			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 1;
 			newPoints[i].value.y = float(i) / 2;
-			newPoints[i].value.z = z;
-			newPoints[i].value.w = 1 - z;
+			newPoints[i].value.z = 1;
+			newPoints[i].value.w = 0;
 		}
 		for (int i = 2; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
 	} else if (key == 73) {
 		for (int i = 0; i < 2; i++) {
-			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 0.5 + 0.5 * i;
 			newPoints[i].value.y = float(i) / 2;
-			newPoints[i].value.z = z;
-			newPoints[i].value.w = 1 - z;
+			newPoints[i].value.z = 1;
+			newPoints[i].value.w = 0;
 		}
 		for (int i = 2; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
 	} else if (key == 74) {
 		for (int i = 0; i < 2; i++) {
-			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 0.5 + 0.5 * i;
 			newPoints[i].value.y = float(i) / 3;
-			newPoints[i].value.z = z;
-			newPoints[i].value.w = 1 - z;
+			newPoints[i].value.z = 1;
+			newPoints[i].value.w = 0;
 		}
 		for (int i = 2; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
 	} else if (key == 75) {
 		for (int i = 0; i < 3; i++) {
-			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 1;
 			newPoints[i].value.y = float(i) / 3;
-			newPoints[i].value.z = z;
-			newPoints[i].value.w = 1 - z;
+			newPoints[i].value.z = 1;
+			newPoints[i].value.w = 0;
 		}
 		for (int i = 3; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
 	} else if (key == 76) {
 		for (int i = 0; i < 3; i++) {
-			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 1;
 			newPoints[i].value.y = float(i) / 3.5;
-			newPoints[i].value.z = z;
-			newPoints[i].value.w = 1 - z;
+			newPoints[i].value.z = 1;
+			newPoints[i].value.w = 0;
 		}
 		for (int i = 3; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
 	} else if (key == 77) {
 		for (int i = 0; i < 3; i++) {
-			float z = std::round(ofRandom(0, 1.1));
 			newPoints[i].value.x = 0.5 + i * 0.5;
 			newPoints[i].value.y = float(i) / 3.5;
-			newPoints[i].value.z = z;
-			newPoints[i].value.w = 1 - z;
+			newPoints[i].value.z = 1;
+			newPoints[i].value.w = 0;
 		}
 		for (int i = 3; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
-		}
-	} else if (key == 78) {
-		for (int i = 0; i < 4; i++) {
-			float z = std::round(ofRandom(0, 1.1));
-			newPoints[i].value.x = 1;
-			newPoints[i].value.y = float(i) / 4;
-			newPoints[i].value.z = z;
-			newPoints[i].value.w = 1 - z;
-		}
-		newPoints[4].value = glm::vec4(0);
-	} else if (key == 79) {
-		for (int i = 0; i < 4; i++) {
-			float z = std::round(ofRandom(0, 1.1));
-			newPoints[i].value.x = 1;
-			newPoints[i].value.y = float(i) / 9;
-			newPoints[i].value.z = z;
-			newPoints[i].value.w =  1 - z;
-		}
-		newPoints[4].value = glm::vec4(0);
-	} else if (key == 80) {
-		for (int i = 0; i < 4; i++) {
-			float z = std::round(ofRandom(0, 1.1));
-			newPoints[i].value.x = 0.3 + 0.3 * i;
-			newPoints[i].value.y = float(i) / 4;
-			newPoints[i].value.z = z;
-			newPoints[i].value.w = 1 - z;
-		}
-		newPoints[4].value = glm::vec4(0);
-	} else if (key == 81) {
-		for (int i = 0; i < 5; i++) {
-			float z = std::round(ofRandom(0, 1.1));
-			newPoints[i].value.x = 1;
-			newPoints[i].value.y = float(i) / 5;
-			newPoints[i].value.z = z;
-			newPoints[i].value.w = 1 - z;
-		}
-	} else if (key == 82) {
-		for (int i = 0; i < 5; i++) {
-			float z = std::round(ofRandom(0, 1.1));
-			newPoints[i].value.x = 0.2 + 0.2 * i;
-			newPoints[i].value.y = float(i) / 8;
-			newPoints[i].value.z = z;
-			newPoints[i].value.w = 1 - z;
-		}
-	} else if (key == 83) {
-		for (int i = 0; i < 5; i++) {
-			float z = std::round(ofRandom(0, 1.1));
-			newPoints[i].value.x = 0.3 + 0.3 * i;
-			newPoints[i].value.y = float(i) / 6;
-			newPoints[i].value.z = z;
-			newPoints[i].value.w = 1 - z;
 		}
 	}
 }
 
 //--------------------------------------------------------------
-void ofApp::keyReleased(int key){
-	if(key=='['){
-		bRecording = !bRecording;
-		if(bRecording && !vidRecorder.isInitialized()) {
-			vidRecorder.setup(fileName+ofGetTimestampString()+fileExt, ofGetWidth(), ofGetHeight(), 60, sampleRate, channels);
-		    // vidRecorder.setup(fileName+ofGetTimestampString()+fileExt, vidGrabber.getWidth(), vidGrabber.getHeight(), 30); // no audio
-		    // vidRecorder.setup(fileName+ofGetTimestampString()+fileExt, 0,0,0, sampleRate, channels); // no video
-		    // vidRecorder.setupCustomOutput(vidGrabber.getWidth(), vidGrabber.getHeight(), 30, sampleRate, channels, "-vcodec mpeg4 -b 1600k -acodec mp2 -ab 128k -f mpegts udp://localhost:1234"); // for custom ffmpeg output string (streaming, etc)
-
-			// Start recording
-			vidRecorder.start();
-		}
-		else if(!bRecording && vidRecorder.isInitialized()) {
-			vidRecorder.setPaused(true);
-		}
-		else if(bRecording && vidRecorder.isInitialized()) {
-			vidRecorder.setPaused(false);
-		}
-	}
-	if(key==']'){
-		bRecording = false;
-		vidRecorder.close();
-	}
-}
+void ofApp::keyReleased(int key){ }
 
 
 void ofApp::copyVariables() {
@@ -868,7 +826,6 @@ void ofApp::copyVariables() {
 	newColourC = colourC;
 	newColourD = colourD;
 
-	newSunZ = sunZ;
 	newDayRate = dayRate;
 	newChemHeight = chemHeight;
 	newTrailHeight = trailHeight;
@@ -904,7 +861,6 @@ void ofApp::moveToVariables() {
 	colourC = glm::mix(colourC, newColourC, rate);
 	colourD = glm::mix(colourD, newColourD, rate);
 
-	sunZ = (1 - rate) * sunZ + rate * newSunZ;
 	chemHeight = (1 - rate) * chemHeight + rate * newChemHeight;
 	trailHeight = (1 - rate) * trailHeight + rate * newTrailHeight;
 

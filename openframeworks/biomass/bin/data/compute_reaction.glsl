@@ -50,8 +50,7 @@ void main(){
     float a = previous.x;
     float b = previous.y;
 
-    vec2 audio = imageLoad(audioMap, coord).xy;
-    float audioMag = length(audio);
+    float audio = imageLoad(audioMap, coord).x;
 
     // get flow map
     vec2 simplex_flow = texture(flowMap, coord).xy;
@@ -61,7 +60,7 @@ void main(){
     optical_flow = (2 * optical_flow) - 1; //convert flow to -1 to 1 range
     float opticalFlowMag = length(optical_flow);
 
-    vec2 flow = (reactionFlowMag + 15 * opticalFlowMag + 5 * audioMag) * simplex_flow;
+    vec2 flow = (reactionFlowMag + 15 * opticalFlowMag + 10 * audio) * simplex_flow;
     float flow_left = 0.2 + 0.2 * flow.x;
     float flow_right = 0.2 - 0.2 * flow.x;
     float flow_up = 0.2 + 0.2 * flow.y;
@@ -117,7 +116,7 @@ void main(){
     float kill = -1 * (k + f) * b;
     vec2 feedkillVec = vec2(feed, kill);
 
-    vec2 diffusion = vec2(1.0, 0.5) + vec2(0.15 * audio.x, 0.3 * audio.y);
+    vec2 diffusion = vec2(1.0, 0.5) + 0.5 * audio * vec2(0.15, 0.3);
 
     vec2 newValues = previous + (deltaTime * ((diffusion * laplacian) + reactionVec + feedkillVec));
 

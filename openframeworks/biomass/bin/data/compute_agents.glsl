@@ -200,9 +200,9 @@ void main(){
 	opticalFlowForce = (2 * opticalFlowForce) - 1; // convert to -1-1 range
 	float opticalFlowMag = length(opticalFlowForce);
 
-	float audioMag = length(imageLoad(audioMap, oldCoord).xy);
+	float audioMag = imageLoad(audioMap, oldCoord).x;
 
-	vec2 force = 2 * opticalFlowMag + ((0.3 * audioMag + agentFlowMag) * simplexFlowForce);
+	vec2 force = 2 * opticalFlowMag + ((audioMag + agentFlowMag) * simplexFlowForce);
 
 	// Update position
 	vec2 newVel = normalize(vel + (force * deltaTime));

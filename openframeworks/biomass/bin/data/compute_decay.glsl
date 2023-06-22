@@ -23,5 +23,19 @@ void main(){
     float opticalDecayRate = 1. - 0.8 * opticalFlowMag;
     
     vec4 newTrail = min(max((blurredTrail * opticalDecayRate * decayRate * deltaTime), 0.), 1.);
+
+    if (newTrail.x < 0.001) {
+        newTrail.x = 0.;
+    }
+    if (newTrail.y < 0.001) {
+        newTrail.y = 0.;
+    }
+    if (newTrail.z < 0.001) {
+        newTrail.z = 0.;
+    }
+    if (newTrail.w < 0.001) {
+        newTrail.w = 0.;
+    }
+
 	imageStore(trailMap, coord, newTrail);
 }

@@ -59,28 +59,16 @@ void main(){
     vec2 uv = vec2(1.0) * vec2(coord) / vec2(resolution);
     vec2 centre = vec2(0.5, 0.5);
     vec2 from_centre = uv - centre;
-    float this_angle = atan(from_centre.y, from_centre.x);
-    float this_r = length(from_centre);
 
-    float a_cassini = 1;
+    float cassini = 1;
     float a = 0;
     for (int i = 0; i < maxPoints; i++) {
         vec2 pos = allPoints[i].value.xy;
         float strength = allPoints[i].value.z;
         a += strength;
-        a_cassini *= mix(1., sum(pow(from_centre - pos, vec2(2.))), strength);
+        cassini *= mix(1., sum(pow(from_centre - pos, vec2(2.))), strength);
     }
-    float a_spec = getSpectrum(a_cassini, a);
+    float spec = getSpectrum(cassini, a);
 
-    float b_cassini = 1;
-    float b = 0;
-    for (int i = 0; i < maxPoints; i++) {
-        vec2 pos = allPoints[i].value.xy;
-        float strength = allPoints[i].value.w;
-        b += strength;
-        b_cassini *= mix(1., sum(pow(from_centre - pos, vec2(2.))), strength);
-    }
-    float b_spec = getSpectrum(b_cassini, b);
-
-    imageStore(audioMap, coord, vec4(a_spec, b_spec, 0., 1.));
+    imageStore(audioMap, coord, vec4(spec, 0., 0., 1.));
 }

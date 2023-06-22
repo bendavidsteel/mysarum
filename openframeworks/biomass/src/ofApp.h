@@ -6,6 +6,7 @@
 #include "ofxOpenCv.h"
 #include "ofxAudioAnalyzer.h"
 #include "ofxMidi.h"
+#include "ofxNetwork.h"
 
 enum Spawn{
 	RANDOM=0,
@@ -14,6 +15,12 @@ enum Spawn{
 	SMALL_RING=3,
 	VERTICAL_LINE=4,
 	HORIZONTAL_LINE=5
+};
+
+enum AudioType{
+	TIME=0,
+	SPECTRAL=1,
+	HEARTBEAT=2
 };
 
 class ofApp : public ofBaseApp, public ofxMidiListener{
@@ -39,20 +46,19 @@ class ofApp : public ofBaseApp, public ofxMidiListener{
 		ofSoundStream soundStream;
 		ofxMidiIn midiIn;
 
-		bool bRecording;
+		ofxUDPManager udpConnection;
+
 		int sampleRate;
 		int bufferSize;
 		int channels;
 		float volume;
-		string fileName;
-		string fileExt;
-
-		void recordingComplete(ofxVideoRecorderOutputFileCompleteEventArgs& args);
+		AudioType audioType;
 
 		// both
 		ofShader compute_flow;
 		ofShader renderer;
 		ofShader simple_renderer;
+		ofShader postprocess;
 
 		ofFbo flowFbo;
 
@@ -127,7 +133,9 @@ class ofApp : public ofBaseApp, public ofxMidiListener{
 
 		ofxAudioAnalyzer audioAnalyzer;
 
-		ofBufferObject melBandsBuffer;
+		int audioArraySize;
+		vector<Component> audioArray;
+		ofBufferObject audioBuffer;
 		ofBufferObject pointsBuffer;
 
 		ofShader compute_audio;
@@ -140,13 +148,12 @@ class ofApp : public ofBaseApp, public ofxMidiListener{
 		vector<Component> newPoints;
 
 		// variables
-		float days;
 		float time_of_day;
+		float time_of_month;
 
 		float dayRate;
+		float monthRate;
 		float newDayRate;
-		float sunZ;
-		float newSunZ;
 		float chemHeight;
 		float newChemHeight;
 		float trailHeight;

@@ -82,8 +82,8 @@ void main()
 		}
 		lighting *= light_falloff;
 
-		colour = chems.x * colourA * lighting;
-		colour += chems.y * colourB * lighting;
+		// colour = chems.x * colourA * lighting;
+		// colour += chems.y * colourB * lighting;
 
 	} else if (display == 1) {
 		float pos_height = 0.;

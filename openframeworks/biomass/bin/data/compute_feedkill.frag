@@ -5,6 +5,7 @@ uniform float time;
 uniform float speed;
 uniform float feedMin;
 uniform float feedRange;
+uniform int pattern;
 
 out vec4 out_color;
 

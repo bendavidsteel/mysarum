@@ -12,6 +12,42 @@ uniform int opticalFlowDownScale;
 uniform float reactionFlowMag;
 uniform float feedMin;
 uniform float feedRange;
+uniform int mapFactor;
+uniform int initialise;
+
+// A single iteration of Bob Jenkins' One-At-A-Time hashing algorithm.
+uint hash( uint x ) {
+	x += ( x << 10u );
+	x ^= ( x >>  6u );
+	x += ( x <<  3u );
+	x ^= ( x >> 11u );
+	x += ( x << 15u );
+	return x;
+}
+
+// Compound versions of the hashing algorithm I whipped together.
+uint hash( uvec2 v ) { return hash( v.x ^ hash(v.y)                         ); }
+uint hash( uvec3 v ) { return hash( v.x ^ hash(v.y) ^ hash(v.z)             ); }
+uint hash( uvec4 v ) { return hash( v.x ^ hash(v.y) ^ hash(v.z) ^ hash(v.w) ); }
+
+// Construct agent float with half-open range [0:1] using low 23 bits.
+// All zeroes yields 0.0, all ones yields the next smallest representable value below 1.0.
+float floatConstruct( uint m ) {
+    const uint ieeeMantissa = 0x007FFFFFu; // binary32 mantissa bitmask
+    const uint ieeeOne      = 0x3F800000u; // 1.0 in IEEE binary32
+
+    m &= ieeeMantissa;                     // Keep only mantissa bits (fractional part)
+    m |= ieeeOne;                          // Add fractional part to 1.0
+
+    float  f = uintBitsToFloat( m );       // Range [1:2]
+    return f - 1.0;                        // Range [0:1]
+}
+
+// Pseudo-random value in half-open range [0:1].
+float random( float x ) { return floatConstruct(hash(floatBitsToUint(x))); }
+float random( vec2  v ) { return floatConstruct(hash(floatBitsToUint(v))); }
+float random( vec3  v ) { return floatConstruct(hash(floatBitsToUint(v))); }
+float random( vec4  v ) { return floatConstruct(hash(floatBitsToUint(v))); }
 
 float get_third_degree_polynomial_out(float x, vec4 coefs) {
     vec4 xs = vec4(1.);
@@ -46,9 +82,24 @@ void main(){
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
 
     // previous values
-    vec2 previous = imageLoad(reactionMap, coord).xy;
-    float a = previous.x;
-    float b = previous.y;
+    float a, b;
+    int init = 0;
+    if (initialise == 1) {
+        a = 1.;
+        vec2 uv = vec2(coord) / vec2(resolution);
+        vec2 centre = vec2(0.5, 0.5);
+        vec2 from_centre = uv - centre;
+        float dist = length(from_centre);
+        if (random(uv) < 0.1) {
+            b = 1.;
+        } else {
+            b = 0.;
+        }
+    } else {
+        vec2 previous = imageLoad(reactionMap, coord).xy;
+        a = previous.x;
+        b = previous.y;
+    }
 
     float audio = imageLoad(audioMap, coord).x;
 
@@ -60,7 +111,7 @@ void main(){
     optical_flow = (2 * optical_flow) - 1; //convert flow to -1 to 1 range
     float opticalFlowMag = length(optical_flow);
 
-    vec2 flow = (reactionFlowMag + 15 * opticalFlowMag + 10 * audio) * simplex_flow;
+    vec2 flow = (reactionFlowMag + 15 * opticalFlowMag + 5 * audio) * simplex_flow;
     float flow_left = 0.2 + 0.2 * flow.x;
     float flow_right = 0.2 - 0.2 * flow.x;
     float flow_up = 0.2 + 0.2 * flow.y;
@@ -71,44 +122,64 @@ void main(){
     float flow_rd = 0.05 - 0.025 * flow.x - 0.025 * flow.y;
 
     // compute laplacian
-    ivec2 neighbourCoord = coord + ivec2(-1, -1);
+    int kernelSize = 1;
+    ivec2 neighbourCoord = coord + kernelSize * ivec2(-1, -1);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
     vec2 neighbours = imageLoad(reactionMap, neighbourCoord).xy * flow_ld;
 
-    neighbourCoord = coord + ivec2(-1, 0);
+    neighbourCoord = coord + kernelSize * ivec2(-1, 0);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
     neighbours += imageLoad(reactionMap, neighbourCoord).xy * flow_left;
 
-    neighbourCoord = coord + ivec2(-1, 1);
+    neighbourCoord = coord + kernelSize * ivec2(-1, 1);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
     neighbours += imageLoad(reactionMap, neighbourCoord).xy * flow_lu;
 
-    neighbourCoord = coord + ivec2(0, -1);
+    neighbourCoord = coord + kernelSize * ivec2(0, -1);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
     neighbours += imageLoad(reactionMap, neighbourCoord).xy * flow_down;
 
-    neighbourCoord = coord + ivec2(0, 1);
+    neighbourCoord = coord + kernelSize * ivec2(0, 1);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
     neighbours += imageLoad(reactionMap, neighbourCoord).xy * flow_up;
 
-    neighbourCoord = coord + ivec2(1, -1);
+    neighbourCoord = coord + kernelSize * ivec2(1, -1);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
     neighbours += imageLoad(reactionMap, neighbourCoord).xy * flow_rd;
 
-    neighbourCoord = coord + ivec2(1, 0);
+    neighbourCoord = coord + kernelSize * ivec2(1, 0);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
     neighbours += imageLoad(reactionMap, neighbourCoord).xy * flow_right;
 
-    neighbourCoord = coord + ivec2(1, 1);
+    neighbourCoord = coord + kernelSize * ivec2(1, 1);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
     neighbours += imageLoad(reactionMap, neighbourCoord).xy * flow_ru;
 
-    vec2 laplacian = neighbours - previous;
+    vec2 laplacian = neighbours - vec2(a, b);
 
     float reaction = a * b * b;
     vec2 reactionVec = reaction * vec2(-1, 1);
 
-    vec2 feedkill = get_feedkill(gl_GlobalInvocationID.xy);
+    vec2 uv = vec2(coord) / vec2(resolution);
+    vec2 centre = vec2(0.5, 0.5);
+    vec2 from_centre = uv - centre;
+    float r = length(from_centre);
+
+    vec2 feedkill;
+    // if (r > 0.2) {
+    //     feedkill = vec2(0.096, 0.057);
+    // } else {
+    //     feedkill = vec2(0.015, 0.045);
+    // }
+
+    feedkill = get_feedkill(gl_GlobalInvocationID.xy);
+    
+    // feedkill = vec2(0.096, 0.057);
+    // feedkill = vec2(0.073, 0.061);
+    // feedkill = vec2(0.035, 0.059);
+    // feedkill = vec2(0.021, 0.053);
+    // feedkill = vec2(0.015, 0.045);
+
     float f = feedkill.x;
     float k = feedkill.y;
 
@@ -118,7 +189,7 @@ void main(){
 
     vec2 diffusion = vec2(1.0, 0.5) + 0.5 * audio * vec2(0.15, 0.3);
 
-    vec2 newValues = previous + (deltaTime * ((diffusion * laplacian) + reactionVec + feedkillVec));
+    vec2 newValues = vec2(a, b) + (deltaTime) * ((diffusion * laplacian) + reactionVec + feedkillVec);
 
     vec4 vals = vec4(newValues, 0., 1.);
 	imageStore(reactionMap, coord, vals);

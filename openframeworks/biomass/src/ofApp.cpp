@@ -4,10 +4,14 @@
 //--------------------------------------------------------------
 void ofApp::setup(){
 
-	ofSetFrameRate(60);
+	ofSetFrameRate(120);
 
 	// constants
 	display = 0;
+
+	mapFactor = 2.;
+	mapWidth = ofGetWidth() * mapFactor;
+	mapHeight = ofGetHeight() * mapFactor;
 
 	colourA = glm::vec3(1., 0., 0.);
 	colourB = glm::vec3(0., 1., 0.);
@@ -16,7 +20,7 @@ void ofApp::setup(){
 	chemHeight = 1.;
 	trailHeight = 2.;
 	dayRate = 10.;
-	monthRate = 300.;
+	monthRate = 10.;
 
 	feedMin = 0.01;
     feedRange = 0.09;
@@ -34,23 +38,23 @@ void ofApp::setup(){
 	sampleRate = 48000;
 	bufferSize = 1024;
     channels = 2;
-	volume = 5.0;
+	volume = 1.0;
 
 	// slime setup
 	int numSpecies = 2;
 	allSpecies.resize(numSpecies);
-	allSpecies[0].movementAttributes.x = 1.1; // moveSpeed
+	allSpecies[0].movementAttributes.x = 1.1 * mapFactor; // moveSpeed
 	allSpecies[0].movementAttributes.y = 0.04 * 2 * PI; // turnSpeed
 	allSpecies[0].movementAttributes.z = CIRCLE; //spawn
 	allSpecies[0].sensorAttributes.x = 30 * PI / 180; // sensorAngleRad
-	allSpecies[0].sensorAttributes.y = 10; // sensorOffsetDist
+	allSpecies[0].sensorAttributes.y = 10 * mapFactor; // sensorOffsetDist
 	allSpecies[0].colour = glm::vec4(0.796, 0.2, 1., 1.);
 
-	allSpecies[1].movementAttributes.x = 0.9; // moveSpeed
+	allSpecies[1].movementAttributes.x = 0.9 * mapFactor; // moveSpeed
 	allSpecies[1].movementAttributes.y = 0.08 * 2 * PI; // turnSpeed
 	allSpecies[1].movementAttributes.z = RING;
 	allSpecies[1].sensorAttributes.x = 40 * PI/ 180; // sensorAngleRad
-	allSpecies[1].sensorAttributes.y = 20; //sensorOffsetDist
+	allSpecies[1].sensorAttributes.y = 20 * mapFactor; //sensorOffsetDist
 	allSpecies[1].colour = glm::vec4(0.1, 0.969, 1., 1.);
 	newSpecies.resize(numSpecies);
 
@@ -62,16 +66,16 @@ void ofApp::setup(){
 		auto &p = particles[idx];
 		speciesIdx = idx % numSpecies;
 		if (allSpecies[speciesIdx].movementAttributes.z == RANDOM) {
-			p.pos.x = ofRandom(0, ofGetWidth());
-			p.pos.y = ofRandom(0, ofGetHeight());
+			p.pos.x = ofRandom(0, mapWidth);
+			p.pos.y = ofRandom(0, mapHeight);
 		} else if (allSpecies[speciesIdx].movementAttributes.z == CIRCLE) {
-			p.pos.x = ofGetWidth() / 2;
-			p.pos.y = ofGetHeight() / 2;
+			p.pos.x = mapWidth / 2;
+			p.pos.y = mapHeight / 2;
 		} else if (allSpecies[speciesIdx].movementAttributes.z == RING) {
 			float angle = ofRandom(0, 2*PI);
-			float radius = 0.4 * ofGetWidth();
-			p.pos.x = (ofGetWidth() / 2) + (radius * ofRandom(0.999, 1.001) * cos(angle));
-			p.pos.y = (ofGetHeight() / 2) + (radius * ofRandom(0.999, 1.001) * sin(angle));
+			float radius = 0.4 * mapWidth;
+			p.pos.x = (mapWidth / 2) + (radius * ofRandom(0.999, 1.001) * cos(angle));
+			p.pos.y = (mapHeight / 2) + (radius * ofRandom(0.999, 1.001) * sin(angle));
 		}
 		p.vel.x = ofRandom(-1, 1);
 		p.vel.y = ofRandom(-1, 1);
@@ -87,26 +91,27 @@ void ofApp::setup(){
 	allSpeciesBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 2);
 
 	ofPixels initialTrail;
-	initialTrail.allocate(ofGetWidth(), ofGetHeight(), OF_PIXELS_RGBA);
+	initialTrail.allocate(mapWidth, mapHeight, OF_PIXELS_RGBA);
 	ofColor initialTrailColor(0., 0., 0., 0.);
 	initialTrail.setColor(initialTrailColor);
 
-	trailMap.allocate(ofGetWidth(), ofGetHeight(), GL_RGBA8);
+	trailMap.allocate(mapWidth, mapHeight, GL_RGBA8);
 	trailMap.loadData(initialTrail);
 	trailMap.bindAsImage(3, GL_READ_WRITE);
 
 	// reaction diffusion setup
-	reactionMap.allocate(ofGetWidth(), ofGetHeight(), GL_RG16);
+	reactionMap.allocate(mapWidth, mapHeight, GL_RG16);
 	reactionMap.bindAsImage(0, GL_READ_WRITE);
-	bool keepPattern = false;
-	reSpawnReaction(keepPattern);
+	bReSpawnReaction = 1;
+	// bool keepPattern = false;
+	// reSpawnReaction(keepPattern);
 
-	// feedkillFbo.allocate(ofGetWidth(), ofGetHeight(), GL_RGBA16);
+	// feedkillFbo.allocate(mapWidth, mapHeight, GL_RGBA16);
 
 	// general setup
-	flowFbo.allocate(ofGetWidth(), ofGetHeight(), GL_RGBA8);
+	flowFbo.allocate(mapWidth, mapHeight, GL_RGBA8);
 
-	fbo.allocate(ofGetWidth(), ofGetHeight(), GL_RGBA8);
+	fbo.allocate(mapWidth, mapHeight, GL_RGBA8);
 
 	// load slime shaders
 	compute_agents.setupShaderFromFile(GL_COMPUTE_SHADER,"compute_agents.glsl");
@@ -137,7 +142,7 @@ void ofApp::setup(){
 	// auto devices = soundStream.getDeviceList(ofSoundDevice::Api::ALSA);
 	auto devices = soundStream.getDeviceList();
 	if(!devices.empty()){
-		settings.setInDevice(devices[1]);
+		settings.setInDevice(devices[0]);
 	}
 	// settings.setApi(ofSoundDevice::Api::ALSA);
 
@@ -154,6 +159,7 @@ void ofApp::setup(){
 
 	// audio analysis setup
 	audioAnalyzer.setup(sampleRate, bufferSize, channels);
+	bpmDetector.setup(channels, sampleRate, 64);
 
 	audioType = AudioType::TIME;
 	if (audioType == AudioType::SPECTRAL) {
@@ -203,14 +209,15 @@ void ofApp::setup(){
 	compute_audio.setupShaderFromFile(GL_COMPUTE_SHADER, "compute_audio.glsl");
 	compute_audio.linkProgram();
 
-	audioTexture.allocate(ofGetWidth(), ofGetHeight(), GL_RG16);
+	audioTexture.allocate(mapWidth, mapHeight, GL_RG16);
 	audioTexture.bindAsImage(7, GL_READ_WRITE);
 
 	// video and optical flow setup
 	vidGrabber.setVerbose(true);
-	int sourceWidth = ofGetWidth();
-	int sourceHeight = ofGetHeight();
-	vidGrabber.setup(sourceWidth, sourceHeight);
+	vidGrabber.setDeviceID(0);
+	int sourceWidth = mapWidth;
+	int sourceHeight = mapHeight;
+	vidGrabber.initGrabber(sourceWidth, sourceHeight);
 	
 	blurAmount = 15;
 	cvDownScale = 10;
@@ -260,6 +267,9 @@ void ofApp::setup(){
 	udpConnection.Setup(udpSettings);
 
 	copyVariables();
+
+	artificerImage.load("artitficer-title.png");
+	artificerImage.resize(ofGetWidth(), ofGetHeight());
 }
 
 //--------------------------------------------------------------
@@ -267,6 +277,9 @@ void ofApp::update(){
 	double deltaTime = 1.; //ofGetLastFrameTime();
 
 	float time = ofGetElapsedTimef();
+	float bps = bpmDetector.getBPM() / 60.;
+	dayRate = 4 * bps;
+	monthRate = dayRate / 10.;
 	float days = time / dayRate;
 	float months = time / monthRate;
 	time_of_day = fmod(days, float(2 * PI)) - PI;
@@ -316,8 +329,8 @@ void ofApp::update(){
 		currentMat.copyTo(previousMat);
 	}
 
-	int numCols = ofGetWidth() / cvDownScale;
-	int numRows = ofGetHeight() / cvDownScale;
+	int numCols = mapWidth / cvDownScale;
+	int numRows = mapHeight / cvDownScale;
 	
 	for( int x = 0; x < numCols; x++ ) {
 		for( int y = 0; y < numRows; y++ ) {
@@ -398,19 +411,75 @@ void ofApp::update(){
 	}
 
 	// evolve physarum
-	if (abs(time_of_day - 0) < 0.1) {
-		newSpecies[0].movementAttributes.x = min(max(allSpecies[0].movementAttributes.x + ofRandom(-0.01, 0.01), float(0.6)), float(1.4)); // moveSpeed
+	if (abs(time_of_day) < 0.1) {
+		newSpecies[0].movementAttributes.x = min(max(allSpecies[0].movementAttributes.x + mapFactor * ofRandom(-0.01, 0.01), float(mapFactor * 0.6)), float(mapFactor * 1.4)); // moveSpeed
 		newSpecies[0].movementAttributes.y = min(max(allSpecies[0].movementAttributes.y + ofRandom(-0.001, 0.001), float(0.03)), float(0.13)) * 2 * PI; // turnSpeed
 		newSpecies[0].sensorAttributes.x = min(max(allSpecies[0].sensorAttributes.x + ofRandom(-0.5, 0.5), float(30.)), float(70.)) * PI / 180; // sensorAngleRad
 		newSpecies[0].sensorAttributes.y = min(max(allSpecies[0].sensorAttributes.y + ofRandom(-0.5, 0.5), float(10.)), float(50.)); // sensorOffsetDist
 		
-		newSpecies[1].movementAttributes.x = min(max(allSpecies[1].movementAttributes.x + ofRandom(-0.01, 0.01), float(0.6)), float(1.4)); // moveSpeed
+		newSpecies[1].movementAttributes.x = min(max(allSpecies[1].movementAttributes.x + mapFactor * ofRandom(-0.01, 0.01), float(mapFactor * 0.6)), float(mapFactor * 1.4)); // moveSpeed
 		newSpecies[1].movementAttributes.y = min(max(allSpecies[1].movementAttributes.y + ofRandom(-0.001, 0.001), float(0.03)), float(0.13)) * 2 * PI; // turnSpeed
 		newSpecies[1].sensorAttributes.x = min(max(allSpecies[1].sensorAttributes.x + ofRandom(-0.5, 0.5), float(30.)), float(70.)) * PI / 180; // sensorAngleRad
 		newSpecies[1].sensorAttributes.y = min(max(allSpecies[1].sensorAttributes.y + ofRandom(-0.5, 0.5), float(10.)), float(50.)); // sensorOffsetDist
 
 		newDiffuseRate = min(max(diffuseRate + ofRandom(-0.01, 0.01), float(0.05)), float(0.4));
 		newDecayRate = min(max(decayRate + ofRandom(-0.001, 0.001), float(0.9)), float(0.999));
+	}
+
+	if (abs(time_of_month) < 0.001) {
+		int newReactionColour = int(ofRandom(0., 10.));
+
+		if (newReactionColour == 0) {
+			newColourA = glm::vec3(1., 0., 0.);
+			newColourB = glm::vec3(0., 1., 0.);
+		} else if (newReactionColour == 1) {
+			newColourA = glm::vec3(1.0, 0.906, 0.51);
+			newColourB = glm::vec3(0.98, 0.345, 0.118);
+		} else if (newReactionColour == 2) {
+			newColourA = glm::vec3(0.494, 0.921, 0.063);
+			newColourB = glm::vec3(0.839, 0.812, 0.153);
+		} else if (newReactionColour == 3) {
+			newColourA = glm::vec3(0.839, 0.02, 0.004);
+			newColourB = glm::vec3(0., 0., 1.);
+		} else if (newReactionColour == 4) {
+			newColourA = glm::vec3(1., 0., 0.);
+			newColourB = glm::vec3(0., 0., 1.);
+		} else if (newReactionColour == 5) {
+			newColourA = glm::vec3(191./255., 11./255., 59./255.);
+			newColourB = glm::vec3(213./255., 13./255., 216./255.);
+		}
+		
+		int newSlimeColour = int(ofRandom(0., 1.5));
+		if (newSlimeColour == 0) {
+			newSpecies[0].colour = glm::vec4(0.796, 0.2, 1., 1.);
+			newSpecies[1].colour = glm::vec4(0.1, 0.969, 1., 1.);
+		} else if (newSlimeColour == 1) {
+			newSpecies[0].colour = glm::vec4(0.263, 0.31, 0.98, 1.);
+			newSpecies[1].colour = glm::vec4(0.396, 0.839, 0.749, 1.);
+		}
+
+		int newReactionMap = int(ofRandom(0., 11.));
+		if (newReactionMap == 0) {
+			newFeedMin = 0.01;
+			newFeedRange = 0.09;
+			bReSpawnReaction = 1;
+		} else if (newReactionMap == 1) {
+			newFeedMin = 0.01;
+			newFeedRange = 0.025;
+			bReSpawnReaction = 1;
+		} else if (newReactionMap == 2) {
+			newFeedMin = 0.035;
+			newFeedRange = 0.025;
+			bReSpawnReaction = 1;
+		} else if (newReactionMap == 3) {
+			newFeedMin = 0.06;
+			newFeedRange = 0.015;
+			bReSpawnReaction = 1;
+		} else if (newReactionMap == 4) {
+			newFeedMin = 0.075;
+			newFeedRange = 0.015;
+			bReSpawnReaction = 1;
+		}
 	}
 
 	// handle inputs
@@ -421,30 +490,34 @@ void ofApp::update(){
 		bReSpawnAgents = false;
 	}
 
-	if (bReSpawnReaction) {
-		bool keepPattern = true;
-		reSpawnReaction(keepPattern);
-		bReSpawnReaction = false;
+	if (bReloadShader) {
+		postprocess.load("generic.vert", "postprocess.frag");
+		renderer.load("generic.vert", "renderer.frag");
+		
+		compute_reaction.setupShaderFromFile(GL_COMPUTE_SHADER,"compute_reaction.glsl");
+		compute_reaction.linkProgram();
+
+		bReloadShader = false;
 	}
 
 	int workGroupSize = 20;
 
-	int widthWorkGroups = ceil(ofGetWidth()/workGroupSize);
-	int heightWorkGroups = ceil(ofGetHeight()/workGroupSize);
+	int widthWorkGroups = ceil(mapWidth/workGroupSize);
+	int heightWorkGroups = ceil(mapHeight/workGroupSize);
 
 	// general updates
 	flowFbo.begin();
 	ofClear(255,255,255, 0);
 	compute_flow.begin();
 	compute_flow.setUniform1f("time", time);
-	compute_flow.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
+	compute_flow.setUniform2i("resolution", mapWidth, mapHeight);
 	ofSetColor(255);
-	ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
+	ofDrawRectangle(0, 0, mapWidth, mapHeight);
 	compute_flow.end();
 	flowFbo.end();
 
 	compute_audio.begin();
-	compute_audio.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
+	compute_audio.setUniform2i("resolution", mapWidth, mapHeight);
 	compute_audio.setUniform1f("deltaTime", deltaTime);
 	compute_audio.setUniform1i("numBands", audioArraySize);
 	compute_audio.setUniform1f("angle", time_of_day);
@@ -455,7 +528,7 @@ void ofApp::update(){
 	// slime updates
 	// horizontal blur
 	compute_diffuse.begin();
-	compute_diffuse.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
+	compute_diffuse.setUniform2i("resolution", mapWidth, mapHeight);
 	compute_diffuse.setUniform1f("deltaTime", deltaTime);
 	compute_diffuse.setUniform1f("diffuseRate", diffuseRate);
 	compute_diffuse.setUniform2i("blurDir", 1, 0);
@@ -464,7 +537,7 @@ void ofApp::update(){
 
 	// vertical blur
 	compute_diffuse.begin();
-	compute_diffuse.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
+	compute_diffuse.setUniform2i("resolution", mapWidth, mapHeight);
 	compute_diffuse.setUniform1f("deltaTime", deltaTime);
 	compute_diffuse.setUniform1f("diffuseRate", diffuseRate);
 	compute_diffuse.setUniform2i("blurDir", 0, 1);
@@ -472,7 +545,7 @@ void ofApp::update(){
 	compute_diffuse.end();
 
 	compute_decay.begin();
-	compute_decay.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
+	compute_decay.setUniform2i("resolution", mapWidth, mapHeight);
 	compute_decay.setUniform1f("deltaTime", deltaTime);
 	compute_decay.setUniform1f("decayRate", decayRate);
 	compute_decay.setUniform1i("opticalFlowDownScale", cvDownScale);
@@ -480,7 +553,7 @@ void ofApp::update(){
 	compute_decay.end();
 
 	compute_agents.begin();
-	compute_agents.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
+	compute_agents.setUniform2i("resolution", mapWidth, mapHeight);
 	compute_agents.setUniform1f("deltaTime", deltaTime);
 	compute_agents.setUniform1f("time", time);
 	compute_agents.setUniform1f("trailWeight", trailWeight);
@@ -497,23 +570,32 @@ void ofApp::update(){
 	compute_agents.end();
 
 	compute_reaction.begin();
-	compute_reaction.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
+	compute_reaction.setUniform2i("resolution", mapWidth, mapHeight);
 	compute_reaction.setUniform1f("deltaTime", deltaTime);
 	compute_reaction.setUniform1i("opticalFlowDownScale", cvDownScale);
 	compute_reaction.setUniform1f("reactionFlowMag", reactionFlowMag);
 	compute_reaction.setUniform1f("feedMin", feedMin);
 	compute_reaction.setUniform1f("feedRange", feedRange);
+	compute_reaction.setUniform1f("mapFactor", mapFactor);
+	compute_reaction.setUniform1i("initialise", bReSpawnReaction);
 	compute_reaction.setUniformTexture("flowMap", flowFbo.getTexture(), 2);
 	compute_reaction.dispatchCompute(widthWorkGroups, heightWorkGroups, 1);
 	compute_reaction.end();
+
+	if (bReSpawnReaction == 1) {
+		bReSpawnReaction = 0;
+	}
 }
 
 //--------------------------------------------------------------
 void ofApp::draw() {
 
+	float bps = bpmDetector.getBPM() / 60.;
+	vector<float> melBands = audioAnalyzer.getValues(MEL_BANDS, 0, highSmoothing);
+
 	float time = ofGetElapsedTimef();
-	float sun_x = (ofGetWidth() / 2) + (2 * ofGetWidth() / 3) * cos(time_of_day);
-	float sun_y = (ofGetHeight() / 2) + (2 * ofGetHeight() / 3) * sin(time_of_day);
+	float sun_x = (mapWidth / 2) + (2 * mapWidth / 3) * cos(time_of_day);
+	float sun_y = (mapHeight / 2) + (2 * mapHeight / 3) * sin(time_of_day);
 	float sun_z = 25 + (10 * sin(time_of_month));
 
 	ofTexture tex;
@@ -521,7 +603,7 @@ void ofApp::draw() {
 		fbo.begin();
 		ofClear(255,255,255, 0);
 		renderer.begin();
-		renderer.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
+		renderer.setUniform2i("resolution", mapWidth, mapHeight);
 		renderer.setUniform3f("colourA", colourA.x, colourA.y, colourA.z);
 		renderer.setUniform3f("colourB", colourB.x, colourB.y, colourB.z);
 		renderer.setUniform3f("colourC", colourC.x, colourC.y, colourC.z);
@@ -529,9 +611,11 @@ void ofApp::draw() {
 		renderer.setUniform3f("light", sun_x, sun_y, sun_z);
 		renderer.setUniform1f("chem_height", chemHeight);
 		renderer.setUniform1f("trail_height", trailHeight);
+		renderer.setUniform1f("time", time);
+		renderer.setUniform1f("bpm", bps);
 		renderer.setUniformTexture("flowMap", flowFbo.getTexture(), 0);
 		ofSetColor(255);
-		ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
+		ofDrawRectangle(0, 0, mapWidth, mapHeight);
 		renderer.end();
 		fbo.end();
 		tex = fbo.getTexture();
@@ -540,7 +624,7 @@ void ofApp::draw() {
 		fbo.begin();
 		ofClear(255,255,255, 0);
 		simple_renderer.begin();
-		simple_renderer.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
+		simple_renderer.setUniform2i("resolution", mapWidth, mapHeight);
 		simple_renderer.setUniform3f("colourA", colourA.x, colourA.y, colourA.z);
 		simple_renderer.setUniform3f("colourB", colourB.x, colourB.y, colourB.z);
 		simple_renderer.setUniform3f("colourC", colourC.x, colourC.y, colourC.z);
@@ -552,7 +636,7 @@ void ofApp::draw() {
 		simple_renderer.setUniform1i("display", display);
 		simple_renderer.setUniformTexture("flowMap", flowFbo.getTexture(), 0);
 		ofSetColor(255);
-		ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
+		ofDrawRectangle(0, 0, mapWidth, mapHeight);
 		simple_renderer.end();
 		fbo.end();
 		tex = fbo.getTexture();
@@ -563,8 +647,12 @@ void ofApp::draw() {
 	fbo.begin();
 	postprocess.begin();
 	postprocess.setUniformTexture("tex", tex, 0);
+	postprocess.setUniformTexture("artificer", artificerImage.getTexture(), 1);
+	postprocess.setUniform2i("mapSize", mapWidth, mapHeight);
 	postprocess.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
 	postprocess.setUniform1f("time", time);
+	postprocess.setUniform1f("bps", bps);
+	postprocess.setUniform1f("bass", melBands[0]);
 	ofSetColor(255);
 	ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
 	postprocess.end();
@@ -589,6 +677,7 @@ void ofApp::audioIn(ofSoundBuffer & buffer){
 	if (buffer.getNumChannels() == audioAnalyzer.getChannelAnalyzersPtrs().size()) {
 		buffer *= volume;
 		audioAnalyzer.analyze(buffer);
+		bpmDetector.processFrame(buffer.getBuffer().data(), buffer.getNumFrames(), buffer.getNumChannels());
 	}
 }
 
@@ -657,77 +746,59 @@ void ofApp::keyPressed(int key){
 
 void ofApp::newInput(int key) {
 	
-	if (key == 36) {
+	if (key == 48) {
 		bReSpawnAgents = true;
-	} else if (key == 37) {
+	} else if (key == 49) {
 		display = 0;
-	} else if (key == 38) {
+	} else if (key == 50) {
 		display = 1;
-	} else if (key == 39) {
+	} else if (key == 51) {
 		display = 2;
-	} else if (key == 40) {
-		display = 3;
-	} else if (key == 41) {
-		display = 4;
-	} else if (key == 42) {
-		display = 5;
-	} else if (key == 43) {
+	} else if (key == 52) {
 		newColourA = glm::vec3(1., 0., 0.);
 		newColourB = glm::vec3(0., 1., 0.);
-	} else if (key == 44) {
+	} else if (key == 53) {
 		newColourA = glm::vec3(1.0, 0.906, 0.51);
 		newColourB = glm::vec3(0.98, 0.345, 0.118);
-	} else if (key == 45) {
+	} else if (key == 54) {
 		newColourA = glm::vec3(0.494, 0.921, 0.063);
 		newColourB = glm::vec3(0.839, 0.812, 0.153);
-	} else if (key == 46) {
-		newColourC = glm::vec3(0.839, 0.02, 0.004);
-		newColourD = glm::vec3(0., 0., 1.);
-	} else if (key == 47) {
-		newColourC = glm::vec3(1., 0., 0.);
-		newColourD = glm::vec3(0., 0., 1.);
-	} else if (key == 48) {
-		newColourC = glm::vec3(191./255., 11./255., 59./255.);
-		newColourD = glm::vec3(213./255., 13./255., 216./255.);
-	} else if (key == 49) {
+	} else if (key == 55) {
+		newColourA = glm::vec3(0.839, 0.02, 0.004);
+		newColourB = glm::vec3(0., 0., 1.);
+	} else if (key == 56) {
+		newColourA = glm::vec3(1., 0., 0.);
+		newColourB = glm::vec3(0., 0., 1.);
+	} else if (key == 57) {
+		newColourA = glm::vec3(191./255., 11./255., 59./255.);
+		newColourB = glm::vec3(213./255., 13./255., 216./255.);
+	} else if (key == 58) {
 		newSpecies[0].colour = glm::vec4(0.796, 0.2, 1., 1.);
 		newSpecies[1].colour = glm::vec4(0.1, 0.969, 1., 1.);
-	} else if (key == 50) {
+	} else if (key == 59) {
 		newSpecies[0].colour = glm::vec4(0.263, 0.31, 0.98, 1.);
 		newSpecies[1].colour = glm::vec4(0.396, 0.839, 0.749, 1.);
-	} else if (key == 62) {
-		if (newAgentFlowMag == 0) {
-			newAgentFlowMag = 20;
-		} else if (newAgentFlowMag = 20) {
-			newAgentFlowMag = 0;
-		}
-	} else if (key == 63) {
-		if (newReactionFlowMag == 0) {
-			newReactionFlowMag = 20;
-		} else if (newReactionFlowMag = 20) {
-			newReactionFlowMag = 0;
-		}
-	} else if (key == 66) {
+	} else if (key == 60) {
 		newFeedMin = 0.01;
 		newFeedRange = 0.09;
-		bReSpawnReaction = true;
-	} else if (key == 67) {
+		bReSpawnReaction = 1;
+	} else if (key == 61) {
 		newFeedMin = 0.01;
 		newFeedRange = 0.025;
-		bReSpawnReaction = true;
-	} else if (key == 68) {
+		bReSpawnReaction = 1;
+	} else if (key == 62) {
 		newFeedMin = 0.035;
 		newFeedRange = 0.025;
-		bReSpawnReaction = true;
-	} else if (key == 69) {
+		bReSpawnReaction = 1;
+	} else if (key == 63) {
 		newFeedMin = 0.06;
 		newFeedRange = 0.015;
-		bReSpawnReaction = true;
-	} else if (key == 70) {
+		bReSpawnReaction = 1;
+	} else if (key == 64) {
 		newFeedMin = 0.075;
 		newFeedRange = 0.015;
-		bReSpawnReaction = true;
-	} else if (key == 71) {
+		bReSpawnReaction = 1;
+	} else if (key == 65) {
 		for (int i = 0; i < 1; i++) {
 			newPoints[i].value.x = 0;
 			newPoints[i].value.y = 0;
@@ -737,7 +808,7 @@ void ofApp::newInput(int key) {
 		for (int i = 1; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
-	} else if (key == 72) {
+	} else if (key == 66) {
 		for (int i = 0; i < 2; i++) {
 			newPoints[i].value.x = 1;
 			newPoints[i].value.y = float(i) / 2;
@@ -747,7 +818,7 @@ void ofApp::newInput(int key) {
 		for (int i = 2; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
-	} else if (key == 73) {
+	} else if (key == 67) {
 		for (int i = 0; i < 2; i++) {
 			newPoints[i].value.x = 0.5 + 0.5 * i;
 			newPoints[i].value.y = float(i) / 2;
@@ -757,17 +828,7 @@ void ofApp::newInput(int key) {
 		for (int i = 2; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
-	} else if (key == 74) {
-		for (int i = 0; i < 2; i++) {
-			newPoints[i].value.x = 0.5 + 0.5 * i;
-			newPoints[i].value.y = float(i) / 3;
-			newPoints[i].value.z = 1;
-			newPoints[i].value.w = 0;
-		}
-		for (int i = 2; i < 5; i++) {
-			newPoints[i].value = glm::vec4(0);
-		}
-	} else if (key == 75) {
+	} else if (key == 68) {
 		for (int i = 0; i < 3; i++) {
 			newPoints[i].value.x = 1;
 			newPoints[i].value.y = float(i) / 3;
@@ -777,7 +838,7 @@ void ofApp::newInput(int key) {
 		for (int i = 3; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
-	} else if (key == 76) {
+	} else if (key == 69) {
 		for (int i = 0; i < 3; i++) {
 			newPoints[i].value.x = 1;
 			newPoints[i].value.y = float(i) / 3.5;
@@ -787,7 +848,7 @@ void ofApp::newInput(int key) {
 		for (int i = 3; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
-	} else if (key == 77) {
+	} else if (key == 70) {
 		for (int i = 0; i < 3; i++) {
 			newPoints[i].value.x = 0.5 + i * 0.5;
 			newPoints[i].value.y = float(i) / 3.5;
@@ -797,6 +858,8 @@ void ofApp::newInput(int key) {
 		for (int i = 3; i < 5; i++) {
 			newPoints[i].value = glm::vec4(0);
 		}
+	} else if (key == 72) {
+		bReloadShader = true;
 	}
 }
 
@@ -886,27 +949,27 @@ void ofApp::reSpawnAgents() {
 		auto &p = particles[idx];
 		speciesIdx = idx % numSpecies;
 		if (allSpecies[speciesIdx].movementAttributes.z == RANDOM) {
-			p.pos.x = ofRandom(0, ofGetWidth());
-			p.pos.y = ofRandom(0, ofGetHeight());
+			p.pos.x = ofRandom(0, mapWidth);
+			p.pos.y = ofRandom(0, mapHeight);
 		} else if (allSpecies[speciesIdx].movementAttributes.z == CIRCLE) {
-			p.pos.x = ofGetWidth() / 2;
-			p.pos.y = ofGetHeight() / 2;
+			p.pos.x = mapWidth / 2;
+			p.pos.y = mapHeight / 2;
 		} else if (allSpecies[speciesIdx].movementAttributes.z == RING) {
 			float angle = ofRandom(0, 2*PI);
-			float radius = 0.4 * ofGetWidth();
-			p.pos.x = (ofGetWidth() / 2) + (radius * ofRandom(0.999, 1.001) * cos(angle));
-			p.pos.y = (ofGetHeight() / 2) + (radius * ofRandom(0.999, 1.001) * sin(angle));
+			float radius = 0.4 * mapWidth;
+			p.pos.x = (mapWidth / 2) + (radius * ofRandom(0.999, 1.001) * cos(angle));
+			p.pos.y = (mapHeight / 2) + (radius * ofRandom(0.999, 1.001) * sin(angle));
 		} else if (allSpecies[speciesIdx].movementAttributes.z == SMALL_RING) {
 			float angle = ofRandom(0, 2*PI);
-			float radius = 0.15 * ofGetWidth();
-			p.pos.x = (ofGetWidth() / 2) + (radius * ofRandom(0.999, 1.001) * cos(angle));
-			p.pos.y = (ofGetHeight() / 2) + (radius * ofRandom(0.999, 1.001) * sin(angle));
+			float radius = 0.15 * mapWidth;
+			p.pos.x = (mapWidth / 2) + (radius * ofRandom(0.999, 1.001) * cos(angle));
+			p.pos.y = (mapHeight / 2) + (radius * ofRandom(0.999, 1.001) * sin(angle));
 		} else if (allSpecies[speciesIdx].movementAttributes.z == VERTICAL_LINE) {
-			p.pos.x = (ofGetWidth() / 2) * ofRandom(0.99, 1.01);
-			p.pos.y = ofRandom(0, ofGetHeight());
+			p.pos.x = (mapWidth / 2) * ofRandom(0.99, 1.01);
+			p.pos.y = ofRandom(0, mapHeight);
 		} else if (allSpecies[speciesIdx].movementAttributes.z == HORIZONTAL_LINE) {
-			p.pos.x = ofRandom(0, ofGetWidth());
-			p.pos.y = (ofGetHeight() / 2) * ofRandom(0.99, 1.01);
+			p.pos.x = ofRandom(0, mapWidth);
+			p.pos.y = (mapHeight / 2) * ofRandom(0.99, 1.01);
 		}
 		p.vel.x = ofRandom(-1, 1);
 		p.vel.y = ofRandom(-1, 1);
@@ -915,27 +978,4 @@ void ofApp::reSpawnAgents() {
 		p.attributes.x = speciesIdx;
 	}
 	particlesBuffer.updateData(particles);
-}
-
-void ofApp::reSpawnReaction(bool keepPattern) {
-	ofPixels initialReaction;
-	initialReaction.allocate(ofGetWidth(), ofGetHeight(), OF_PIXELS_RGBA);
-
-	if (keepPattern) {
-		reactionMap.readToPixels(initialReaction);
-	} else {
-		ofColor baseReactionColour(255., 0., 0., 0.);
-		initialReaction.setColor(baseReactionColour);
-	}
-	
-	ofColor reactantColour(255., 255., 0., 0.);
-	for (int j = 0; j < ofGetHeight(); j++) {
-		for (int i = 0; i < ofGetWidth(); i++) {
-			if (ofRandom(1) < 0.1) {
-				initialReaction.setColor(i, j, reactantColour);
-			}
-		}
-	}
-
-	reactionMap.loadData(initialReaction);
 }

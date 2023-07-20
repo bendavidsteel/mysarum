@@ -2,4 +2,6 @@ ofxPoco
 ofxVideoRecorder
 ofxOpenCv
 ofxAudioAnalyzer
+ofxBPMDetector
 ofxMidi
+ofxNetwork

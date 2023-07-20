@@ -5,6 +5,7 @@
 #include "ofxVideoRecorder.h"
 #include "ofxOpenCv.h"
 #include "ofxAudioAnalyzer.h"
+#include "ofxBPMDetector.h"
 #include "ofxMidi.h"
 #include "ofxNetwork.h"
 
@@ -45,6 +46,8 @@ class ofApp : public ofBaseApp, public ofxMidiListener{
 		ofxVideoRecorder vidRecorder;
 		ofSoundStream soundStream;
 		ofxMidiIn midiIn;
+
+		ofImage artificerImage;
 
 		ofxUDPManager udpConnection;
 
@@ -89,6 +92,10 @@ class ofApp : public ofBaseApp, public ofxMidiListener{
 		ofBufferObject allSpeciesBuffer;
 		ofTexture trailMap;
 
+		int mapWidth;
+		int mapHeight;
+		int mapFactor;
+
 		float diffuseRate;
 		float newDiffuseRate;
 		float decayRate;
@@ -132,6 +139,7 @@ class ofApp : public ofBaseApp, public ofxMidiListener{
 		};
 
 		ofxAudioAnalyzer audioAnalyzer;
+		ofxBPMDetector bpmDetector;
 
 		int audioArraySize;
 		vector<Component> audioArray;
@@ -181,5 +189,6 @@ class ofApp : public ofBaseApp, public ofxMidiListener{
 		int display;
 
 		bool bReSpawnAgents;
-		bool bReSpawnReaction;
+		int bReSpawnReaction;
+		bool bReloadShader;
 };

@@ -25,8 +25,39 @@ uniform ivec2 resolution;
 uniform vec3 light;
 uniform float chem_height;
 uniform float trail_height;
+uniform float time;
+uniform float bps;
 
 out vec4 out_color;
+
+mat3 get_colour_rotation(int theta)
+{
+    theta = theta % 6;
+    if (theta == 0)
+    {
+        return mat3(1., 0., 0., 0., 1., 0., 0., 0., 1.);
+    }
+    else if (theta == 1)
+    {
+        return mat3(0.5, 0.5, 0., 0., 0.5, 0.5, 0.5, 0., 0.5);
+    }
+    else if (theta == 2)
+    {
+        return mat3(0., 1., 0., 0., 0., 1., 1., 0., 0.);
+    }
+    else if (theta == 3)
+    {
+        return mat3(0., 0.5, 0.5, 0.5, 0., 0.5, 0.5, 0.5, 0.);
+    }
+    else if (theta == 4)
+    {
+        return mat3(0., 0., 1., 1., 0., 0., 0., 1., 0.);
+    }
+    else if (theta == 5)
+    {
+        return mat3(0.5, 0., 0.5, 0.5, 0.5, 0., 0., 0.5, 0.5);
+    }
+}
 
 void main()
 {
@@ -45,6 +76,7 @@ void main()
 	float dist_to_light = distance(pos.xy, light.xy);
 
 	vec3 lighting = vec3(1.);
+
 	float falloff = resolution.x / 3;
 	vec3 light_falloff = vec3(exp(-dist_to_light / (100 * falloff)));
 
@@ -104,7 +136,7 @@ void main()
 		colour = mix(colour, allSpecies[3].colour.rgb * light_falloff, trail.a);
 	}
 
-	colour *= 1. + 0.5 * audio.x * vec3(0., 0., 1.);
-	colour *= 1. - 0.5 * audio.y * vec3(1., 0., 0.);
+	mat3 colour_rotation = get_colour_rotation(int(6 * sin(time * bps)));//int(audio.x * 6.));
+	colour = mix(colour, colour * colour_rotation, 1.0 * audio.x);
 	out_color = vec4(colour, 1.);
 }

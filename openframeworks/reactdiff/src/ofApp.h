@@ -30,15 +30,7 @@ class ofApp : public ofBaseApp{
 		void gotMessage(ofMessage msg);
 		void audioIn(float * input, int bufferSize, int nChannels);
 
-		ofxVideoRecorder vidRecorder;
-		ofSoundStream soundStream;
-		bool bRecording;
-		int sampleRate;
-		int channels;
-		string fileName;
-		string fileExt;
-
-		void recordingComplete(ofxVideoRecorderOutputFileCompleteEventArgs& args);
+		ofPlanePrimitive plane;
 
 		ofShader compute_flow;
 		ofShader compute_diffusion;

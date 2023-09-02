@@ -22,10 +22,10 @@ layout(std140, binding=2) buffer species{
 
 layout(rgba8,binding=3) uniform restrict image2D trailMap;
 layout(rg16,binding=4) uniform restrict image2D optFlowMap; // TODO switch to readonly
-layout(rg16,binding=0) uniform restrict image2D reactionMap;
 layout(rg16,binding=7) uniform restrict image2D audioMap;
 
 uniform sampler2DRect flowMap;
+uniform sampler2DRect reactionMap;
 
 uniform ivec2 resolution;
 uniform float time;
@@ -113,7 +113,7 @@ float sense(vec2 pos, float angle, vec4 speciesMask, float sensorOffsetDist, flo
 			sum -= 10 * opticalFlowMag;
 
 			// repel from reaction peaks
-			float chem_y = imageLoad(reactionMap, sampleCoord).y;
+			float chem_y = texture(reactionMap, sampleCoord).y;
 			sum -= 20 * chem_y;
 		}
 	}
@@ -202,7 +202,7 @@ void main(){
 
 	float audioMag = imageLoad(audioMap, oldCoord).x;
 
-	vec2 force = 2 * opticalFlowMag + ((0.5 * audioMag + agentFlowMag) * simplexFlowForce);
+	vec2 force = ((2 * opticalFlowMag) + (0.5 * audioMag) + agentFlowMag) * simplexFlowForce;
 
 	// Update position
 	vec2 newVel = normalize(vel + (force * deltaTime));
@@ -214,8 +214,7 @@ void main(){
 	agents[gl_GlobalInvocationID.x].vel.xy = newVel;
 	agents[gl_GlobalInvocationID.x].pos.xy = newPos;
 
+	// TODO do this with a VBO
 	ivec2 newCoord = ivec2(newPos.xy);
-	vec4 oldTrail = imageLoad(trailMap, newCoord);
-	vec4 newTrail = max(min((oldTrail + (speciesMask * trailWeight * deltaTime)), 1.), 0.);
-	imageStore(trailMap, newCoord, newTrail);
+	
 }

@@ -76,73 +76,32 @@ vec4 toMask(int idx) {
 	return ret;
 }
 
-void getOrthoVecs(vec3 vec, out vec3 vecA, out vec3 vecB) {
-	vecA = vec3(0.);
-	vecB = vec3(0.);
-	if (vec.x != 0) {
-		vecA.y = vec.x;
-		vecA.x = -1 * vec.y;
-		vecB.z = vec.x;
-		vecB.x = -1 * vec.z;
-	} else if (vec.y != 0) {
-		vecA.z = vec.y;
-		vecA.y = -1 * vec.z;
-		vecB.x = vec.y;
-		vecB.y = -1 * vec.x;
-	} else {
-		vecA.x = vec.z;
-		vecA.z = -1 * vec.x;
-		vecB.y = vec.z;
-		vecB.z = -1 * vec.y;
-	}
-	vecA = normalize(vecA);
-	vecB = normalize(vecB);
+
+vec3 vecFromThetaPhi(float theta, float phi) {
+	return vec3(cos(phi) * cos(theta), cos(phi) * sin(theta), sin(phi));
 }
 
-void getSenseVecs(vec3 pos, vec3 vel, float sensorDist, float sensorOffset, float sensorOffDist, out vec3 vecAhead, out vec3 vecA, out vec3 vecB, out vec3 vecC, out vec3 vecD) {
-	vec3 velNorm = normalize(vel);
-	vecAhead = velNorm * sensorDist;
-	
-	vec3 vecX;
-	vec3 vecY;
-	getOrthoVecs(vel, vecX, vecY);
+float sense(vec3 pos, float theta, float phi, vec4 speciesMask, float sensorOffsetDist, float sensorThetaOffset, float sensorPhiOffset) {
+	float sensorTheta = theta + sensorThetaOffset;
+	float sensorPhi = phi + sensorPhiOffset;
+	vec3 sensorDir = vecFromThetaPhi(sensorTheta, sensorPhi);
 
-	vecA = (velNorm * sensorOffDist) + (vecX * sensorOffset);
-	vecB = (velNorm * sensorOffDist) + (vecX * -1 * sensorOffset);
-	vecC = (velNorm * sensorOffDist) + (vecY * sensorOffset);
-	vecD = (velNorm * sensorOffDist) + (vecY * -1 * sensorOffset);
-}
+	vec3 sensorPos = pos + (sensorDir * sensorOffsetDist);
+	int sensorCentreX = int(sensorPos.x);
+	int sensorCentreY = int(sensorPos.y);
+	int sensorCentreZ = int(sensorPos.z);
 
-void sense(vec3 pos, vec4 speciesMask, vec3 vecAhead, vec3 vecA, vec3 vecB, vec3 vecC, vec3 vecD, out float weightAhead, out float weightA, out float weightB, out float weightC, out float weightD) {
-	
-	vec3 senseAhead = pos + vecAhead;
-	vec3 senseA = pos + vecA;
-	vec3 senseB = pos + vecB;
-	vec3 senseC = pos + vecC;
-	vec3 senseD = pos + vecD;
+	float sum = 0;
+	const int sensorSize = 0;
 
 	// TODO can we optimize in glsl?
 	vec4 senseWeight = (speciesMask * 2.0) - 1.0;
 
-	ivec3 coordAhead = min(resolution, max(ivec3(senseAhead.xyz), 0));
-	vec4 trailAhead = imageLoad(trailMap, coordAhead);
-	weightAhead = dot(senseWeight, trailAhead);
+	ivec3 sampleCoord = min(resolution, max(ivec3(sensorCentreX, sensorCentreY, sensorCentreZ), 0));
+	vec4 trailWeight = imageLoad(trailMap, sampleCoord);
+	sum += dot(senseWeight, trailWeight);
 
-	ivec3 coordA = min(resolution, max(ivec3(senseA.xyz), 0));
-	vec4 trailA = imageLoad(trailMap, coordA);
-	weightA = dot(senseWeight, trailA);
-
-	ivec3 coordB = min(resolution, max(ivec3(senseB.xyz), 0));
-	vec4 trailB = imageLoad(trailMap, coordB);
-	weightB = dot(senseWeight, trailB);
-
-	ivec3 coordC = min(resolution, max(ivec3(senseC.xyz), 0));
-	vec4 trailC = imageLoad(trailMap, coordC);
-	weightC = dot(senseWeight, trailC);
-
-	ivec3 coordD = min(resolution, max(ivec3(senseD.xyz), 0));
-	vec4 trailD = imageLoad(trailMap, coordD);
-	weightD = dot(senseWeight, trailD);
+	return sum;
 }
 
 void doRebound(inout vec3 pos)
@@ -194,51 +153,53 @@ void main(){
 	vec4 speciesMask = toMask(speciesIdx);
 
 	// Steer based on sensory data
-	float sensorDist = allSpecies[speciesIdx].sensorAttributes.x;
-	float sensorOffset = allSpecies[speciesIdx].sensorAttributes.y;
-	float sensorOffDist = allSpecies[speciesIdx].sensorAttributes.z;
+	float sensorAngleRad = allSpecies[speciesIdx].sensorAttributes.x;
+	float sensorOffsetDist = allSpecies[speciesIdx].sensorAttributes.y;
 	float moveSpeed = allSpecies[speciesIdx].movementAttributes.x;
-	float turnStrength = allSpecies[speciesIdx].movementAttributes.y;
-
-	vec3 vecAhead, vecA, vecB, vecC, vecD;
-	getSenseVecs(pos, vel, sensorDist, sensorOffset, sensorOffDist, vecAhead, vecA, vecB, vecC, vecD);
-	float weightAhead, weightA, weightB, weightC, weightD;
-	sense(pos, speciesMask, vecAhead, vecA, vecB, vecC, vecD, weightAhead, weightA, weightB, weightC, weightD);
-	
-	float randomThetaStrength = random(vec4(pos, time));
-	float randomPhiStrength = random(vec4(pos, time));
-	// vec3 agentUid = pos * time * gl_GlobalInvocationID.x;
-	// float randomX = (random(vec4(agentUid, vel.x)) * 2) - 1;
-	// float randomY = (random(vec4(agentUid, vel.y)) * 2) - 1;
-	// float randomZ = (random(vec4(agentUid, vel.z)) * 2) - 1;
-	// vec3 randomForce = normalize(vec3(randomX, randomY, randomZ));
+	float turnSpeed = allSpecies[speciesIdx].movementAttributes.y;
 
 	float theta = atan(vel.y, vel.x);
 	float phi = atan(vel.z, sqrt(vel.x * vel.x + vel.y * vel.y));
 
-	if (weightAhead < weightA && weightAhead < weightB && weightAhead < weightC && weightAhead < weightD) {
-		angle += (randomThetaStrength - 0.5) * 2 * turnSpeed * deltaTime;
+	float weightAhead = sense(pos, theta, phi, speciesMask, sensorOffsetDist, 0, 0);
+	float weightLeft = sense(pos, theta, phi, speciesMask, sensorOffsetDist, sensorAngleRad, 0);
+	float weightRight = sense(pos, theta, phi, speciesMask, sensorOffsetDist, -sensorAngleRad, 0);
+	float weightUp = sense(pos, theta, phi, speciesMask, sensorOffsetDist, 0, sensorAngleRad);
+	float weightDown = sense(pos, theta, phi, speciesMask, sensorOffsetDist, 0, -sensorAngleRad);
+	
+	float randomThetaStrength = random(vec4(pos, time));
+	float randomPhiStrength = random(vec4(pos, time));
+
+	if (weightAhead < weightLeft && weightAhead < weightRight && weightAhead < weightUp && weightAhead < weightDown) {
+		theta += (randomThetaStrength - 0.5) * 2 * turnSpeed * deltaTime;
 		phi += (randomPhiStrength - 0.5) * 2 * turnSpeed * deltaTime;
-	} else if (weightA > weightAhead && weightA > weightB && weightA > weightC && weightA > weightD) {
-		
-	} else if (weightB > weightAhead && weightB > weightA && weightB > weightC && weightB > weightD) {
-		force += normalize(vecB);
-	} else if (weightC > weightAhead && weightC > weightA && weightC > weightB && weightC > weightD) {
-		force += normalize(vecC);
-	} else if (weightD > weightAhead && weightD > weightA && weightD > weightB && weightD > weightC) {
-		force += normalize(vecD);
-	} else if (weightAhead > weightA && weightAhead > weightB && weightAhead > weightC && weightAhead > weightD) {
-		force += vec3(0.);
+	} else if (weightLeft > weightAhead && weightLeft > weightRight && weightLeft > weightUp && weightLeft > weightDown) {
+		theta += randomThetaStrength * turnSpeed * deltaTime;
+		phi += (randomPhiStrength - 0.5) * 0.5 * turnSpeed * deltaTime;
+	} else if (weightRight > weightAhead && weightRight > weightLeft && weightRight > weightUp && weightRight > weightDown) {
+		theta -= randomThetaStrength * turnSpeed * deltaTime;
+		phi += (randomPhiStrength - 0.5) * 0.5 * turnSpeed * deltaTime;
+	} else if (weightUp > weightAhead && weightUp > weightLeft && weightUp > weightRight && weightUp > weightDown) {
+		phi += randomPhiStrength * turnSpeed * deltaTime;
+		theta += (randomThetaStrength - 0.5) * 0.5 * turnSpeed * deltaTime;
+	} else if (weightDown  > weightAhead && weightDown > weightLeft && weightDown > weightRight && weightDown > weightUp) {
+		phi -= randomPhiStrength * turnSpeed * deltaTime;
+		theta += (randomThetaStrength - 0.5) * 0.5 * turnSpeed * deltaTime;
+	} else if (weightAhead > weightLeft && weightAhead > weightRight && weightAhead > weightUp && weightAhead > weightDown) {
+		theta += (randomThetaStrength - 0.5) * 0.5 * turnSpeed * deltaTime;
+		phi += (randomPhiStrength - 0.5) * 0.5 * turnSpeed * deltaTime;
 	}
+
+	vel = vecFromThetaPhi(theta, phi);
 
 	// pushing agents around based on flow
 	ivec3 oldCoord = ivec3(pos.xyz);
 	vec3 flowForce = imageLoad(flowMap, oldCoord).xyz;
 	flowForce = (2 * flowForce) - 1; // convert to -1-1 range
-	force += 2 * flowForce;
+	vec3 force = 0.1 * flowForce;
 
 	// Update position
-	vec3 newVel = normalize(vel + (force * randomForceStrength * turnStrength * deltaTime));
+	vec3 newVel = normalize(vel + (force * deltaTime));
 	vec3 newPos = pos + (newVel * deltaTime * moveSpeed);
 
 	// Clamp position to map boundaries, and pick new random move dir if hit boundary

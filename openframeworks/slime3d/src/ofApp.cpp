@@ -4,12 +4,12 @@
 //--------------------------------------------------------------
 void ofApp::setup(){
 
-	volWidth = 1536;
-	volHeight = 1024;
-	volDepth = 1;
+	volWidth = 512;
+	volHeight = 512;
+	volDepth = 32;
 
-	diffuseRate = 0.2;
-	decayRate = 0.98;
+	diffuseRate = 0.3;
+	decayRate = 0.96;
 	trailWeight = 1;
 
 	sampleRate = 44100;
@@ -20,25 +20,21 @@ void ofApp::setup(){
 
 	int numSpecies = 2;
 	allSpecies.resize(numSpecies);
-	float angle = 30 * PI / 180;
 	allSpecies[0].movementAttributes.x = 1.1; // moveSpeed
 	allSpecies[0].movementAttributes.y = 1.0; // turnStrength
 	allSpecies[0].movementAttributes.z = CENTRE; //spawn
-	allSpecies[0].sensorAttributes.x = 30; // sensorDist
-	allSpecies[0].sensorAttributes.y = allSpecies[0].sensorAttributes.x * sin(angle); // sensorOffset
-	allSpecies[0].sensorAttributes.z = allSpecies[0].sensorAttributes.y / tan(angle); // sensorOffDist
+	allSpecies[0].sensorAttributes.x = 30 * PI / 180; // sensorAngleRad
+	allSpecies[0].sensorAttributes.y = 30; // sensorOffsetDist
 	allSpecies[0].colour = glm::vec4(0.796, 0.2, 1., 1.);
 
-	angle = 60 * PI / 180;
 	allSpecies[1].movementAttributes.x = 0.9;
 	allSpecies[1].movementAttributes.y = 0.6;
 	allSpecies[1].movementAttributes.z = RING;
-	allSpecies[1].sensorAttributes.x = 40;
-	allSpecies[1].sensorAttributes.y = allSpecies[1].sensorAttributes.x * sin(angle);
-	allSpecies[1].sensorAttributes.z = allSpecies[1].sensorAttributes.y / tan(angle);
+	allSpecies[1].sensorAttributes.x = 60 * PI / 180;
+	allSpecies[1].sensorAttributes.y = 40;
 	allSpecies[1].colour = glm::vec4(0.1, 0.969, 1., 1.);
 
-	int numParticles = 1024 * 256;
+	int numParticles = 1024 * 32;
 	particles.resize(numParticles);
 
 	int speciesIdx = 0;
@@ -134,13 +130,17 @@ void ofApp::update(){
 	double deltaTime = 1.; //ofGetLastFrameTime();
 	float time = ofGetElapsedTimef();
 
+	int localSizeX = 4;
+	int localSizeY = 4;
+	int localSizeZ = 4;
+
 	// horizontal blur
 	compute_diffuse.begin();
 	compute_diffuse.setUniform3i("resolution", volWidth, volHeight, volDepth);
 	compute_diffuse.setUniform1f("deltaTime", deltaTime);
 	compute_diffuse.setUniform1f("diffuseRate", diffuseRate);
 	compute_diffuse.setUniform3i("blurDir", 1, 0, 0);
-	compute_diffuse.dispatchCompute(volWidth/32, volHeight/32, volDepth/1);
+	compute_diffuse.dispatchCompute(volWidth/localSizeX, volHeight/localSizeY, volDepth/localSizeZ);
 	compute_diffuse.end();
 
 	// vertical blur
@@ -149,7 +149,7 @@ void ofApp::update(){
 	compute_diffuse.setUniform1f("deltaTime", deltaTime);
 	compute_diffuse.setUniform1f("diffuseRate", diffuseRate);
 	compute_diffuse.setUniform3i("blurDir", 0, 1, 0);
-	compute_diffuse.dispatchCompute(volWidth/32, volHeight/32, volDepth/1);
+	compute_diffuse.dispatchCompute(volWidth/localSizeX, volHeight/localSizeY, volDepth/localSizeZ);
 	compute_diffuse.end();
 
 	// depth blur
@@ -158,20 +158,20 @@ void ofApp::update(){
 	compute_diffuse.setUniform1f("deltaTime", deltaTime);
 	compute_diffuse.setUniform1f("diffuseRate", diffuseRate);
 	compute_diffuse.setUniform3i("blurDir", 0, 0, 1);
-	compute_diffuse.dispatchCompute(volWidth/32, volHeight/32, volDepth/1);
+	compute_diffuse.dispatchCompute(volWidth/localSizeX, volHeight/localSizeY, volDepth/localSizeZ);
 	compute_diffuse.end();
 
 	compute_decay.begin();
 	compute_decay.setUniform3i("resolution", volWidth, volHeight, volDepth);
 	compute_decay.setUniform1f("deltaTime", deltaTime);
 	compute_decay.setUniform1f("decayRate", decayRate);
-	compute_decay.dispatchCompute(volWidth/32, volHeight/32, volDepth/1);
+	compute_decay.dispatchCompute(volWidth/localSizeX, volHeight/localSizeY, volDepth/localSizeZ);
 	compute_decay.end();
 
 	compute_flow.begin();
 	compute_flow.setUniform1f("time", time);
 	compute_flow.setUniform2i("resolution", volWidth, volHeight);
-	compute_flow.dispatchCompute(volWidth/32, volHeight/32, volDepth/1);
+	compute_flow.dispatchCompute(volWidth/localSizeX, volHeight/localSizeY, volDepth/localSizeZ);
 	compute_flow.end();
 
 	compute_agents.begin();
@@ -191,17 +191,17 @@ void ofApp::update(){
 
 //--------------------------------------------------------------
 void ofApp::draw() {
-	// volume.drawVolume(0,0,0, ofGetHeight(), 0);
+	volume.drawVolume(0,0,0, ofGetHeight(), 0);
 
-	fbo.begin();
-	renderer.begin();
-	renderer.setUniform2i("screen_res", ofGetWidth(), ofGetHeight());
-	renderer.setUniform3i("trail_res", volWidth, volHeight, volDepth);
-	ofSetColor(255);
-	ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
-	renderer.end();
-	fbo.end();
-	fbo.draw(0, 0);
+	// fbo.begin();
+	// renderer.begin();
+	// renderer.setUniform2i("screen_res", ofGetWidth(), ofGetHeight());
+	// renderer.setUniform3i("trail_res", volWidth, volHeight, volDepth);
+	// ofSetColor(255);
+	// ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
+	// renderer.end();
+	// fbo.end();
+	// fbo.draw(0, 0);
 
 	if(bRecording){
 		// const ofFbo fbo = volume.getFbo();

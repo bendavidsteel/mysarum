@@ -1,0 +1,4 @@
+ofxDlib
+ofxGraph
+ofxXmlSettings
+ofxGui

@@ -3,6 +3,7 @@
 #include "ofMain.h"
 #include "ofBufferObject.h"
 #include "ofxAudioAnalyzer.h"
+#include "ofxNetwork.h"
 
 enum InitialPattern{
 	CIRCLE,
@@ -30,7 +31,7 @@ class ofApp : public ofBaseApp{
 		void gotMessage(ofMessage msg);
 		void audioIn(ofSoundBuffer & input);
 
-		struct MelBand{
+		struct Component{
 			glm::vec4 value;
 		};
 
@@ -41,7 +42,7 @@ class ofApp : public ofBaseApp{
 		ofSoundStream soundStream;
 		ofxAudioAnalyzer audioAnalyzer;
 
-		ofBufferObject melBandsBuffer;
+		ofBufferObject audioBuffer;
 
 		ofShader compute_audio;
 		ofShader compute_flow;
@@ -52,4 +53,9 @@ class ofApp : public ofBaseApp{
 		float lowSmoothing;
 		float highSmoothing;
 		float numPoints;
+
+		int audioBufferSize;
+		vector<Component> rmsBuffer;
+
+		ofxUDPManager udpConnection;
 };

@@ -15,7 +15,7 @@ layout(std140, binding=1) buffer spectrum{
 
 uniform ivec2 resolution;
 uniform float deltaTime;
-uniform int numBands;
+uniform int bufferSize;
 uniform float angle;
 uniform float rms;
 uniform float dissonance;
@@ -37,16 +37,16 @@ float sum(vec2 v) {
 float getSpectrum(float cassini) {
     float scale = sqrt(cassini) / rms;
     // float scale = length(from_centre) * 2;
-    float index = scale * numBands;
-    if (ceil(index) >= numBands) {
-        index = numBands - 1 - (index - numBands);
+    float index = scale * bufferSize;
+    if (ceil(index) >= bufferSize) {
+        return 0;
     }
 
     float lowerSpectrumVal = allSpectrum[max(int(floor(index)), 0)].value.x;
-    float upperSpectrumVal = allSpectrum[min(int(ceil(index)), numBands-1)].value.x;
+    float upperSpectrumVal = allSpectrum[min(int(ceil(index)), bufferSize-1)].value.x;
     float spectrumVal = mix(lowerSpectrumVal, upperSpectrumVal, pow(fract(index), 2.));
-    float spectrumMapped = exp((spectrumVal - 1) / 4);
-    return spectrumMapped;
+    // spectrumVal = exp((spectrumVal - 1) / 4);
+    return spectrumVal;
 }
 
 layout(local_size_x = 20, local_size_y = 20, local_size_z = 1) in;
@@ -78,6 +78,7 @@ void main(){
     vals.zw = vec2(0., 1.);
 
     vals.x = getSpectrum(cassini);
+    vals.x = rms;
 
 	imageStore(audioMap, coord, vals);
 }

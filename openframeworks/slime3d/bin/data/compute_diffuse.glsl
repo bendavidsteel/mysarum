@@ -7,7 +7,7 @@ uniform float deltaTime;
 uniform float diffuseRate;
 uniform ivec3 blurDir;
 
-layout(local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 void main(){
 
     ivec3 coord = ivec3(gl_GlobalInvocationID.xyz);

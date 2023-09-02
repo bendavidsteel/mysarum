@@ -16,13 +16,13 @@ layout(std140, binding=6) buffer points{
     Component allPoints[];
 };
 
-layout(rg16,binding=7) uniform restrict image2D audioMap;
-
 uniform ivec2 resolution;
 uniform float deltaTime;
 uniform int numBands;
 uniform float angle;
 uniform float rms;
+
+out vec4 out_color;
 
 float map(float val, float a, float b, float c, float d) {
     float normVal = (val - a) / (b - a);
@@ -52,10 +52,9 @@ float getSpectrum(float cassini, float dist) {
     return spectrumVal;
 }
 
-layout(local_size_x = 20, local_size_y = 20, local_size_z = 1) in;
 void main(){
 
-    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 coord = ivec2(gl_FragCoord.xy);
     vec2 uv = vec2(1.0) * vec2(coord) / vec2(resolution);
     vec2 centre = vec2(0.5, 0.5);
     vec2 from_centre = uv - centre;
@@ -70,5 +69,5 @@ void main(){
     }
     float spec = getSpectrum(cassini, a);
 
-    imageStore(audioMap, coord, vec4(spec, 0., 0., 1.));
+    out_color = vec4(spec, 0., 0., 1.);
 }

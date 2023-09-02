@@ -10,28 +10,46 @@ void ofApp::setup(){
 
 	AgentSpawn strategy = CENTRE;
 
-	int numParticles = 1024 * 124;
-	particles.resize(numParticles);
-	for(auto & p: particles){
-		if (strategy == RANDOM) {
-			p.pos.x = ofRandom(0, ofGetWidth());
-			p.pos.y = ofRandom(0, ofGetHeight());
-		} else if (strategy == CENTRE) {
-			p.pos.x = ofGetWidth() / 2;
-			p.pos.y = ofGetHeight() / 2;
-		}
-		p.angle = ofRandom(0, 2*PI);
-		p.speciesIdx = 0;
-	}
-
-	int numSpecies = 1;
+	int numSpecies = 2;
 	allSpecies.resize(numSpecies);
-	for(auto & species: allSpecies){
-		species.moveSpeed = 1;
-		species.sensorAngleRad = 40 * PI / 180;
-		species.sensorOffsetDist = 15;
-		species.turnSpeed = 0.05 * 2 * PI;
-		species.colour = glm::vec4(1., 1., 1., 1.);
+	allSpecies[0].movementAttributes.x = 1.1 * mapFactor; // moveSpeed
+	allSpecies[0].movementAttributes.y = 0.04 * 2 * PI; // turnSpeed
+	allSpecies[0].movementAttributes.z = CIRCLE; //spawn
+	allSpecies[0].sensorAttributes.x = 30 * PI / 180; // sensorAngleRad
+	allSpecies[0].sensorAttributes.y = 10 * mapFactor; // sensorOffsetDist
+	allSpecies[0].colour = glm::vec4(0.796, 0.2, 1., 1.);
+
+	allSpecies[1].movementAttributes.x = 0.9 * mapFactor; // moveSpeed
+	allSpecies[1].movementAttributes.y = 0.08 * 2 * PI; // turnSpeed
+	allSpecies[1].movementAttributes.z = RING;
+	allSpecies[1].sensorAttributes.x = 40 * PI/ 180; // sensorAngleRad
+	allSpecies[1].sensorAttributes.y = 20 * mapFactor; //sensorOffsetDist
+	allSpecies[1].colour = glm::vec4(0.1, 0.969, 1., 1.);
+
+	int numParticles = 1024 * 64;
+	particles.resize(numParticles);
+
+	int speciesIdx = 0;
+	for(int idx = 0; idx < particles.size(); idx++){
+		auto &p = particles[idx];
+		speciesIdx = idx % numSpecies;
+		if (allSpecies[speciesIdx].movementAttributes.z == RANDOM) {
+			p.pos.x = ofRandom(0, mapWidth);
+			p.pos.y = ofRandom(0, mapHeight);
+		} else if (allSpecies[speciesIdx].movementAttributes.z == CIRCLE) {
+			p.pos.x = mapWidth / 2;
+			p.pos.y = mapHeight / 2;
+		} else if (allSpecies[speciesIdx].movementAttributes.z == RING) {
+			float angle = ofRandom(0, 2*PI);
+			float radius = 0.4 * mapWidth;
+			p.pos.x = (mapWidth / 2) + (radius * ofRandom(0.999, 1.001) * cos(angle));
+			p.pos.y = (mapHeight / 2) + (radius * ofRandom(0.999, 1.001) * sin(angle));
+		}
+		p.vel.x = ofRandom(-1, 1);
+		p.vel.y = ofRandom(-1, 1);
+		p.vel = glm::normalize(p.vel);
+		p.vel = p.vel * allSpecies[speciesIdx].movementAttributes.x;
+		p.attributes.x = speciesIdx;
 	}
 
 	particlesBuffer.allocate(particles, GL_DYNAMIC_DRAW);

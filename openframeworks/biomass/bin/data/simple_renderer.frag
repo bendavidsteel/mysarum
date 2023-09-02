@@ -12,10 +12,10 @@ layout(std140, binding=2) buffer species{
 
 layout(rgba8,binding=3) uniform restrict image2D trailMap;
 layout(rg16,binding=4) uniform restrict image2D optFlowMap;
-layout(rg16,binding=0) uniform restrict image2D reactionMap;
 layout(rg16,binding=7) uniform restrict image2D audioMap;
 
 uniform sampler2DRect flowMap;
+uniform sampler2DRect reactionMap;
 
 uniform vec3 colourA;
 uniform vec3 colourB;
@@ -56,7 +56,7 @@ void main()
 		colour = audioColour;
 
 	} else if (display == 2) {
-		vec2 chems = imageLoad(reactionMap, coord).xy;
+		vec2 chems = texture(reactionMap, coord).xy;
 
 		float this_chem_height = chem_height * (1 + length(audio));
 
@@ -72,7 +72,7 @@ void main()
 				break;
 			}
 
-			float other_peak_height = imageLoad(reactionMap, ivec2(other_peak)).y * this_chem_height;
+			float other_peak_height = texture(reactionMap, ivec2(other_peak)).y * this_chem_height;
 			float light_height = pos_height + (dist * height_to_light / dist_to_light);
 			if (other_peak_height > light_height) {
 				// in shadow

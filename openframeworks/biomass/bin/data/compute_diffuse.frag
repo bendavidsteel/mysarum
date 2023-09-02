@@ -1,16 +1,15 @@
 #version 440
 
-layout(rgba8,binding=3) uniform restrict image2D trailMap;
+uniform sampler2DRect trailMap;
 
 uniform ivec2 resolution;
 uniform float deltaTime;
 uniform float diffuseRate;
 uniform ivec2 blurDir;
 
-layout(local_size_x = 20, local_size_y = 20, local_size_z = 1) in;
 void main(){
 
-    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 coord = ivec2(gl_FragCoord.xy);
 
     // accumulator
     vec4 originalTrail = imageLoad(trailMap, coord);
@@ -34,5 +33,5 @@ void main(){
     float diffuseWeight = clamp(diffuseRate * deltaTime, 0, 1);
     blurredTrail = mix(originalTrail, blurredTrail, diffuseWeight);
     
-	imageStore(trailMap, coord, blurredTrail);
+    out_color = blurredTrail;
 }

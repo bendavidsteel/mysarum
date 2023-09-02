@@ -5,21 +5,28 @@
 void ofApp::setup(){
 	lowSmoothing = 0.6;
 	highSmoothing = 0.8;
-	numPoints = 3.;
+	numPoints = 1.;
 
-	sampleRate = 44100;
-    bufferSize = 512;
+	sampleRate = 48000;
+    bufferSize = 1024;
     channels = 2;
     
     audioAnalyzer.setup(sampleRate, bufferSize, channels);
 
-	int numBands = 24;
-	vector<MelBand> melBands(numBands);
-	for (int i = 0; i < numBands; i++) {
-		melBands[i].value.x = float(i) / numBands;
+	// int numBands = 24;
+	// vector<MelBand> melBands(numBands);
+	// for (int i = 0; i < numBands; i++) {
+	// 	melBands[i].value.x = float(i) / numBands;
+	// }
+
+	audioBufferSize = 32;
+	rmsBuffer.resize(audioBufferSize);
+	for (int i = 0; i < audioBufferSize; i++) {
+		rmsBuffer[i].value.x = 0.;
 	}
-	melBandsBuffer.allocate(melBands, GL_DYNAMIC_DRAW);
-	melBandsBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 1);
+
+	audioBuffer.allocate(rmsBuffer, GL_DYNAMIC_DRAW);
+	audioBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 1);
 
 	audio_texture.allocate(ofGetWidth(), ofGetHeight(), GL_RGBA16);
 	audio_texture.bindAsImage(0, GL_READ_WRITE);
@@ -40,11 +47,13 @@ void ofApp::setup(){
 	// settings.device = devices[4];
 
 	// you can also get devices for an specific api
-	// auto devices = soundStream.getDevicesByApi(ofSoundDevice::Api::PULSE);
-	// settings.device = devices[0];
+	// auto devices = soundStream.getDeviceList(ofSoundDevice::Api::ALSA);
+	// if (!devices.empty()) {
+	// 	settings.setInDevice(devices[0]);
+	// }
 
 	// or get the default device for an specific api:
-	// settings.api = ofSoundDevice::Api::PULSE;
+	// settings.setApi(ofSoundDevice::Api::JACK);
 
 	// or by name
 	auto devices = soundStream.getDeviceList();
@@ -63,6 +72,11 @@ void ofApp::setup(){
 	settings.bufferSize = bufferSize;
 	soundStream.setup(settings);
 
+	ofxUDPSettings udpSettings;
+	udpSettings.receiveOn(11999);
+	udpSettings.blocking = false;
+
+	udpConnection.Setup(udpSettings);
 }
 
 //--------------------------------------------------------------
@@ -81,12 +95,45 @@ void ofApp::update(){
 
 	bool isOnset = audioAnalyzer.getOnsetValue(0);
 
-	int numBands = 24;
-	vector<MelBand> melBandsComponents(numBands);
-	for(int i = 0; i < numBands; i++){
-		melBandsComponents[i].value.x = melBands[i];
+	// char udpMessage[100000];
+	// udpConnection.Receive(udpMessage,100000);
+	// string allMessages = udpMessage;
+	// if (allMessages != "") {
+	// 	float x,y;
+	// 	vector<string> messages = ofSplitString(allMessages,"\n");
+	// 	// remove empty messages
+	// 	for (int i = 0; i < messages.size(); i++) {
+	// 		if (messages[i] == "") {
+	// 			messages.erase(messages.begin() + i);
+	// 		}
+	// 	}
+	// 	if (messages.size() > 0) {
+	// 		for (int i = audioBufferSize - 1; i >= messages.size(); i--) {
+	// 			rmsBuffer[i].value.x = rmsBuffer[i - 1].value.x;
+	// 		}
+	// 	}
+	// 	for(int i=0;i<messages.size();i++){
+	// 		vector<string> message = ofSplitString(messages[i],",");
+	// 		float bpm = atof(message[0].c_str());
+	// 		float heartbeat = atof(message[1].c_str());
+	// 		rmsBuffer[messages.size() - i - 1].value.x = heartbeat;
+	// 	}
+	// }	
+
+	// int numBands = 24;
+	// vector<MelBand> melBandsComponents(numBands);
+	// for(int i = 0; i < numBands; i++){
+	// 	melBandsComponents[i].value.x = melBands[i];
+	// }
+	rms /= 4;
+	rmsBuffer[0].value.x = rms;
+	for (int i = audioBufferSize - 1; i > 0; i--) {
+		rmsBuffer[i].value.x = rmsBuffer[i - 1].value.x;
 	}
-	melBandsBuffer.updateData(melBandsComponents);
+
+	// rms = 1;
+
+	audioBuffer.updateData(rmsBuffer);
 
 	int workGroupSize = 20;
 
@@ -110,7 +157,7 @@ void ofApp::update(){
 	compute_audio.begin();
 	compute_audio.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
 	compute_audio.setUniform1f("deltaTime", deltaTime);
-	compute_audio.setUniform1i("numBands", numBands);
+	compute_audio.setUniform1i("bufferSize", audioBufferSize);
 	compute_audio.setUniform1f("angle", time_of_day);
 	compute_audio.setUniform1f("rms", rms);
 	compute_audio.setUniform1f("dissonance", dissonance);

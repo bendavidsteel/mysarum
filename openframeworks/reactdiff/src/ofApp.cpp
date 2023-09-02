@@ -9,9 +9,6 @@ void ofApp::setup(){
 
 	float_strength = 1;
 
-	fileName = "testMovie";
-    fileExt = ".mov"; // ffmpeg uses the extension to determine the container type. run 'ffmpeg -formats' to see supported formats
-
 	ofPixels initialReaction;
 	initialReaction.allocate(ofGetWidth(), ofGetHeight(), OF_PIXELS_RGBA);
 	ofColor baseReactionColour(255., 0., 0., 0.);
@@ -70,15 +67,16 @@ void ofApp::setup(){
 	compute_reaction.setupShaderFromFile(GL_COMPUTE_SHADER,"compute_reaction.glsl");
 	compute_reaction.linkProgram();
 
+	float planeScale = 0.75;
+	int planeWidth = ofGetWidth() * planeScale;
+	int planeHeight = ofGetHeight() * planeScale;
+	int planeGridSize = 20;
+	int planeColums = planeWidth / planeGridSize;
+	int planeRows = planeHeight / planeGridSize;
+
+	plane.set(planeWidth, planeHeight, planeColums, planeRows, OF_PRIMITIVE_TRIANGLES);
+
 	renderer.load("renderer.vert", "renderer.frag");
-
-	// video recording
-	ofAddListener(vidRecorder.outputFileCompleteEvent, this, &ofApp::recordingComplete);
-
-	bRecording = false;
-
-	// sound
-	ofSoundStreamSetup(0, 2, 44100, 256, 4);
 }
 
 //--------------------------------------------------------------
@@ -117,30 +115,25 @@ void ofApp::update(){
 
 //--------------------------------------------------------------
 void ofApp::draw() {
-	// flowMap.draw(0, 0, ofGetWidth(), ofGetHeight());
-
 	fbo.begin();
-	ofClear(255,255,255, 0);
+	// ofClear(255,255,255, 0);
 	renderer.begin();
 	renderer.setUniform3f("colourA", 1., 0., 0.);
 	renderer.setUniform3f("colourB", 0., 1., 0.);
 	renderer.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
-	renderer.setUniform3f("light", ofGetWidth(), 0., 0.1);
+	renderer.setUniform3f("light", ofGetWidth(), 0., 10.);
 	renderer.setUniform1f("height", 1000.);
-	ofSetColor(255);
-	ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
+
+	// translate plane into center screen.
+	float tx = ofGetWidth() / 2;
+	float ty = ofGetHeight() / 2;
+	ofTranslate(tx, ty);
+
+	plane.drawWireframe();
+
 	renderer.end();
 	fbo.end();
 	fbo.draw(0, 0, ofGetWidth(), ofGetHeight());
-
-	if(bRecording){
-		// const ofFbo fbo = volume.getFbo();
-		fbo.readToPixels(pixels);
-		bool recordSuccess = vidRecorder.addFrame(pixels);
-		if (!recordSuccess) {
-			ofLogWarning("This frame was not added!");
-		}
-	}
 
     // Check if the video recorder encountered any error while writing video frame or audio smaples.
     if (vidRecorder.hasVideoError()) {

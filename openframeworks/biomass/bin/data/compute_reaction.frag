@@ -1,10 +1,10 @@
 #version 440
 
-layout(rg16,binding=0) uniform restrict image2D reactionMap;
 layout(rg16,binding=4) uniform restrict image2D optFlowMap; // TODO switch to readonly
 layout(rg16,binding=7) uniform restrict image2D audioMap;
 
 uniform sampler2DRect flowMap;
+uniform sampler2DRect lastReactionMap;
 
 uniform ivec2 resolution;
 uniform float deltaTime;
@@ -14,6 +14,8 @@ uniform float feedMin;
 uniform float feedRange;
 uniform int mapFactor;
 uniform int initialise;
+
+out vec4 out_color;
 
 // A single iteration of Bob Jenkins' One-At-A-Time hashing algorithm.
 uint hash( uint x ) {
@@ -76,27 +78,21 @@ vec2 get_feedkill(vec2 coord) {
     return vec2(feed, kill);
 }
 
-layout(local_size_x = 20, local_size_y = 20, local_size_z = 1) in;
 void main(){
-
-    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 coord = ivec2(gl_FragCoord.xy);
 
     // previous values
     float a, b;
-    int init = 0;
     if (initialise == 1) {
         a = 1.;
         vec2 uv = vec2(coord) / vec2(resolution);
-        vec2 centre = vec2(0.5, 0.5);
-        vec2 from_centre = uv - centre;
-        float dist = length(from_centre);
         if (random(uv) < 0.1) {
             b = 1.;
         } else {
             b = 0.;
         }
     } else {
-        vec2 previous = imageLoad(reactionMap, coord).xy;
+        vec2 previous = texture(lastReactionMap, coord).xy;
         a = previous.x;
         b = previous.y;
     }
@@ -111,7 +107,7 @@ void main(){
     optical_flow = (2 * optical_flow) - 1; //convert flow to -1 to 1 range
     float opticalFlowMag = length(optical_flow);
 
-    vec2 flow = (reactionFlowMag + 15 * opticalFlowMag + 5 * audio) * simplex_flow;
+    vec2 flow = 0. * (reactionFlowMag + 15 * opticalFlowMag + 5 * audio) * simplex_flow;
     float flow_left = 0.2 + 0.2 * flow.x;
     float flow_right = 0.2 - 0.2 * flow.x;
     float flow_up = 0.2 + 0.2 * flow.y;
@@ -125,36 +121,39 @@ void main(){
     int kernelSize = 1;
     ivec2 neighbourCoord = coord + kernelSize * ivec2(-1, -1);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
-    vec2 neighbours = imageLoad(reactionMap, neighbourCoord).xy * flow_ld;
+    vec2 neighbours = texture(lastReactionMap, neighbourCoord).xy * flow_ld;
 
     neighbourCoord = coord + kernelSize * ivec2(-1, 0);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
-    neighbours += imageLoad(reactionMap, neighbourCoord).xy * flow_left;
+    neighbours += texture(lastReactionMap, neighbourCoord).xy * flow_left;
 
     neighbourCoord = coord + kernelSize * ivec2(-1, 1);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
-    neighbours += imageLoad(reactionMap, neighbourCoord).xy * flow_lu;
+    neighbours += texture(lastReactionMap, neighbourCoord).xy * flow_lu;
 
     neighbourCoord = coord + kernelSize * ivec2(0, -1);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
-    neighbours += imageLoad(reactionMap, neighbourCoord).xy * flow_down;
+    neighbours += texture(lastReactionMap, neighbourCoord).xy * flow_down;
 
     neighbourCoord = coord + kernelSize * ivec2(0, 1);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
-    neighbours += imageLoad(reactionMap, neighbourCoord).xy * flow_up;
+    neighbours += texture(lastReactionMap, neighbourCoord).xy * flow_up;
 
     neighbourCoord = coord + kernelSize * ivec2(1, -1);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
-    neighbours += imageLoad(reactionMap, neighbourCoord).xy * flow_rd;
+    neighbours += texture(lastReactionMap, neighbourCoord).xy * flow_rd;
 
     neighbourCoord = coord + kernelSize * ivec2(1, 0);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
-    neighbours += imageLoad(reactionMap, neighbourCoord).xy * flow_right;
+    neighbours += texture(lastReactionMap, neighbourCoord).xy * flow_right;
 
     neighbourCoord = coord + kernelSize * ivec2(1, 1);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
-    neighbours += imageLoad(reactionMap, neighbourCoord).xy * flow_ru;
+    neighbours += texture(lastReactionMap, neighbourCoord).xy * flow_ru;
 
+    if (initialise == 1) {
+        neighbours = vec2(a, b);
+    }
     vec2 laplacian = neighbours - vec2(a, b);
 
     float reaction = a * b * b;
@@ -172,7 +171,7 @@ void main(){
     //     feedkill = vec2(0.015, 0.045);
     // }
 
-    feedkill = get_feedkill(gl_GlobalInvocationID.xy);
+    feedkill = get_feedkill(gl_FragCoord.xy);
     
     // feedkill = vec2(0.096, 0.057);
     // feedkill = vec2(0.073, 0.061);
@@ -187,10 +186,9 @@ void main(){
     float kill = -1 * (k + f) * b;
     vec2 feedkillVec = vec2(feed, kill);
 
-    vec2 diffusion = vec2(1.0, 0.5) + 0.5 * audio * vec2(0.15, 0.3);
+    vec2 diffusion = vec2(1.0, 0.5) + (0.5 * audio * vec2(0.15, 0.3));
 
     vec2 newValues = vec2(a, b) + (deltaTime) * ((diffusion * laplacian) + reactionVec + feedkillVec);
 
-    vec4 vals = vec4(newValues, 0., 1.);
-	imageStore(reactionMap, coord, vals);
+    out_color = vec4(newValues, 0., 1.);
 }

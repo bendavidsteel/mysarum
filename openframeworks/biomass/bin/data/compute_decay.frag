@@ -1,20 +1,27 @@
 #version 440
 
-layout(rgba8,binding=3) uniform restrict image2D trailMap;
 layout(rg16,binding=4) uniform restrict image2D optFlowMap; // TODO switch to readonly
+
+uniform sampler2DRect trailMap;
+uniform sampler2DRect particleMap;
 
 uniform ivec2 resolution;
 uniform float deltaTime;
 uniform float decayRate;
 uniform int opticalFlowDownScale;
 
-layout(local_size_x = 20, local_size_y = 20, local_size_z = 1) in;
+out vec4 out_color;
+
 void main(){
 
-    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 coord = ivec2(gl_FragCoord.xy);
+
+    vec4 oldTrail = imageLoad(trailMap, newCoord);
+	vec4 newTrail = max(min((oldTrail + (speciesMask * trailWeight * deltaTime)), 1.), 0.);
+	imageStore(trailMap, newCoord, newTrail);
 
     // accumulator
-    vec4 blurredTrail = imageLoad(trailMap, coord);
+    vec4 blurredTrail = texture(trailMap, coord);
 
     // read optical flow
     vec2 opticalFlowForce = imageLoad(optFlowMap, coord / opticalFlowDownScale).xy;
@@ -37,5 +44,5 @@ void main(){
         newTrail.w = 0.;
     }
 
-	imageStore(trailMap, coord, newTrail);
+    out_color = newTrail;
 }

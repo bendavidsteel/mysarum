@@ -141,7 +141,7 @@ void main() {
     // r *= 0.9 + 0.1 * pow(bass, 2.);
     // theta += 0.01 * random(r);
 
-    uv = centre + vec2(cos(theta), sin(theta)) * r;
+    // uv = centre + vec2(cos(theta), sin(theta)) * r;
 
     // uv += 0.1 * vec2(sin(0.25 * bps * time), cos(0.25 * bps * time));
 

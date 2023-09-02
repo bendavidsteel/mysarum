@@ -37,7 +37,7 @@ void Biomass::setup(){
 	allSpecies.resize(numSpecies);
 	allSpecies[0].movementAttributes.x = 1.1 * mapFactor; // moveSpeed
 	allSpecies[0].movementAttributes.y = 0.04 * 2 * PI; // turnSpeed
-	allSpecies[0].movementAttributes.z = CIRCLE; //spawn
+	allSpecies[0].movementAttributes.z = HORIZONTAL_LINE; //spawn
 	allSpecies[0].sensorAttributes.x = 30 * PI / 180; // sensorAngleRad
 	allSpecies[0].sensorAttributes.y = 10 * mapFactor; // sensorOffsetDist
 	allSpecies[0].colour = glm::vec4(0.796, 0.2, 1., 1.);
@@ -50,12 +50,12 @@ void Biomass::setup(){
 	allSpecies[1].colour = glm::vec4(0.1, 0.969, 1., 1.);
 	newSpecies.resize(numSpecies);
 
-	int numParticles = 1024 * 64;
-	particles.resize(numParticles);
+	int numAgents = 1024 * 64;
+	agents.resize(numAgents);
 
 	int speciesIdx = 0;
-	for(int idx = 0; idx < particles.size(); idx++){
-		auto &p = particles[idx];
+	for(int idx = 0; idx < agents.size(); idx++){
+		auto &p = agents[idx];
 		speciesIdx = idx % numSpecies;
 		if (allSpecies[speciesIdx].movementAttributes.z == RANDOM) {
 			p.pos.x = ofRandom(0, mapWidth);
@@ -73,11 +73,23 @@ void Biomass::setup(){
 		p.vel.y = ofRandom(-1, 1);
 		p.vel = glm::normalize(p.vel);
 		p.vel = p.vel * allSpecies[speciesIdx].movementAttributes.x;
-		p.attributes.x = speciesIdx;
+		
+		// convert speciesIdx to speciesMask glm::vec4
+		p.speciesMask = glm::vec4(0., 0., 0., 0.);
+		if (speciesIdx == 0) {
+			p.speciesMask.x = 1;
+		} else if (speciesIdx == 1) {
+			p.speciesMask.y = 1;
+		} else if (speciesIdx == 2) {
+			p.speciesMask.z = 1;
+		} else if (speciesIdx == 3) {
+			p.speciesMask.w = 1;
+		}
+		p.speciesMask.w = 1; // TODO to remove
 	}
 	
-	particlesBuffer.allocate(particles, GL_DYNAMIC_DRAW);
-	particlesBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 1);
+	agentBuffer.allocate(agents, GL_DYNAMIC_DRAW);
+	agentBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 1);
 
 	allSpeciesBuffer.allocate(allSpecies, GL_DYNAMIC_DRAW);
 	allSpeciesBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 2);
@@ -88,10 +100,18 @@ void Biomass::setup(){
 	initialTrail.setColor(initialTrailColor);
 
 	trailFbo1.allocate(mapWidth, mapHeight, GL_RGBA8);
-	trailFbo1.loadData(initialTrail);
+	trailFbo1.begin();
+	ofClear(255,255,255, 0);
+	trailFbo1.end();
 	trailFbo2.allocate(mapWidth, mapHeight, GL_RGBA8);
-	trailFbo2.loadData(initialTrail);
-	particleFbo.allocate(mapWidth, mapHeight, GL_RGBA8);
+	trailFbo2.begin();
+	ofClear(255,255,255, 0);
+	trailFbo2.end();
+	agentFbo.allocate(mapWidth, mapHeight, GL_RGBA8);
+
+	agentVbo.setVertexBuffer(agentBuffer,4,sizeof(Agent));
+	agentVbo.setColorBuffer(agentBuffer,sizeof(Agent),2*sizeof(glm::vec4));
+	agentVbo.enableColors();
 
 	// reaction diffusion setup
 	reactionFbo.allocate(mapWidth, mapHeight, GL_RG16);
@@ -138,6 +158,14 @@ void Biomass::setup(){
 
 	renderer.load("generic.vert", "renderer.frag");
 	simple_renderer.load("generic.vert", "simple_renderer.frag");
+
+	int planeWidth = ofGetWidth() * mapFactor;
+	int planeHeight = ofGetHeight() * mapFactor;
+	int planeGridSize = 1;
+	int planeColums = planeWidth / planeGridSize;
+	int planeRows = planeHeight / planeGridSize;
+
+	plane.set(planeWidth, planeHeight, planeColums, planeRows, OF_PRIMITIVE_TRIANGLES);
 	
 	copyVariables();
 }
@@ -287,7 +315,6 @@ void Biomass::update(){
 	compute_agents.setUniform2i("resolution", mapWidth, mapHeight);
 	compute_agents.setUniform1f("deltaTime", deltaTime);
 	compute_agents.setUniform1f("time", time);
-	compute_agents.setUniform1f("trailWeight", trailWeight);
 	compute_agents.setUniform1i("opticalFlowDownScale", cvDownScale);
 	compute_agents.setUniform1f("agentFlowMag", agentFlowMag);
 	compute_agents.setUniformTexture("flowMap", flowFbo.getTexture(), 0);
@@ -297,21 +324,23 @@ void Biomass::update(){
 	// we only have to issue 1 / 1024 workgroups to cover the full workload.
 	// note how we add 1024 and subtract one, this is a fast way to do the equivalent
 	// of std::ceil() in the float domain, i.e. to round up, so that we're also issueing
-	// a work group should the total size of particles be < 1024
-	compute_agents.dispatchCompute((particles.size() + 1024 -1 )/1024, 1, 1);
+	// a work group should the total size of agents be < 1024
+	compute_agents.dispatchCompute((agents.size() + 1024 -1 )/1024, 1, 1);
 	compute_agents.end();
 
-	particleFbo1.begin();
-	particleVbo.draw();
-	particleFbo1.end();
+	agentFbo.begin();
+	glPointSize(2);
+	agentVbo.draw(GL_POINTS, 0, agents.size());
+	agentFbo.end();
 
 	trailFbo2.begin();
 	compute_decay.begin();
 	compute_decay.setUniform2i("resolution", mapWidth, mapHeight);
 	compute_decay.setUniform1f("deltaTime", deltaTime);
 	compute_decay.setUniform1f("decayRate", decayRate);
+	compute_decay.setUniform1f("trailWeight", trailWeight);
 	compute_decay.setUniform1i("opticalFlowDownScale", cvDownScale);
-	compute_decay.setUniformTexture("particleMap", particleFbo.getTexture(), 0);
+	compute_decay.setUniformTexture("agentMap", agentFbo.getTexture(), 0);
 	compute_decay.setUniformTexture("trailMap", trailFbo1.getTexture(), 1);
 	compute_decay.end();
 	trailFbo2.end();
@@ -374,48 +403,55 @@ void Biomass::draw() {
 	float sun_y = (mapHeight / 2) + (2 * mapHeight / 3) * sin(time_of_day);
 	float sun_z = 25 + (10 * sin(time_of_month));
 
-	if (display == 0) {
-		ofClear(255,255,255, 0);
-		renderer.begin();
-		renderer.setUniform2i("resolution", mapWidth, mapHeight);
-		renderer.setUniform3f("colourA", colourA.x, colourA.y, colourA.z);
-		renderer.setUniform3f("colourB", colourB.x, colourB.y, colourB.z);
-		renderer.setUniform3f("light", sun_x, sun_y, sun_z);
-		renderer.setUniform1f("chem_height", chemHeight);
-		renderer.setUniform1f("trail_height", trailHeight);
-		renderer.setUniform1f("time", time);
-		renderer.setUniform1f("bpm", bps);
-		renderer.setUniformTexture("flowMap", flowFbo.getTexture(), 0);
-		renderer.setUniformTexture("reactionMap", reactionFbo.getTexture(), 1);
-		renderer.setUniformTexture("trailMap", trailFbo2.getTexture(), 2);
-		ofSetColor(255);
-		ofDrawRectangle(0, 0, mapWidth, mapHeight);
-		renderer.end();
+	agentVbo.draw(GL_POINTS, 0, agents.size());
+	// agentFbo.draw(0, 0, ofGetWidth(), ofGetHeight());
+	// trailFbo2.draw(0, 0, ofGetWidth(), ofGetHeight());
 
-	}  else if (display == 1 || display == 2 || display == 3 || display == 4){
-		ofClear(255,255,255, 0);
-		simple_renderer.begin();
-		simple_renderer.setUniform2i("resolution", mapWidth, mapHeight);
-		simple_renderer.setUniform3f("colourA", colourA.x, colourA.y, colourA.z);
-		simple_renderer.setUniform3f("colourB", colourB.x, colourB.y, colourB.z);
-		simple_renderer.setUniform3f("light", sun_x, sun_y, sun_z);
-		simple_renderer.setUniform1f("chem_height", chemHeight);
-		simple_renderer.setUniform1f("trail_height", trailHeight);
-		simple_renderer.setUniform1i("opticalFlowDownScale", cvDownScale);
-		simple_renderer.setUniform1i("display", display);
-		simple_renderer.setUniformTexture("flowMap", flowFbo.getTexture(), 0);
-		simple_renderer.setUniformTexture("reactionMap", reactionFbo.getTexture(), 1);
-		simple_renderer.setUniformTexture("trailMap", trailFbo2.getTexture(), 2);
-		ofSetColor(255);
-		ofDrawRectangle(0, 0, mapWidth, mapHeight);
-		simple_renderer.end();
-	} else if (display == 5) {
-		flowFbo.draw(0, 0, mapWidth, mapHeight);
-	}
+	// if (display == 0) {
+	// 	ofClear(255,255,255, 0);
+	// 	renderer.begin();
+	// 	renderer.setUniform2i("resolution", mapWidth, mapHeight);
+	// 	renderer.setUniform3f("colourA", colourA.x, colourA.y, colourA.z);
+	// 	renderer.setUniform3f("colourB", colourB.x, colourB.y, colourB.z);
+	// 	renderer.setUniform3f("light", sun_x, sun_y, sun_z);
+	// 	renderer.setUniform1f("chem_height", chemHeight);
+	// 	renderer.setUniform1f("trail_height", trailHeight);
+	// 	renderer.setUniform1f("time", time);
+	// 	renderer.setUniform1f("bpm", bps);
+	// 	renderer.setUniformTexture("flowMap", flowFbo.getTexture(), 0);
+	// 	renderer.setUniformTexture("reactionMap", reactionFbo.getTexture(), 1);
+	// 	renderer.setUniformTexture("trailMap", trailFbo2.getTexture(), 2);
+		
+	// 	plane.draw();
+
+	// 	renderer.end();
+
+	// }  else if (display == 1 || display == 2 || display == 3 || display == 4){
+	// 	ofClear(255,255,255, 0);
+	// 	simple_renderer.begin();
+	// 	simple_renderer.setUniform2i("resolution", mapWidth, mapHeight);
+	// 	simple_renderer.setUniform3f("colourA", colourA.x, colourA.y, colourA.z);
+	// 	simple_renderer.setUniform3f("colourB", colourB.x, colourB.y, colourB.z);
+	// 	simple_renderer.setUniform3f("light", sun_x, sun_y, sun_z);
+	// 	simple_renderer.setUniform1f("chem_height", chemHeight);
+	// 	simple_renderer.setUniform1f("trail_height", trailHeight);
+	// 	simple_renderer.setUniform1i("opticalFlowDownScale", cvDownScale);
+	// 	simple_renderer.setUniform1i("display", display);
+	// 	simple_renderer.setUniformTexture("flowMap", flowFbo.getTexture(), 0);
+	// 	simple_renderer.setUniformTexture("reactionMap", reactionFbo.getTexture(), 1);
+	// 	simple_renderer.setUniformTexture("trailMap", trailFbo2.getTexture(), 2);
+		
+	// 	plane.draw();
+
+	// 	simple_renderer.end();
+	// } else if (display == 5) {
+	// 	flowFbo.draw(0, 0, mapWidth, mapHeight);
+	// }
 }
 
 void Biomass::exit(){
-	trailMap.clear();
+	trailFbo1.clear();
+	trailFbo2.clear();
 	reactionFbo.clear();
 	lastReactionFbo.clear();
 	flowFbo.clear();
@@ -499,8 +535,8 @@ void Biomass::reSpawnAgents() {
 	allSpecies[1].movementAttributes.z = std::round(ofRandom(0, 5.1));
 	int numSpecies = 2;
 	int speciesIdx = 0;
-	for(int idx = 0; idx < particles.size(); idx++){
-		auto &p = particles[idx];
+	for(int idx = 0; idx < agents.size(); idx++){
+		auto &p = agents[idx];
 		speciesIdx = idx % numSpecies;
 		if (allSpecies[speciesIdx].movementAttributes.z == RANDOM) {
 			p.pos.x = ofRandom(0, mapWidth);
@@ -529,9 +565,19 @@ void Biomass::reSpawnAgents() {
 		p.vel.y = ofRandom(-1, 1);
 		p.vel = glm::normalize(p.vel);
 		p.vel = p.vel * allSpecies[speciesIdx].movementAttributes.x;
-		p.attributes.x = speciesIdx;
+		
+		p.speciesMask = glm::vec4(0., 0., 0., 0.);
+		if (speciesIdx == 0) {
+			p.speciesMask.x = 1;
+		} else if (speciesIdx == 1) {
+			p.speciesMask.y = 1;
+		} else if (speciesIdx == 2) {
+			p.speciesMask.z = 1;
+		} else if (speciesIdx == 3) {
+			p.speciesMask.w = 1;
+		}
 	}
-	particlesBuffer.updateData(particles);
+	agentBuffer.updateData(agents);
 }
 
 void Biomass::setSpeciesColour(glm::vec3 colour1, glm::vec3 colour2) {

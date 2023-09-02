@@ -283,21 +283,26 @@ void ofApp::draw() {
 
 	evolution.evaluate(fbo);
 
-	tex = fbo.getTexture();
+	bool postprocessEnabled = false;
 
-	fbo.begin();
-	postprocess.begin();
-	postprocess.setUniformTexture("tex", tex, 0);
-	postprocess.setUniformTexture("artificer", artificerImage.getTexture(), 1);
-	postprocess.setUniform2i("mapSize", biomass.getMapWidth(), biomass.getMapHeight());
-	postprocess.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
-	postprocess.setUniform1f("time", time);
-	postprocess.setUniform1f("bps", bps);
-	postprocess.setUniform1f("bass", melBands[0]);
-	ofSetColor(255);
-	ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
-	postprocess.end();
-	fbo.end();
+	if (postprocessEnabled) {
+		tex = fbo.getTexture();
+
+		fbo.begin();
+		postprocess.begin();
+		postprocess.setUniformTexture("tex", tex, 0);
+		postprocess.setUniformTexture("artificer", artificerImage.getTexture(), 1);
+		postprocess.setUniform2i("mapSize", biomass.getMapWidth(), biomass.getMapHeight());
+		postprocess.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
+		postprocess.setUniform1f("time", time);
+		postprocess.setUniform1f("bps", bps);
+		postprocess.setUniform1f("bass", melBands[0]);
+		ofSetColor(255);
+		ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
+		postprocess.end();
+		fbo.end();
+	}
+
 	fbo.draw(0, 0);
 
 	ofDrawBitmapString(ofGetFrameRate(),20,20);
@@ -350,11 +355,11 @@ void ofApp::newMidiMessage(ofxMidiMessage& message) {
 //--------------------------------------------------------------
 void ofApp::keyPressed(int key){
 	if (key == '1') {
-		newInput(36);
+		newInput(49);
 	} else if (key == '2') {
-		newInput(37);
+		newInput(50);
 	} else if (key == '3') {
-		newInput(38);
+		newInput(51);
 	} else if (key == '4') {
 		newInput(39);
 	} else if (key == '5') {

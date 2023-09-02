@@ -1,5 +1,7 @@
 #version 440
 
+out vec4 out_color;
+
 uniform sampler2DRect trailMap;
 
 uniform ivec2 resolution;
@@ -12,7 +14,7 @@ void main(){
     ivec2 coord = ivec2(gl_FragCoord.xy);
 
     // accumulator
-    vec4 originalTrail = imageLoad(trailMap, coord);
+    vec4 originalTrail = texture(trailMap, coord);
     
     //blur box size
     const int dim = 1;
@@ -20,12 +22,12 @@ void main(){
     vec4 lastTrail = vec4(0.);
     ivec2 pointCoord = coord - blurDir;
     pointCoord = min(resolution-1, max(pointCoord, 0));
-    lastTrail = imageLoad(trailMap, pointCoord);
+    lastTrail = texture(trailMap, pointCoord);
 
     vec4 nextTrail = vec4(0.);
     pointCoord = coord + blurDir;
     pointCoord = min(resolution-1, max(pointCoord, 0));
-    nextTrail = imageLoad(trailMap, pointCoord);
+    nextTrail = texture(trailMap, pointCoord);
 
     vec4 sum = lastTrail + originalTrail + nextTrail;
 
@@ -34,4 +36,5 @@ void main(){
     blurredTrail = mix(originalTrail, blurredTrail, diffuseWeight);
     
     out_color = blurredTrail;
+    out_color.a = 1;
 }

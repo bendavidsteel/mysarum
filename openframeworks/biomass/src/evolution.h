@@ -5,6 +5,9 @@
 class Evolution{
     public:
         void setup(Biomass& biomass);
-        void evalute(Fbo output);
+        void evaluate(ofFbo output);
         void update();
+
+    private:
+        Biomass biomass;
 };

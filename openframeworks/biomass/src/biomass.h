@@ -54,10 +54,13 @@ class Biomass{
 		void setBPS(float bps);
 
 	private:
+
 		// both
 		ofShader compute_flow;
 		ofShader renderer;
 		ofShader simple_renderer;
+
+		ofPlanePrimitive plane;
 
 		ofFbo flowFbo;
 
@@ -69,9 +72,9 @@ class Biomass{
 
 		// slime
 		struct Agent{
-			glm::vec2 pos;
-			glm::vec2 vel;
-			glm::vec4 attributes;
+			glm::vec4 pos;
+			glm::vec4 vel;
+			glm::vec4 speciesMask;
 		};
 
 		struct Species{
@@ -84,14 +87,16 @@ class Biomass{
 		ofShader compute_decay;
 		ofShader compute_diffuse;
 
-		vector<Agent> particles;
-		ofBufferObject particlesBuffer;
+		vector<Agent> agents;
+		ofBufferObject agentBuffer;
 		vector<Species> allSpecies;
 		vector<Species> newSpecies;
 		ofBufferObject allSpeciesBuffer;
 
 		ofFbo trailFbo1;
 		ofFbo trailFbo2;
+		ofFbo agentFbo;
+		ofVbo agentVbo;
 
 		int mapWidth;
 		int mapHeight;

@@ -1,9 +1,9 @@
 #version 440
 
 struct Agent{
-	vec2 pos;
-	vec2 vel;
-	vec4 attributes;
+	vec4 pos;
+	vec4 vel;
+	vec4 speciesMask;
 };
 
 struct Species{
@@ -12,9 +12,13 @@ struct Species{
 	vec4 sensorAttributes;
 };
 
-layout(std140, binding=1) buffer particle{
+layout(std140, binding=0) buffer agents{
     Agent agents[];
 };
+
+layout (std140 binding=1) buffer agentsBack {
+	Agent agentsBack[];
+}
 
 layout(std140, binding=2) buffer species{
     Species allSpecies[];
@@ -156,10 +160,20 @@ void ensureRebound(inout vec2 pos, inout vec2 vel){
 
 layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
 void main(){
-	vec2 pos = agents[gl_GlobalInvocationID.x].pos.xy;
-	vec2 vel = agents[gl_GlobalInvocationID.x].vel.xy;
-	int speciesIdx = int(agents[gl_GlobalInvocationID.x].attributes.x);
-	vec4 speciesMask = toMask(speciesIdx);
+	vec2 pos = agentsBack[gl_GlobalInvocationID.x].pos.xy;
+	vec2 vel = agentsBack[gl_GlobalInvocationID.x].vel.xy;
+	vec4 speciesMask = agentsBack[gl_GlobalInvocationID.x].speciesMask;
+
+	int speciesIdx = 0;
+	if (speciesMask.x == 1.0) {
+		speciesIdx = 0;
+	} else if (speciesMask.y == 1.0) {
+		speciesIdx = 1;
+	} else if (speciesMask.z == 1.0) {
+		speciesIdx = 2;
+	} else if (speciesMask.w == 1.0) {
+		speciesIdx = 3;
+	}
 
 	// Steer based on sensory data
 	float sensorAngleRad = allSpecies[speciesIdx].sensorAttributes.x;
@@ -213,8 +227,4 @@ void main(){
 
 	agents[gl_GlobalInvocationID.x].vel.xy = newVel;
 	agents[gl_GlobalInvocationID.x].pos.xy = newPos;
-
-	// TODO do this with a VBO
-	ivec2 newCoord = ivec2(newPos.xy);
-	
 }

@@ -15,17 +15,18 @@ out vec4 out_color;
 
 void main(){
 
-    ivec2 coord = ivec2(gl_FragCoord.xy);
+    vec2 coord = gl_FragCoord.xy;
 
     vec4 oldTrail = texture(trailMap, coord);
     vec4 speciesMask = texture(agentMap, coord);
 	vec4 newTrail = max(min((oldTrail + (speciesMask * trailWeight * deltaTime)), 1.), 0.);
 
     // read optical flow
-    vec2 opticalFlowForce = imageLoad(optFlowMap, coord / opticalFlowDownScale).xy;
+    vec2 opticalFlowForce = imageLoad(optFlowMap, ivec2(coord / opticalFlowDownScale)).xy;
     opticalFlowForce = opticalFlowForce * 2. - 1.;
     float opticalFlowMag = length(opticalFlowForce);
-    float opticalDecayRate = 1. - 0.8 * opticalFlowMag;
+    // float opticalDecayRate = 1. - 0.8 * opticalFlowMag;
+    float opticalDecayRate = 1.;
     
     vec4 blurredTrail = min(max((newTrail * opticalDecayRate * decayRate * deltaTime), 0.), 1.);
 
@@ -43,5 +44,5 @@ void main(){
     }
 
     out_color = blurredTrail;
-    out_color.a = 1.;
+    out_color.w = 1.; // TODO if we remove this, everything breaks. why? 
 }

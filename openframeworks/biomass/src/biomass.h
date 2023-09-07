@@ -3,14 +3,8 @@
 #include "ofMain.h"
 #include "ofBufferObject.h"
 
-enum Spawn{
-	RANDOM=0,
-	CIRCLE=1,
-	RING=2,
-	SMALL_RING=3,
-	VERTICAL_LINE=4,
-	HORIZONTAL_LINE=5
-};
+#include "reactiondiffusion.h"
+#include "physarum.h"
 
 struct Component{
 	glm::vec4 value;
@@ -20,7 +14,7 @@ class Biomass{
 
 	public:
 		void setup();
-		void update();
+		void update(ofTexture opticalFlowTexture);
 		void draw();
 		void exit();
 
@@ -54,15 +48,21 @@ class Biomass{
 		void setBPS(float bps);
 
 	private:
+		ReactionDiffusion reactionDiffusion;
+		Physarum physarum;
 
 		// both
 		ofShader compute_flow;
 		ofShader renderer;
+		ofShader physarum_renderer;
+		ofShader reaction_renderer;
 		ofShader simple_renderer;
 
 		ofPlanePrimitive plane;
 
 		ofFbo flowFbo;
+		ofFbo trailFbo;
+		ofFbo reactionFbo;
 
 		ofShader compute_audio;
 		ofFbo audioFbo;
@@ -70,57 +70,16 @@ class Biomass{
 		ofBufferObject pointsBuffer;
 		int audioArraySize;
 
-		// slime
-		struct Agent{
-			glm::vec4 pos;
-			glm::vec4 vel;
-			glm::vec4 speciesMask;
-		};
-
-		struct Species{
-			glm::vec4 colour;
-			glm::vec4 movementAttributes;
-			glm::vec4 sensorAttributes;
-		};
-
-		ofShader compute_agents;
-		ofShader compute_decay;
-		ofShader compute_diffuse;
-
-		vector<Agent> agents;
-		ofBufferObject agentBuffer;
-		vector<Species> allSpecies;
-		vector<Species> newSpecies;
-		ofBufferObject allSpeciesBuffer;
-
-		ofFbo trailFbo1;
-		ofFbo trailFbo2;
-		ofFbo agentFbo;
-		ofVbo agentVbo;
-
 		int mapWidth;
 		int mapHeight;
 		int mapFactor;
-
-		float diffuseRate;
-		float newDiffuseRate;
-		float decayRate;
-		float newDecayRate;
-		float trailWeight;
-		float newTrailWeight;
-
-		// reaction diffusion
-		ofShader compute_reaction;
-
-		ofFbo reactionFbo;
-		ofFbo lastReactionFbo;
 
 		int flowSizeFactor;
 		float floatStrength;
 
 		// variables
-		float time_of_day;
-		float time_of_month;
+		float timeOfDay;
+		float timeOfMonth;
 
 		float dayRate;
 		float monthRate;
@@ -130,16 +89,6 @@ class Biomass{
 		float trailHeight;
 		float newTrailHeight;
 
-		float feedMin;
-		float newFeedMin;
-		float feedRange;
-		float newFeedRange;
-
-		float reactionFlowMag;
-		float newReactionFlowMag;
-		float agentFlowMag;
-		float newAgentFlowMag;
-
 		glm::vec3 colourA;
 		glm::vec3 newColourA;
 		glm::vec3 colourB;
@@ -148,9 +97,6 @@ class Biomass{
 		vector<Component> points;
 		vector<Component> newPoints;
 		int numPoints = 4;
-
-		bool bReSpawnAgents;
-		int bReSpawnReaction;
 
 		int display;
 

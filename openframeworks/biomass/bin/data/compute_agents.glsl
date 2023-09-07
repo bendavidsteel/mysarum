@@ -1,8 +1,8 @@
 #version 440
 
 struct Agent{
-	vec4 pos;
-	vec4 vel;
+	vec2 pos;
+	vec2 vel;
 	vec4 speciesMask;
 };
 
@@ -12,24 +12,21 @@ struct Species{
 	vec4 sensorAttributes;
 };
 
-layout(std140, binding=0) buffer agents{
-    Agent agents[];
+layout(std140, binding=1) buffer agents{
+    Agent allAgents[];
 };
-
-layout (std140 binding=1) buffer agentsBack {
-	Agent agentsBack[];
-}
 
 layout(std140, binding=2) buffer species{
     Species allSpecies[];
 };
 
-layout(rgba8,binding=3) uniform restrict image2D trailMap;
-layout(rg16,binding=4) uniform restrict image2D optFlowMap; // TODO switch to readonly
-layout(rg16,binding=7) uniform restrict image2D audioMap;
+layout(rg16,binding=3) uniform restrict image2D agentMap;
 
 uniform sampler2DRect flowMap;
 uniform sampler2DRect reactionMap;
+uniform sampler2DRect audioMap;
+uniform sampler2DRect optFlowMap;
+uniform sampler2DRect trailMap;
 
 uniform ivec2 resolution;
 uniform float time;
@@ -107,11 +104,11 @@ float sense(vec2 pos, float angle, vec4 speciesMask, float sensorOffsetDist, flo
 	for (int offsetX = -sensorSize; offsetX <= sensorSize; offsetX ++) {
 		for (int offsetY = -sensorSize; offsetY <= sensorSize; offsetY ++) {
 			ivec2 sampleCoord = min(resolution, max(ivec2(sensorCentreX + offsetX, sensorCentreY + offsetY), 0));
-			vec4 trailWeight = imageLoad(trailMap, sampleCoord);
+			vec4 trailWeight = texture(trailMap, sampleCoord);
 			sum += dot(senseWeight, trailWeight);
 
 			// repel from optical flow
-			vec2 opticalFlow = imageLoad(optFlowMap, sampleCoord / opticalFlowDownScale).xy;
+			vec2 opticalFlow = texture(optFlowMap, sampleCoord / opticalFlowDownScale).xy;
 			opticalFlow = opticalFlow * 2.0 - 1.0;
 			float opticalFlowMag = length(opticalFlow);
 			sum -= 10 * opticalFlowMag;
@@ -160,9 +157,9 @@ void ensureRebound(inout vec2 pos, inout vec2 vel){
 
 layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
 void main(){
-	vec2 pos = agentsBack[gl_GlobalInvocationID.x].pos.xy;
-	vec2 vel = agentsBack[gl_GlobalInvocationID.x].vel.xy;
-	vec4 speciesMask = agentsBack[gl_GlobalInvocationID.x].speciesMask;
+	vec2 pos = allAgents[gl_GlobalInvocationID.x].pos.xy;
+	vec2 vel = allAgents[gl_GlobalInvocationID.x].vel.xy;
+	vec4 speciesMask = allAgents[gl_GlobalInvocationID.x].speciesMask;
 
 	int speciesIdx = 0;
 	if (speciesMask.x == 1.0) {
@@ -210,21 +207,25 @@ void main(){
 	vec2 simplexFlowForce = texture(flowMap, oldCoord).xy;
 	simplexFlowForce = (2 * simplexFlowForce) - 1; // convert to -1-1 range
 
-	vec2 opticalFlowForce = imageLoad(optFlowMap, oldCoord / opticalFlowDownScale).xy;
+	vec2 opticalFlowForce = texture(optFlowMap, oldCoord / opticalFlowDownScale).xy;
 	opticalFlowForce = (2 * opticalFlowForce) - 1; // convert to -1-1 range
 	float opticalFlowMag = length(opticalFlowForce);
 
-	float audioMag = imageLoad(audioMap, oldCoord).x;
+	float audioMag = texture(audioMap, oldCoord).x;
 
-	vec2 force = ((2 * opticalFlowMag) + (0.5 * audioMag) + agentFlowMag) * simplexFlowForce;
+	// vec2 force = ((2 * opticalFlowMag) + (0.5 * audioMag) + agentFlowMag) * simplexFlowForce + opticalFlowForce;
+	vec2 force = vec2(0.);
 
 	// Update position
 	vec2 newVel = normalize(vel + (force * deltaTime));
-	vec2 newPos = pos + (newVel * deltaTime * moveSpeed) + (4 * opticalFlowForce * deltaTime);
+	vec2 newPos = pos + (newVel * deltaTime * moveSpeed);;
 
 	// Clamp position to map boundaries, and pick new random move dir if hit boundary
 	ensureRebound(newPos, newVel);
 
-	agents[gl_GlobalInvocationID.x].vel.xy = newVel;
-	agents[gl_GlobalInvocationID.x].pos.xy = newPos;
+	allAgents[gl_GlobalInvocationID.x].vel.xy = newVel;
+	allAgents[gl_GlobalInvocationID.x].pos.xy = newPos;
+
+	ivec2 newCoord = ivec2(newPos.xy);
+	imageStore(agentMap, newCoord, speciesMask);
 }

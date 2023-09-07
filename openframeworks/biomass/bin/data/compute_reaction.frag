@@ -1,10 +1,9 @@
 #version 440
 
-layout(rg16,binding=4) uniform restrict image2D optFlowMap; // TODO switch to readonly
-layout(rg16,binding=7) uniform restrict image2D audioMap;
-
 uniform sampler2DRect flowMap;
 uniform sampler2DRect lastReactionMap;
+uniform sampler2DRect optFlowMap;
+uniform sampler2DRect audioMap;
 
 uniform ivec2 resolution;
 uniform float deltaTime;
@@ -79,7 +78,7 @@ vec2 get_feedkill(vec2 coord) {
 }
 
 void main(){
-    ivec2 coord = ivec2(gl_FragCoord.xy);
+    vec2 coord = gl_FragCoord.xy;
 
     // previous values
     float a, b;
@@ -97,13 +96,13 @@ void main(){
         b = previous.y;
     }
 
-    float audio = imageLoad(audioMap, coord).x;
+    float audio = texture(audioMap, coord).x;
 
     // get flow map
     vec2 simplex_flow = texture(flowMap, coord).xy;
     simplex_flow = (2 * simplex_flow) - 1; //convert flow to -1 to 1 range
 
-    vec2 optical_flow = imageLoad(optFlowMap, coord / opticalFlowDownScale).xy;
+    vec2 optical_flow = texture(optFlowMap, coord / opticalFlowDownScale).xy;
     optical_flow = (2 * optical_flow) - 1; //convert flow to -1 to 1 range
     float opticalFlowMag = length(optical_flow);
 
@@ -119,35 +118,35 @@ void main(){
 
     // compute laplacian
     int kernelSize = 1;
-    ivec2 neighbourCoord = coord + kernelSize * ivec2(-1, -1);
+    vec2 neighbourCoord = coord + kernelSize * vec2(-1, -1);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
     vec2 neighbours = texture(lastReactionMap, neighbourCoord).xy * flow_ld;
 
-    neighbourCoord = coord + kernelSize * ivec2(-1, 0);
+    neighbourCoord = coord + kernelSize * vec2(-1, 0);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
     neighbours += texture(lastReactionMap, neighbourCoord).xy * flow_left;
 
-    neighbourCoord = coord + kernelSize * ivec2(-1, 1);
+    neighbourCoord = coord + kernelSize * vec2(-1, 1);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
     neighbours += texture(lastReactionMap, neighbourCoord).xy * flow_lu;
 
-    neighbourCoord = coord + kernelSize * ivec2(0, -1);
+    neighbourCoord = coord + kernelSize * vec2(0, -1);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
     neighbours += texture(lastReactionMap, neighbourCoord).xy * flow_down;
 
-    neighbourCoord = coord + kernelSize * ivec2(0, 1);
+    neighbourCoord = coord + kernelSize * vec2(0, 1);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
     neighbours += texture(lastReactionMap, neighbourCoord).xy * flow_up;
 
-    neighbourCoord = coord + kernelSize * ivec2(1, -1);
+    neighbourCoord = coord + kernelSize * vec2(1, -1);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
     neighbours += texture(lastReactionMap, neighbourCoord).xy * flow_rd;
 
-    neighbourCoord = coord + kernelSize * ivec2(1, 0);
+    neighbourCoord = coord + kernelSize * vec2(1, 0);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
     neighbours += texture(lastReactionMap, neighbourCoord).xy * flow_right;
 
-    neighbourCoord = coord + kernelSize * ivec2(1, 1);
+    neighbourCoord = coord + kernelSize * vec2(1, 1);
     neighbourCoord = min(resolution-1, max(neighbourCoord, 0));
     neighbours += texture(lastReactionMap, neighbourCoord).xy * flow_ru;
 

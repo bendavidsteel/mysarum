@@ -109,7 +109,6 @@ void ofApp::setup(){
 
 	opticalFlowPixels.allocate(scaledWidth, scaledHeight, OF_IMAGE_COLOR);
 	optFlowTexture.allocate(scaledWidth, scaledHeight, GL_RG16);
-	optFlowTexture.bindAsImage(4, GL_READ_WRITE);
 
 	// setup midi
 	// open port by number (you may need to change this)
@@ -266,7 +265,7 @@ void ofApp::update(){
 	}
 	
 	evolution.update();
-	biomass.update();
+	biomass.update(optFlowTexture);
 }
 
 //--------------------------------------------------------------
@@ -354,12 +353,14 @@ void ofApp::newMidiMessage(ofxMidiMessage& message) {
 
 //--------------------------------------------------------------
 void ofApp::keyPressed(int key){
-	if (key == '1') {
-		newInput(49);
+	if (key == '0') {
+		biomass.setDisplay(0);
+	} else if (key == '1') {
+		biomass.setDisplay(1);
 	} else if (key == '2') {
-		newInput(50);
+		biomass.setDisplay(2);
 	} else if (key == '3') {
-		newInput(51);
+		biomass.setDisplay(3);
 	} else if (key == '4') {
 		newInput(39);
 	} else if (key == '5') {

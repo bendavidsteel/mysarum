@@ -10,12 +10,10 @@ layout(std140, binding=2) buffer species{
     Species allSpecies[];
 };
 
-layout(rgba8,binding=3) uniform restrict image2D trailMap;
-layout(rg16,binding=4) uniform restrict image2D optFlowMap;
-layout(rg16,binding=7) uniform restrict image2D audioMap;
-
 uniform sampler2DRect flowMap;
 uniform sampler2DRect reactionMap;
+uniform sampler2DRect trailMap;
+// uniform sampler2DRect audioMap;
 
 uniform vec3 colourA;
 uniform vec3 colourB;
@@ -59,12 +57,13 @@ mat3 get_colour_rotation(int theta)
 
 void main()
 {
-	ivec2 coord = ivec2(gl_FragCoord.xy);
+	vec2 coord = gl_FragCoord.xy;
 
 	vec2 chems = texture(reactionMap, coord).xy;
-	vec2 audio = imageLoad(audioMap, coord).xy;
+	// vec2 audio = texture(audioMap, coord).xy;
 
-	float this_chem_height = chem_height * (1 + 2 * length(audio));
+	float audioMag = 1;//length(audio);
+	float this_chem_height = chem_height * (1 + 2 * audioMag);
 
 	vec3 pos = vec3(coord, chems.y);
 	float pos_height = chems.y * this_chem_height;
@@ -99,39 +98,52 @@ void main()
 	vec3 colour = chems.x * colourA * lighting;
 	colour += chems.y * colourB * lighting;
 
-	float trail_d = dist_to_light * (trail_height - pos_height) / height_to_light;
-	vec2 trail_coord = pos.xy + (dir_to_light * trail_d);
-	vec4 trail_shadow = imageLoad(trailMap, ivec2(trail_coord));
+	// float trail_d = dist_to_light * (trail_height - pos_height) / height_to_light;
+	// vec2 trail_coord = pos.xy + (dir_to_light * trail_d);
+	// vec4 trail_shadow = texture(trailMap, trail_coord);
 
-	if (trail_shadow.r > 0.1) {
-		colour *= (1 - 0.5 * trail_shadow.r) * (0.5 + 0.5 * allSpecies[0].colour.rgb);
-	}
-	if (trail_shadow.g > 0.1) {
-		colour *= (1 - 0.5 * trail_shadow.g) * (0.5 + 0.5 * allSpecies[1].colour.rgb);
-	}
-	if (trail_shadow.b > 0.1) {
-		colour *= (1 - 0.5 * trail_shadow.b) * (0.5 + 0.5 * allSpecies[2].colour.rgb);
-	}
-	if (trail_shadow.a > 0.1) {
-		colour *= (1 - 0.5 * trail_shadow.a) * (0.5 + 0.5 * allSpecies[3].colour.rgb);
-	}
+	// if (trail_shadow.r > 0.1) {
+	// 	colour *= (1 - 0.5 * trail_shadow.r) * (0.5 + 0.5 * allSpecies[0].colour.rgb);
+	// }
+	// if (trail_shadow.g > 0.1) {
+	// 	colour *= (1 - 0.5 * trail_shadow.g) * (0.5 + 0.5 * allSpecies[1].colour.rgb);
+	// }
+	// if (trail_shadow.b > 0.1) {
+	// 	colour *= (1 - 0.5 * trail_shadow.b) * (0.5 + 0.5 * allSpecies[2].colour.rgb);
+	// }
+	// if (trail_shadow.a > 0.1) {
+	// 	colour *= (1 - 0.5 * trail_shadow.a) * (0.5 + 0.5 * allSpecies[3].colour.rgb);
+	// }
 
-	vec4 trail = imageLoad(trailMap, coord);
+	vec4 trail = texture(trailMap, coord);
+	// colour.rg = trail.rg;
 
-	if (trail.r > 0.1) {
-		colour = mix(colour, allSpecies[0].colour.rgb * light_falloff, trail.r);
-	}
-	if (trail.g > 0.1) {
-		colour = mix(colour, allSpecies[1].colour.rgb * light_falloff, trail.g);
-	}
-	if (trail.b > 0.1) {
-		colour = mix(colour, allSpecies[2].colour.rgb * light_falloff, trail.b);
-	}
-	if (trail.a > 0.1) {
-		colour = mix(colour, allSpecies[3].colour.rgb * light_falloff, trail.a);
-	}
+	vec3 speciesAColour = allSpecies[0].colour.rgb;
+	vec3 speciesBColour = allSpecies[1].colour.rgb;
+	vec3 speciesCColour = allSpecies[2].colour.rgb;
+	vec3 speciesDColour = allSpecies[3].colour.rgb;
 
-	mat3 colour_rotation = get_colour_rotation(int(6 * sin(time * bps)));//int(audio.x * 6.));
-	colour = mix(colour, colour * colour_rotation, 1.0 * audio.x);
+	speciesAColour = vec3(1., 0., 0.);
+	speciesBColour = vec3(0., 1., 0.);
+	speciesCColour = vec3(0., 0., 1.);
+	speciesDColour = vec3(1., 1., 0.);
+
+	// if (trail.r > 0.1) {
+	// 	colour = mix(colour, speciesAColour * light_falloff, trail.r);
+	// }
+	// if (trail.g > 0.1) {
+	// 	colour = mix(colour, speciesBColour * light_falloff, trail.g);
+	// }
+	// if (trail.b > 0.1) {
+	// 	colour = mix(colour, speciesCColour * light_falloff, trail.b);
+	// }
+	// if (trail.a > 0.1) {
+	// 	colour = mix(colour, speciesDColour * light_falloff, trail.a);
+	// }
+
+	// colour.rg = trail.rg;
+
+	// mat3 colour_rotation = get_colour_rotation(int(6 * sin(time * bps)));//int(audio.x * 6.));
+	// colour = mix(colour, colour * colour_rotation, 1.0 * audio.x);
 	out_color = vec4(colour, 1.);
 }

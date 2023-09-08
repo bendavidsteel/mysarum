@@ -53,12 +53,23 @@ class Biomass{
 
 		// both
 		ofShader compute_flow;
+		ofShader plane_renderer;
 		ofShader renderer;
 		ofShader physarum_renderer;
 		ofShader reaction_renderer;
+		ofShader audio_renderer;
 		ofShader simple_renderer;
 
 		ofPlanePrimitive plane;
+		ofPlanePrimitive reactionPlane;
+		ofPlanePrimitive physarumPlane;
+		ofPlanePrimitive audioPlane;
+
+		ofSpherePrimitive randomSphere;
+
+		ofCamera camera;
+		ofLight light;
+		ofMaterial material;
 
 		ofFbo flowFbo;
 		ofFbo trailFbo;
@@ -66,6 +77,7 @@ class Biomass{
 
 		ofShader compute_audio;
 		ofFbo audioFbo;
+		vector<Component> audioVector;
 		ofBufferObject audioBuffer;
 		ofBufferObject pointsBuffer;
 		int audioArraySize;

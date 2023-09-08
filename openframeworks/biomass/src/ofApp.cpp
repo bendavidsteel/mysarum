@@ -25,6 +25,7 @@ void ofApp::setup(){
 	fbo.allocate(mapWidth, mapHeight, GL_RGBA8);
 
 	postprocess.load("generic.vert", "postprocess.frag");
+	preprocess.load("generic.vert", "preprocess.frag");
 
 	// sound
 	ofSoundStreamSettings settings;
@@ -32,7 +33,7 @@ void ofApp::setup(){
 	// auto devices = soundStream.getDeviceList(ofSoundDevice::Api::ALSA);
 	auto devices = soundStream.getDeviceList();
 	if(!devices.empty()){
-		settings.setInDevice(devices[0]);
+		settings.setInDevice(devices[1]);
 	}
 	// settings.setApi(ofSoundDevice::Api::ALSA);
 
@@ -51,7 +52,7 @@ void ofApp::setup(){
 	audioAnalyzer.setup(sampleRate, bufferSize, channels);
 	bpmDetector.setup(channels, sampleRate, 64);
 
-	audioType = AudioType::TIME;
+	audioType = AudioType::SPECTRAL;
 	if (audioType == AudioType::SPECTRAL) {
 		int numBands = 24;
 		vector<Component> melBands(numBands);
@@ -129,8 +130,8 @@ void ofApp::setup(){
 
 	udpConnection.Setup(udpSettings);
 
-	artificerImage.load("artitficer-title.png");
-	artificerImage.resize(ofGetWidth(), ofGetHeight());
+	maskImage.load("BS-screen-mask.png");
+	maskImage.resize(ofGetWidth(), ofGetHeight());
 }
 
 //--------------------------------------------------------------
@@ -275,14 +276,25 @@ void ofApp::draw() {
 	float bps = bpmDetector.getBPM() / 60.;
 	vector<float> melBands = audioAnalyzer.getValues(MEL_BANDS, 0, highSmoothing);
 
-	ofTexture tex;
+	ofTexture tex = fbo.getTexture();
 	fbo.begin();
+	preprocess.begin();
+	preprocess.setUniformTexture("tex", tex, 0);
+	preprocess.setUniformTexture("mask", maskImage.getTexture(), 1);
+	preprocess.setUniform2i("mapSize", biomass.getMapWidth(), biomass.getMapHeight());
+	preprocess.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
+	preprocess.setUniform1f("time", time);
+	preprocess.setUniform1f("bps", bps);
+	preprocess.setUniform1f("bass", melBands[0]);
+	ofSetColor(255);
+	ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
+	preprocess.end();
 	biomass.draw();
 	fbo.end();
 
 	evolution.evaluate(fbo);
 
-	bool postprocessEnabled = false;
+	bool postprocessEnabled = true;
 
 	if (postprocessEnabled) {
 		tex = fbo.getTexture();
@@ -290,7 +302,7 @@ void ofApp::draw() {
 		fbo.begin();
 		postprocess.begin();
 		postprocess.setUniformTexture("tex", tex, 0);
-		postprocess.setUniformTexture("artificer", artificerImage.getTexture(), 1);
+		postprocess.setUniformTexture("mask", maskImage.getTexture(), 1);
 		postprocess.setUniform2i("mapSize", biomass.getMapWidth(), biomass.getMapHeight());
 		postprocess.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
 		postprocess.setUniform1f("time", time);
@@ -362,11 +374,11 @@ void ofApp::keyPressed(int key){
 	} else if (key == '3') {
 		biomass.setDisplay(3);
 	} else if (key == '4') {
-		newInput(39);
+		biomass.setDisplay(4);
 	} else if (key == '5') {
-		newInput(40);
-	} else if (key == 'q') {
-		newInput(43);
+		biomass.setDisplay(5);
+	} else if (key == '6') {
+		biomass.setDisplay(6);
 	} else if (key == 'w') {
 		newInput(44);
 	} else if (key == 'e') {

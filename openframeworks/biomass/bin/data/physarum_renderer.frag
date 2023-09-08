@@ -20,6 +20,8 @@ uniform ivec2 resolution;
 uniform vec3 light;
 uniform float trail_height;
 
+in vec2 texCoordVarying;
+
 out vec4 out_color;
 
 void main()
@@ -37,7 +39,7 @@ void main()
 	// float falloff = resolution.x / 3;
 	// vec3 light_falloff = vec3(exp(-dist_to_light / (50 * falloff))) + 0.8 * audioColour;
 
-	vec3 colour = vec3(0.);
+	vec4 colour = vec4(0.);
 
     // float pos_height = 0.;
     // float height_to_light = light.z - pos_height;
@@ -45,8 +47,8 @@ void main()
     // vec2 trail_coord = pos.xy + (dir_to_light * trail_d);
     // vec4 trail_shadow = texture(trailMap, trail_coord);
 
-    vec3 flow = texture(flowMap, gl_FragCoord.xy).xyz;
-    colour = 0.2 * flow;
+    // vec3 flow = texture(flowMap, gl_FragCoord.xy).xyz;
+    // colour = 0.2 * flow;
 
     // if (trail_shadow.r > 0.1) {
     //     colour *= (1 - 0.5 * trail_shadow.r) * (0.5 + 0.5 * allSpecies[0].colour.rgb);
@@ -61,34 +63,37 @@ void main()
     //     colour *= (1 - 0.5 * trail_shadow.a) * (0.5 + 0.5 * allSpecies[3].colour.rgb);
     // }
 
-    vec4 trail = texture(trailMap, gl_FragCoord.xy);
+    vec4 trail = texture(trailMap, texCoordVarying);
 
-    vec3 speciesAColour = allSpecies[0].colour.rgb;
-	vec3 speciesBColour = allSpecies[1].colour.rgb;
-	vec3 speciesCColour = allSpecies[2].colour.rgb;
-	vec3 speciesDColour = allSpecies[3].colour.rgb;
+    vec4 speciesAColour = vec4(0., 0., 0., 1.);
+	vec4 speciesBColour = vec4(0., 0., 0., 1.);
+	vec4 speciesCColour = vec4(0., 0., 0., 1.);
+	vec4 speciesDColour = vec4(0., 0., 0., 1.);
+
+	speciesAColour.rgb = allSpecies[0].colour.rgb;
+	speciesBColour.rgb = allSpecies[1].colour.rgb;
+	speciesCColour.rgb = allSpecies[2].colour.rgb;
+	speciesDColour.rgb = allSpecies[3].colour.rgb;
 
 	// vec3 speciesAColour = vec3(1., 0., 0.);
 	// vec3 speciesBColour = vec3(0., 1., 0.);
 	// vec3 speciesCColour = vec3(0., 0., 1.);
 	// vec3 speciesDColour = vec3(1., 1., 0.);
 
-    vec3 light_falloff = vec3(1.);
-
 	if (trail.r > 0.1) {
-		colour = mix(colour, speciesAColour * light_falloff, trail.r);
+		colour = mix(colour, speciesAColour, trail.r);
 	}
 	if (trail.g > 0.1) {
-		colour = mix(colour, speciesBColour * light_falloff, trail.g);
+		colour = mix(colour, speciesBColour, trail.g);
 	}
 	if (trail.b > 0.1) {
-		colour = mix(colour, speciesCColour * light_falloff, trail.b);
+		colour = mix(colour, speciesCColour, trail.b);
 	}
 	// if (trail.a > 0.1) {
-	// 	colour = mix(colour, speciesDColour * light_falloff, trail.a);
+	// 	colour = mix(colour, speciesDColour, trail.a);
 	// }
 
     // colour.gb = trail.rg;
 
-    out_color = vec4(colour, 1.);
+    out_color = colour;
 }

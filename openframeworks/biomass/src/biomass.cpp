@@ -3,20 +3,23 @@
 
 //--------------------------------------------------------------
 void Biomass::setup(){
-
+	// ofDisableArbTex();
 	ofSetFrameRate(120);
+	ofSetVerticalSync(true);
+	// ofEnableDepthTest();
+	// ofSetSmoothLighting(true);
 
 	// constants
 	display = 0;
 
-	mapFactor = 2.;
-	mapWidth = ofGetWidth() * mapFactor;
-	mapHeight = ofGetHeight() * mapFactor;
+	mapFactor = 1.;
+	mapWidth = 2000.;
+	mapHeight = 2000.;
 
 	colourA = glm::vec3(1., 0., 0.);
 	colourB = glm::vec3(0., 1., 0.);
-	chemHeight = 1.;
-	trailHeight = 2.;
+	chemHeight = 50.;
+	trailHeight = 10.;
 	dayRate = 10.;
 	monthRate = 10.;
 
@@ -41,7 +44,7 @@ void Biomass::setup(){
 
 	compute_audio.load("generic.vert", "compute_audio.frag");
 
-	audioFbo.allocate(mapWidth, mapHeight, GL_RG16);
+	audioFbo.allocate(mapWidth, mapHeight, GL_RGBA16);
 	trailFbo.allocate(mapWidth, mapHeight, GL_RGBA8);
 	reactionFbo.allocate(mapWidth, mapHeight, GL_RGBA8);
 
@@ -55,19 +58,49 @@ void Biomass::setup(){
 	compute_flow.load("generic.vert", "compute_flow.frag");
 
 	renderer.load("generic.vert", "renderer.frag");
+	plane_renderer.load("plane_renderer.vert", "plane_renderer.frag");
 	simple_renderer.load("generic.vert", "simple_renderer.frag");
-	physarum_renderer.load("generic.vert", "physarum_renderer.frag");
-	reaction_renderer.load("generic.vert", "reaction_renderer.frag");
+	physarum_renderer.load("physarum_renderer.vert", "physarum_renderer.frag");
+	reaction_renderer.load("reaction_renderer.vert", "reaction_renderer.frag");
+	audio_renderer.load("audio_renderer.vert", "audio_renderer.frag");
 
-	int planeWidth = ofGetWidth() * mapFactor;
-	int planeHeight = ofGetHeight() * mapFactor;
-	int planeGridSize = 1;
-	int planeColums = planeWidth / planeGridSize;
-	int planeRows = planeHeight / planeGridSize;
+	int planeWidth = 1200;
+	int planeHeight = 1200;
 
-	plane.set(planeWidth, planeHeight, planeColums, planeRows, OF_PRIMITIVE_TRIANGLES);
+	reactionPlane.set(planeWidth, planeHeight, mapWidth, mapHeight);
+	reactionPlane.mapTexCoordsFromTexture(reactionFbo.getTexture());
+
+	physarumPlane.set(planeWidth, planeHeight, mapWidth, mapHeight);
+	physarumPlane.mapTexCoordsFromTexture(trailFbo.getTexture());
+
+	audioPlane.set(planeWidth, planeHeight, mapWidth, mapHeight);
+	audioPlane.mapTexCoordsFromTexture(audioFbo.getTexture());
+
+	plane.set(planeWidth, planeHeight, mapWidth, mapHeight);
+	plane.mapTexCoordsFromTexture(flowFbo.getTexture());
+
+	int sphereRadius = 200;
+	int sphereResolution = 20;
+
+	randomSphere.set(sphereRadius, sphereResolution);
 	
 	copyVariables();
+
+	camera.setFarClip(ofGetWidth()*10);
+	camera.setNearClip(0.1);
+
+	// Point lights emit light in all directions //
+	// set the diffuse color, color reflected from the light source //
+	light.setDiffuseColor( ofColor(125.f, 255.f, 125.f));
+
+	// specular color, the highlight/shininess color //
+	light.setSpecularColor( ofColor(255.f, 255.f, 125.f));
+	light.setPointLight();
+
+	// shininess is a value between 0 - 128, 128 being the most shiny //
+	material.setShininess( 20 );
+	// the light highlight of the material //
+	material.setSpecularColor(ofColor(255, 255, 255, 255));
 }
 
 void Biomass::setupAudio(vector<Component> audio) {
@@ -76,6 +109,7 @@ void Biomass::setupAudio(vector<Component> audio) {
 }
 
 void Biomass::updateAudio(vector<Component> audio) {
+	audioVector = audio;
 	audioBuffer.updateData(audio);
 }
 
@@ -87,8 +121,8 @@ void Biomass::update(ofTexture opticalFlowTexture){
 	monthRate = dayRate / 10.;
 	float days = time / dayRate;
 	float months = time / monthRate;
-	timeOfDay = fmod(days, float(2 * PI)) - PI;
-	timeOfMonth = fmod(months, float(2 * PI)) - PI;
+	timeOfDay = std::fmod(days, float(2 * PI)) - PI;
+	timeOfMonth = std::fmod(months, float(2 * PI)) - PI;
 
 	if (abs(timeOfMonth) < 0.01) {
 		int newReactionColour = int(ofRandom(0., 10.));
@@ -140,7 +174,7 @@ void Biomass::update(ofTexture opticalFlowTexture){
 	compute_audio.setUniform1f("deltaTime", deltaTime);
 	compute_audio.setUniform1i("numBands", audioArraySize);
 	compute_audio.setUniform1f("angle", timeOfDay);
-	compute_audio.setUniform1f("rms", 1);
+	compute_audio.setUniform1f("rms", audioVector[0].value.x);
 	ofSetColor(255);
 	ofDrawRectangle(0, 0, mapWidth, mapHeight);
 	compute_audio.end();
@@ -175,8 +209,8 @@ void Biomass::update(ofTexture opticalFlowTexture){
 void Biomass::draw() {
 	float time = ofGetElapsedTimef();
 	
-	float sun_x = (mapWidth / 2) + (2 * mapWidth / 3) * cos(timeOfDay);
-	float sun_y = (mapHeight / 2) + (2 * mapHeight / 3) * sin(timeOfDay);
+	float sun_x = (mapWidth / 2) + (2 * mapWidth / 3) * std::cos(timeOfDay);
+	float sun_y = (mapHeight / 2) + (2 * mapHeight / 3) * std::sin(timeOfDay);
 	float sun_z = 25 + (10 * sin(timeOfMonth));
 
 	glm::vec3 colourC = glm::vec3(1., 0., 0.);
@@ -192,8 +226,9 @@ void Biomass::draw() {
 	trailFbo.end();
 
 	// trailFbo.draw(0, 0);
+	// reactionFbo.draw(0, 0, mapWidth, mapHeight);
 
-	display = 1;
+	// display = 6;
 	if (display == 0) {
 		ofClear(255,255,255, 0);
 		renderer.begin();
@@ -240,7 +275,7 @@ void Biomass::draw() {
 		reaction_renderer.setUniform3f("colourC", colourC.x, colourC.y, colourC.z);
 		reaction_renderer.setUniform3f("colourD", colourD.x, colourD.y, colourD.z);
 		reaction_renderer.setUniform3f("light", sun_x, sun_y, sun_z);
-		reaction_renderer.setUniform1f("chem_height", chemHeight);
+		reaction_renderer.setUniform1f("chemHeight", chemHeight);
 		reaction_renderer.setUniformTexture("reactionMap", reactionFbo.getTexture(), 0);
 		reaction_renderer.setUniformTexture("audioMap", audioFbo.getTexture(), 1);
 
@@ -253,16 +288,12 @@ void Biomass::draw() {
 		ofClear(255,255,255, 0);
 		simple_renderer.begin();
 		simple_renderer.setUniform2i("resolution", mapWidth, mapHeight);
-		simple_renderer.setUniform3f("colourA", colourA.x, colourA.y, colourA.z);
-		simple_renderer.setUniform3f("colourB", colourB.x, colourB.y, colourB.z);
-		simple_renderer.setUniform3f("light", sun_x, sun_y, sun_z);
-		simple_renderer.setUniform1f("chem_height", chemHeight);
-		simple_renderer.setUniform1f("trail_height", trailHeight);
+		simple_renderer.setUniform2i("screen_res", ofGetWidth(), ofGetHeight());
+		simple_renderer.setUniform3f("colourC", colourC.x, colourC.y, colourC.z);
+		simple_renderer.setUniform3f("colourD", colourD.x, colourD.y, colourD.z);
 		simple_renderer.setUniform1i("opticalFlowDownScale", cvDownScale);
 		simple_renderer.setUniform1i("display", display);
-		simple_renderer.setUniformTexture("flowMap", flowFbo.getTexture(), 0);
-		simple_renderer.setUniformTexture("reactionMap", reactionFbo.getTexture(), 1);
-		simple_renderer.setUniformTexture("trailMap", trailFbo.getTexture(), 2);
+		simple_renderer.setUniformTexture("audioMap", audioFbo.getTexture(), 3);
 		
 		ofSetColor(255);
 		ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
@@ -270,6 +301,143 @@ void Biomass::draw() {
 		simple_renderer.end();
 	} else if (display == 5) {
 		flowFbo.draw(0, 0, ofGetWidth(), ofGetHeight());
+	} else if (display == 6) {
+
+		// ofEnableLighting();
+		// material.begin();
+
+		float planeOffset = 20.;
+
+		float centreX = ofGetWidth() / 2;
+		float centreY = ofGetHeight() / 2;
+		float centreZ = 0.;
+    	camera.lookAt(glm::vec3(centreX, centreY + 200., centreZ));
+
+		float cameraDist = 700. + (300. * std::sin(timeOfDay * 2));
+		float cameraX = centreX + (cameraDist * std::sin(timeOfDay));
+		float cameraY = centreY - 500. + (600 * std::sin(timeOfDay * 3));
+		float cameraZ = centreZ + (cameraDist * std::cos(timeOfDay));
+		camera.setPosition(cameraX, cameraY, cameraZ);
+
+		float lightDist = 100.;
+		float sunX = centreX + (lightDist * -1 * std::sin(timeOfDay / 1.2));
+		float sunY = centreY - 2000. + (100 * std::sin(timeOfDay / 12.));
+		float sunZ = centreZ + (lightDist * -1 * std::cos(timeOfDay / 1.2));
+
+		// light.setPosition(sunX, sunY, sunZ);
+
+		camera.begin();
+
+		// light.enable();
+
+		float angle = 90.;
+
+		// audio_renderer.begin();
+		// audio_renderer.setUniform2i("resolution", mapWidth, mapHeight);
+		// audio_renderer.setUniform3f("colourA", colourA.x, colourA.y, colourA.z);
+		// audio_renderer.setUniform3f("colourB", colourB.x, colourB.y, colourB.z);
+		// audio_renderer.setUniform3f("colourC", colourC.x, colourC.y, colourC.z);
+		// audio_renderer.setUniform3f("colourD", colourD.x, colourD.y, colourD.z);
+		// audio_renderer.setUniformTexture("audioMap", audioFbo.getTexture(), 1);
+
+		// ofPushMatrix();
+
+		// // translate plane into center screen.
+		// ofTranslate(centreX, centreY + planeOffset, centreZ);
+		// ofRotateDeg(angle, 1, 0, 0);
+
+		// audioPlane.draw();
+
+		// ofPopMatrix();
+
+		// audio_renderer.end();
+
+		// reaction_renderer.begin();
+		// reaction_renderer.setUniform2i("resolution", mapWidth, mapHeight);
+		// reaction_renderer.setUniform3f("colourA", colourA.x, colourA.y, colourA.z);
+		// reaction_renderer.setUniform3f("colourB", colourB.x, colourB.y, colourB.z);
+		// reaction_renderer.setUniform3f("colourC", colourC.x, colourC.y, colourC.z);
+		// reaction_renderer.setUniform3f("colourD", colourD.x, colourD.y, colourD.z);
+		// reaction_renderer.setUniform3f("light", sun_x, sun_y, sun_z);
+		// reaction_renderer.setUniform1f("chemHeight", chemHeight);
+		// reaction_renderer.setUniformTexture("reactionMap", reactionFbo.getTexture(), 0);
+		// reaction_renderer.setUniformTexture("audioMap", audioFbo.getTexture(), 1);
+
+		// ofPushMatrix();
+
+		// // translate plane into center screen.
+		// ofTranslate(centreX, centreY, centreZ);
+		// ofRotateDeg(angle, 1, 0, 0);
+
+		// reactionPlane.draw();
+
+		// ofPopMatrix();
+
+		// reaction_renderer.end();
+
+		// physarum_renderer.begin();
+		// physarum_renderer.setUniform2i("resolution", mapWidth, mapHeight);
+		// physarum_renderer.setUniform3f("colourC", colourC.x, colourC.y, colourC.z);
+		// physarum_renderer.setUniform3f("colourD", colourD.x, colourD.y, colourD.z);
+		// physarum_renderer.setUniform3f("light", sun_x, sun_y, sun_z);
+		// physarum_renderer.setUniform1f("trailHeight", trailHeight);
+		// physarum_renderer.setUniformTexture("trailMap", trailFbo.getTexture(), 4);
+		// physarum_renderer.setUniformTexture("audioMap", audioFbo.getTexture(), 2);
+
+		// ofPushMatrix();
+
+		// // translate plane into center screen.
+		// ofTranslate(centreX, centreY - planeOffset, centreZ);
+		// ofRotateDeg(angle, 1, 0, 0);
+
+		// physarumPlane.draw();
+
+		// ofPopMatrix();
+
+		// physarum_renderer.end();
+
+		plane_renderer.begin();
+		plane_renderer.setUniform2i("resolution", mapWidth, mapHeight);
+		plane_renderer.setUniform3f("colourA", colourA.x, colourA.y, colourA.z);
+		plane_renderer.setUniform3f("colourB", colourB.x, colourB.y, colourB.z);
+		plane_renderer.setUniform3f("light", sun_x, sun_y, sun_z);
+		plane_renderer.setUniform1f("chemHeight", chemHeight);
+		plane_renderer.setUniform1f("trailHeight", trailHeight);
+		plane_renderer.setUniform1f("time", time);
+		plane_renderer.setUniform1f("bpm", bps);
+		plane_renderer.setUniformTexture("flowMap", flowFbo.getTexture(), 4);
+		plane_renderer.setUniformTexture("reactionMap", reactionFbo.getTexture(), 5);
+		plane_renderer.setUniformTexture("trailMap", trailFbo.getTexture(), 6);
+		
+		ofPushMatrix();
+
+		// translate plane into center screen.
+		ofTranslate(centreX, centreY - planeOffset, centreZ);
+		ofRotateDeg(angle, 1, 0, 0);
+
+		plane.draw();
+
+		ofPopMatrix();
+
+		plane_renderer.end();
+
+		// ofPushMatrix();
+
+		// // translate plane into center screen.
+		// ofTranslate(centreX, centreY, centreZ);
+		// randomSphere.drawWireframe();
+
+		// ofPopMatrix();
+
+		// light.disable();
+
+		camera.end();
+
+		// material.end();
+		// ofDisableLighting();
+
+		// ofSetColor( light.getDiffuseColor() );
+		// light.draw();
 	}
 }
 

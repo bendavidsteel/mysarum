@@ -1,37 +1,20 @@
 #version 440
 
-struct Species{
-	vec4 colour;
-	vec4 sensorAttributes;
-	vec4 movementAttributes;
-};
-
-layout(std140, binding=2) buffer species{
-    Species allSpecies[];
-};
-
-uniform sampler2DRect flowMap;
-uniform sampler2DRect reactionMap;
-uniform sampler2DRect trailMap;
 uniform sampler2DRect optFlowMap;
 uniform sampler2DRect audioMap;
 
-uniform vec3 colourA;
-uniform vec3 colourB;
 uniform vec3 colourC;
 uniform vec3 colourD;
 uniform ivec2 resolution;
-uniform vec3 light;
-uniform float chem_height;
-uniform float trail_height;
 uniform int opticalFlowDownScale;
 uniform int display;
+uniform ivec2 screen_res;
 
 out vec4 out_color;
 
 void main()
 {
-	vec2 coord = gl_FragCoord.xy;
+	vec2 coord = gl_FragCoord.xy * resolution / screen_res;
 
 	vec2 audio = texture(audioMap, coord).xy;
 	vec3 audioColour = colourC * audio.x;

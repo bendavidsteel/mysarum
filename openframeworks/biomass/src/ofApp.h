@@ -38,7 +38,7 @@ class ofApp : public ofBaseApp, public ofxMidiListener{
 		ofSoundStream soundStream;
 		ofxMidiIn midiIn;
 
-		ofImage artificerImage;
+		ofImage maskImage;
 
 		ofxUDPManager udpConnection;
 
@@ -50,6 +50,7 @@ class ofApp : public ofBaseApp, public ofxMidiListener{
 
 		// both
 		ofShader postprocess;
+		ofShader preprocess;
 
 		ofPixels pixels;
 		ofFbo fbo;

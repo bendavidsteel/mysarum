@@ -5,10 +5,10 @@ uniform float bass;
 uniform ivec2 mapSize;
 uniform ivec2 resolution;
 uniform sampler2DRect tex;
-uniform sampler2DRect artificer;
+uniform sampler2DRect mask;
 uniform float bps;
 
-out vec4 color;
+out vec4 out_color;
 
 #define SHOW_NOISE 0
 #define SRGB 0
@@ -162,9 +162,9 @@ void main() {
     // }
 
     ivec2 sampled_coord = ivec2(mapped_uv.xy * mapSize.xy);
-    color = vec4(0.);
+    vec4 color = vec4(0.);
     color.a = 1.0;
-    float sharpness = 0.5;
+    float sharpness = 1.;
     color.rgb += sharpness * texture(tex, sampled_coord + ivec2(0, 0)).rgb;
     color.rgb += ((1 - sharpness) / 4.) * texture(tex, sampled_coord + ivec2(1, 0)).rgb;
     color.rgb += ((1 - sharpness) / 4.) * texture(tex, sampled_coord + ivec2(-1, 0)).rgb;
@@ -224,4 +224,6 @@ void main() {
 
     // invert
     // color.rgb = vec3(1.0) - color.rgb;
+
+    out_color = texture(tex, gl_FragCoord.xy);
 }

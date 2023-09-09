@@ -14,7 +14,7 @@ void Biomass::setup(){
 
 	mapFactor = 1.;
 	mapWidth = 2000.;
-	mapHeight = 2000.;
+	mapHeight = 1500.;
 
 	colourA = glm::vec3(1., 0., 0.);
 	colourB = glm::vec3(0., 1., 0.);
@@ -55,14 +55,7 @@ void Biomass::setup(){
 	reactionDiffusion.setup(mapWidth, mapHeight);
 
 	// load general shaders
-	compute_flow.load("generic.vert", "compute_flow.frag");
-
-	renderer.load("generic.vert", "renderer.frag");
-	plane_renderer.load("plane_renderer.vert", "plane_renderer.frag");
-	simple_renderer.load("generic.vert", "simple_renderer.frag");
-	physarum_renderer.load("physarum_renderer.vert", "physarum_renderer.frag");
-	reaction_renderer.load("reaction_renderer.vert", "reaction_renderer.frag");
-	audio_renderer.load("audio_renderer.vert", "audio_renderer.frag");
+	reloadShaders();
 
 	int planeWidth = 1200;
 	int planeHeight = 1200;
@@ -311,7 +304,7 @@ void Biomass::draw() {
 		float centreX = ofGetWidth() / 2;
 		float centreY = ofGetHeight() / 2;
 		float centreZ = 0.;
-    	camera.lookAt(glm::vec3(centreX, centreY + 200., centreZ));
+    	camera.lookAt(glm::vec3(centreX, centreY, centreZ));
 
 		float cameraDist = 700. + (300. * std::sin(timeOfDay * 2));
 		float cameraX = centreX + (cameraDist * std::sin(timeOfDay));
@@ -492,8 +485,17 @@ void Biomass::setDayRate(float dayRate) {
 }
 
 void Biomass::reloadShaders() {
+	compute_flow.load("generic.vert", "compute_flow.frag");
+
 	renderer.load("generic.vert", "renderer.frag");
+	plane_renderer.load("plane_renderer.vert", "plane_renderer.frag");
+	simple_renderer.load("generic.vert", "simple_renderer.frag");
+	physarum_renderer.load("physarum_renderer.vert", "physarum_renderer.frag");
+	reaction_renderer.load("reaction_renderer.vert", "reaction_renderer.frag");
+	audio_renderer.load("audio_renderer.vert", "audio_renderer.frag");
+
 	reactionDiffusion.reloadShaders();
+	physarum.reloadShaders();
 }
 
 void Biomass::setDisplay(int d) {

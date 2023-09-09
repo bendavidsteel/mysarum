@@ -30,6 +30,7 @@ class ofApp : public ofBaseApp, public ofxMidiListener{
 		void audioIn(ofSoundBuffer & input);
 		void newMidiMessage(ofxMidiMessage& eventArgs);
 		void newInput(int key);
+		void reloadShaders();
 
 		Biomass biomass;
 		Evolution evolution;
@@ -54,6 +55,8 @@ class ofApp : public ofBaseApp, public ofxMidiListener{
 
 		ofPixels pixels;
 		ofFbo fbo;
+		ofFbo last;
+		ofFbo current;
 
 		// video and optical flow
 		ofVideoGrabber 		vidGrabber;

@@ -87,11 +87,7 @@ void Physarum::setup(int mapWidth, int mapHeight, int mapFactor) {
     agentFbo.getTexture().bindAsImage(3, GL_READ_WRITE);
 
     // load slime shaders
-	compute_agents.setupShaderFromFile(GL_COMPUTE_SHADER,"compute_agents.glsl");
-	compute_agents.linkProgram();
-
-	compute_decay.load("generic.vert", "compute_decay.frag");
-	compute_diffuse.load("generic.vert", "compute_diffuse.frag");
+	reloadShaders();
 
 }
 
@@ -289,7 +285,10 @@ void Physarum::setAgentFlowMag(float agentFlowMag) {
 
 void Physarum::reloadShaders() {
     compute_agents.setupShaderFromFile(GL_COMPUTE_SHADER,"compute_agents.glsl");
-    compute_agents.linkProgram();
+	compute_agents.linkProgram();
+
+	compute_decay.load("generic.vert", "compute_decay.frag");
+	compute_diffuse.load("generic.vert", "compute_diffuse.frag");
 }
 
 void Physarum::exit() {

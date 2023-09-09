@@ -12,7 +12,7 @@ void ReactionDiffusion::setup(int mapWidth, int mapHeight) {
 	lastReactionFbo.allocate(mapWidth, mapHeight, GL_RG16);
 
     // load reaction diffusion shaders
-	compute_reaction.load("generic.vert", "compute_reaction.frag");
+	reloadShaders();
 
 }
 
@@ -88,8 +88,7 @@ ofFbo ReactionDiffusion::getReactionFbo() {
 }
 
 void ReactionDiffusion::reloadShaders() {
-    compute_reaction.setupShaderFromFile(GL_COMPUTE_SHADER,"compute_reaction.glsl");
-	compute_reaction.linkProgram();
+    compute_reaction.load("generic.vert", "compute_reaction.frag");
 }
 
 void ReactionDiffusion::reSpawnReaction() {

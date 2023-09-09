@@ -2,10 +2,12 @@
 
 uniform float time;
 uniform float bass;
+uniform float treble;
 uniform ivec2 mapSize;
 uniform ivec2 resolution;
 uniform sampler2DRect tex;
 uniform sampler2DRect artificer;
+uniform sampler2DRect mask;
 uniform float bps;
 
 out vec4 out_color;
@@ -116,5 +118,39 @@ void main() {
     vec2 coord = gl_FragCoord.xy;
     vec2 uv = coord / resolution.xy;
 
-    out_color = vec4(0.0, 0.0, 0.0, 1.0);
+    vec2 centre = vec2(0.5, 0.5);
+    vec2 from_centre = uv - centre;
+
+    float bpm = 160.;
+    float bps = bpm / 60;
+
+    from_centre += 0.2 * vec2(sin(bps * time), cos(bps * time));
+
+    float r = length(from_centre);
+    float theta = atan(from_centre.y, from_centre.x);
+
+    r += 0.01 * random(theta);
+    theta += 0.01 * random(r);
+
+    theta += 2.;
+
+    uv = centre + vec2(cos(theta), sin(theta)) * r;
+
+    vec2 rand = vec2(random(time), random(time + 2.));
+    vec2 randForce = (2 * rand) - 1.;
+    randForce *= 0.01;
+    uv += randForce;
+
+    coord = uv * resolution.xy;
+
+    vec3 colour = vec3(1., 0., 0.);
+
+    colour += texture(tex, coord).rgb;
+
+    colour.rgb *= get_colour_rotation(int(3. + 3. * sin(bps * time)));
+
+    out_color = vec4(colour, 1.0);
+
+    float mask = texture(mask, gl_FragCoord.xy).a;
+    out_color.a *= mask;
 }

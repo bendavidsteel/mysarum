@@ -2,6 +2,7 @@
 
 uniform float time;
 uniform float bass;
+uniform float treble;
 uniform ivec2 mapSize;
 uniform ivec2 resolution;
 uniform sampler2DRect tex;
@@ -138,10 +139,14 @@ void main() {
     float theta = atan(from_centre.y, from_centre.x);
     float r = length(from_centre);
 
-    // r *= 0.9 + 0.1 * pow(bass, 2.);
+    float bass_boost = 0.5;
+    r *= (1 - bass_boost) + bass_boost * pow(bass, 4.);
+    // r *= (1. + 0.2 * random(theta));
+
+    theta *= (1. + pow(treble, 5.));
     // theta += 0.01 * random(r);
 
-    // uv = centre + vec2(cos(theta), sin(theta)) * r;
+    uv = centre + vec2(cos(theta), sin(theta)) * r;
 
     // uv += 0.1 * vec2(sin(0.25 * bps * time), cos(0.25 * bps * time));
 
@@ -153,10 +158,10 @@ void main() {
     // mapped_uv += 0.25 + 0.25 * vec2(sin(speed * time), cos(speed * time));
 
     
-    // centre = vec2(0.5);// + 0.3 * vec2(sin(speed * time), cos(speed * time));
-    // from_centre = uv - centre;
+    centre = vec2(0.5);// + 0.3 * vec2(sin(speed * time), cos(speed * time));
+    from_centre = uv - centre;
     // r = pow(pow(from_centre.x, 2.0) + (pow(from_centre.y, 2.0) / pow(1.5, 2)), 0.5);
-    // if (r < bass / 2.) {
+    // if (r < bass / 3.) {
     //     float mapped_r = pow(r, 0.5);
     //     mapped_uv = centre + from_centre * mapped_r;
     // }
@@ -164,12 +169,52 @@ void main() {
     ivec2 sampled_coord = ivec2(mapped_uv.xy * mapSize.xy);
     vec4 color = vec4(0.);
     color.a = 1.0;
-    float sharpness = 1.;
-    color.rgb += sharpness * texture(tex, sampled_coord + ivec2(0, 0)).rgb;
-    color.rgb += ((1 - sharpness) / 4.) * texture(tex, sampled_coord + ivec2(1, 0)).rgb;
-    color.rgb += ((1 - sharpness) / 4.) * texture(tex, sampled_coord + ivec2(-1, 0)).rgb;
-    color.rgb += ((1 - sharpness) / 4.) * texture(tex, sampled_coord + ivec2(0, 1)).rgb;
-    color.rgb += ((1 - sharpness) / 4.) * texture(tex, sampled_coord + ivec2(0, -1)).rgb;
+
+    int offset = int(50 * pow(bass, 2.));
+
+    ivec2 offset_left = offset_dist * vec2(random(time), random(time + 10.));
+    ivec2 offset_right = mat2(-1., 0., 0., 0.) * offset_left;
+    ivec2 offset_up = mat2()
+
+    vec3 centre_sample = texture(tex, sampled_coord + ivec2(0, 0)).rgb;
+    vec3 right_sample = texture(tex, sampled_coord + ivec2(offset, 0)).rgb;
+    vec3 left_sample = texture(tex, sampled_coord + ivec2(-offset, 0)).rgb;
+    vec3 down_sample = texture(tex, sampled_coord + ivec2(0, offset)).rgb;
+    vec3 up_sample = texture(tex, sampled_coord + ivec2(0, -offset)).rgb;
+
+    float centre_brightness = dot(centre_sample, vec3(0.333));
+    float right_brightness = dot(right_sample, vec3(0.333));
+    float left_brightness = dot(left_sample, vec3(0.333));
+    float down_brightness = dot(down_sample, vec3(0.333));
+    float up_brightness = dot(up_sample, vec3(0.333));
+
+    if (down_brightness > centre_brightness) {
+        color.rgb = down_sample;
+    }
+
+    if (up_brightness > centre_brightness) {
+        color.rgb = up_sample;
+    }
+
+    if (left_brightness > centre_brightness) {
+        color.rgb = left_sample;
+    }
+
+    if (right_brightness > centre_brightness) {
+        color.rgb = right_sample;
+    }
+
+    // float sharpness = 1.;
+    // color.rgb += sharpness * centre_sample;
+    // color.rgb += ((1 - sharpness) / 4.) * right_sample;
+    // color.rgb += ((1 - sharpness) / 4.) * left_sample;
+    // color.rgb += ((1 - sharpness) / 4.) * down_sample;
+    // color.rgb += ((1 - sharpness) / 4.) * up_sample;
+
+    float bpm = 160.;
+    float bps = bpm / 60;
+
+    color.rgb *= get_colour_rotation(int(3. + 3. * sin(0.25 * bps * time)));
 
     #if SRGB
     color = pow(color, vec4(2.2));
@@ -223,7 +268,21 @@ void main() {
     // }
 
     // invert
-    // color.rgb = vec3(1.0) - color.rgb;
+    // color.rgb = vec3(1. 0) - color.rgb;
 
-    out_color = texture(tex, gl_FragCoord.xy);
+    // coord = gl_FragCoord.xy * resolution / mapSize;
+
+    vec2 rcoord = uv * resolution.xy;
+    ivec2 rand_rect = ivec2(500 * random(time), 200 * random(time + 3.));
+    ivec2 qcoord = ivec2(rcoord / rand_rect);
+    vec2 quv = vec2(qcoord) / resolution.xy;
+    if (random(quv) < 0.1 * pow(bass, 2.)) {
+        // color.rgb = vec3(dot(color.rgb, vec3(1.)) / 3.);
+        color.rgb = texture(tex, sampled_coord + ivec2(50, 200)).rgb;
+    }
+
+    out_color = color;
+
+    float mask = texture(mask, gl_FragCoord.xy).a;
+    out_color.a *= mask;
 }

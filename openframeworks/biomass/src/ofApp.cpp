@@ -20,12 +20,11 @@ void ofApp::setup(){
 	evolution.setup(biomass);
 
 	// general setup
-	int mapWidth = biomass.getMapWidth();
-	int mapHeight = biomass.getMapHeight();
-	fbo.allocate(mapWidth, mapHeight, GL_RGBA8);
+	fbo.allocate(ofGetWidth(), ofGetHeight(), GL_RGBA8);
+	last.allocate(ofGetWidth(), ofGetHeight(), GL_RGBA8);
+	current.allocate(ofGetWidth(), ofGetHeight(), GL_RGBA8);
 
-	postprocess.load("generic.vert", "postprocess.frag");
-	preprocess.load("generic.vert", "preprocess.frag");
+	reloadShaders();
 
 	// sound
 	ofSoundStreamSettings settings;
@@ -33,7 +32,7 @@ void ofApp::setup(){
 	// auto devices = soundStream.getDeviceList(ofSoundDevice::Api::ALSA);
 	auto devices = soundStream.getDeviceList();
 	if(!devices.empty()){
-		settings.setInDevice(devices[1]);
+		settings.setInDevice(devices[0]);
 	}
 	// settings.setApi(ofSoundDevice::Api::ALSA);
 
@@ -79,8 +78,8 @@ void ofApp::setup(){
 	// video and optical flow setup
 	vidGrabber.setVerbose(true);
 	vidGrabber.setDeviceID(0);
-	int sourceWidth = mapWidth;
-	int sourceHeight = mapHeight;
+	int sourceWidth = ofGetWidth();
+	int sourceHeight = ofGetHeight();
 	vidGrabber.initGrabber(sourceWidth, sourceHeight);
 	
 	blurAmount = 15;
@@ -130,7 +129,7 @@ void ofApp::setup(){
 
 	udpConnection.Setup(udpSettings);
 
-	maskImage.load("BS-screen-mask.png");
+	maskImage.load("BS3-mask.png");
 	maskImage.resize(ofGetWidth(), ofGetHeight());
 }
 
@@ -205,7 +204,7 @@ void ofApp::update(){
 			}
 		}
 	}
-	optFlowTexture.loadData(opticalFlowPixels);
+	// optFlowTexture.loadData(opticalFlowPixels);
 
 	// audio analysis
 	vector<float> melBands = audioAnalyzer.getValues(MEL_BANDS, 0, highSmoothing);
@@ -260,8 +259,7 @@ void ofApp::update(){
 	}
 
 	if (bReloadShader) {
-		postprocess.load("generic.vert", "postprocess.frag");
-		biomass.reloadShaders();
+		reloadShaders();
 		bReloadShader = false;
 	}
 	
@@ -275,17 +273,24 @@ void ofApp::draw() {
 
 	float bps = bpmDetector.getBPM() / 60.;
 	vector<float> melBands = audioAnalyzer.getValues(MEL_BANDS, 0, highSmoothing);
+	float bass = ofMap(melBands[0], DB_MIN, DB_MAX, 0., 1., true);
+	float treble = ofMap(melBands[22], DB_MIN, DB_MAX, 0., 1., true);
 
-	ofTexture tex = fbo.getTexture();
+	last.begin();
+	fbo.draw(0, 0);
+	last.end();
+
 	fbo.begin();
+	ofClear(255, 255, 255, 0);
 	preprocess.begin();
-	preprocess.setUniformTexture("tex", tex, 0);
+	preprocess.setUniformTexture("last", last, 0);
 	preprocess.setUniformTexture("mask", maskImage.getTexture(), 1);
 	preprocess.setUniform2i("mapSize", biomass.getMapWidth(), biomass.getMapHeight());
 	preprocess.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
 	preprocess.setUniform1f("time", time);
 	preprocess.setUniform1f("bps", bps);
-	preprocess.setUniform1f("bass", melBands[0]);
+	preprocess.setUniform1f("bass", bass);
+	preprocess.setUniform1f("treble", treble);
 	ofSetColor(255);
 	ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
 	preprocess.end();
@@ -297,17 +302,22 @@ void ofApp::draw() {
 	bool postprocessEnabled = true;
 
 	if (postprocessEnabled) {
-		tex = fbo.getTexture();
+
+		current.begin();
+		fbo.draw(0, 0);
+		current.end();
 
 		fbo.begin();
+		ofClear(0, 0, 0, 255);
 		postprocess.begin();
-		postprocess.setUniformTexture("tex", tex, 0);
+		postprocess.setUniformTexture("tex", current.getTexture(), 0);
 		postprocess.setUniformTexture("mask", maskImage.getTexture(), 1);
 		postprocess.setUniform2i("mapSize", biomass.getMapWidth(), biomass.getMapHeight());
 		postprocess.setUniform2i("resolution", ofGetWidth(), ofGetHeight());
 		postprocess.setUniform1f("time", time);
 		postprocess.setUniform1f("bps", bps);
-		postprocess.setUniform1f("bass", melBands[0]);
+		postprocess.setUniform1f("bass", bass);
+		postprocess.setUniform1f("treble", treble);
 		ofSetColor(255);
 		ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
 		postprocess.end();
@@ -316,7 +326,7 @@ void ofApp::draw() {
 
 	fbo.draw(0, 0);
 
-	ofDrawBitmapString(ofGetFrameRate(),20,20);
+	// ofDrawBitmapString(ofGetFrameRate(),20,20);
 }
 
 void ofApp::exit(){
@@ -401,6 +411,8 @@ void ofApp::keyPressed(int key){
 		newInput(69);
 	} else if (key == 'b') {
 		newInput(70);
+	} else if (key == ' ') {
+		reloadShaders();
 	}
 }
 
@@ -554,7 +566,13 @@ void ofApp::newInput(int key) {
 		biomass.setPoints(newPoints);
 	} else if (key == 72) {
 		bReloadShader = true;
-		biomass.reloadShaders();
+		reloadShaders();
 	}
+}
+
+void ofApp::reloadShaders() {
+	biomass.reloadShaders();
+	preprocess.load("generic.vert", "preprocess.frag");
+	postprocess.load("generic.vert", "postprocess.frag");
 }
 

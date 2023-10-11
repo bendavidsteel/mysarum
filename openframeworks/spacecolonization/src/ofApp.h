@@ -4,6 +4,13 @@
 #include "ofBufferObject.h"
 #include "ofxSpatialHash.h"
 
+struct Node {
+	vector<Node> children;
+	int idx;
+	float width;
+	float opacity;
+};
+
 class ofApp : public ofBaseApp{
 
 	public:
@@ -27,10 +34,15 @@ class ofApp : public ofBaseApp{
 		void audioIn(float * input, int bufferSize, int nChannels);
 
 		vector<ofVec2f> nodePositions;
+		vector<glm::vec3> nodeVertices;
+		vector<unsigned int> nodeIndices;
+		vector<ofFloatColor> nodeColors;
 		vector<ofVec2f> nodeAttractions;
+
 		vector<ofVec2f> attractors;
 
-		ofMesh nodes;
+		ofVbo nodeVbo;
+		vector<Node> nodeRoots;
 
 		float attractionDistance;
 		float killDistance;

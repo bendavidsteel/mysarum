@@ -1,6 +1,8 @@
 #include "ofApp.h"
 #include "ofConstants.h"
 
+#define MAX_NODES 1000000
+
 ofApp::ofApp():
 	nodeHash(nodePositions),
 	attractorHash(attractors)
@@ -17,21 +19,31 @@ void ofApp::setup(){
 		attractors.push_back(ofVec2f(ofRandomWidth(), ofRandomHeight()));
 	}
 
-	nodes.setMode(OF_PRIMITIVE_LINES);
+	shader.load("node.vert", "node.frag", "node.geom");
+
+	// create node vbo
+	nodeVertices.reserve(MAX_NODES * 2);
+	nodeIndices.reserve(MAX_NODES * 2);
+	nodeColors.reserve(MAX_NODES);
+	nodeWidths.reserve(MAX_NODES);
 
 	// create initial nodes
-	int numNodes = int(ofRandom(3, 8));
-	nodePositions.resize(numNodes);
-	nodeAttractions.resize(numNodes);
-	for (int i = 0; i < numNodes; i++) {
-		nodePositions[i] = ofVec2f(ofRandomWidth(), ofRandomHeight());
-		nodeAttractions[i] = ofVec2f(0, 0);
-
-		nodes.addVertex(ofPoint(nodePositions[i].x, nodePositions[i].y, 0.));
-		nodes.addVertex(ofPoint(nodePositions[i].x, nodePositions[i].y, 0.));
-		nodes.addIndex(2*i);
-		nodes.addIndex(2*i+1);
+	int numInitialNodes = int(ofRandom(3, 8));
+	nodePositions.resize(numInitialNodes);
+	nodeAttractions.resize(numInitialNodes);
+	for (int i = 0; i < numInitialNodes; i++) {
+		ofVec2f pos = ofVec2f(ofRandomWidth(), ofRandomHeight());
+		addNode(pos, pos, 2 * i, true);
 	}
+
+	nodeVbo.setVertexData(nodeVertices.data(), MAX_NODES * 2, GL_DYNAMIC_DRAW);
+	nodeVbo.setIndexData(nodeIndices.data(), MAX_NODES * 2, GL_DYNAMIC_DRAW);
+	nodeVbo.setColorData(nodeColors.data(), MAX_NODES, GL_DYNAMIC_DRAW);
+	
+	shader.begin();
+	int widthAttLoc = shader.getAttributeLocation("nodeWidth");
+	vbo.setAttributeData(widthAttLoc, nodeWidths, 1, MAX_NODES, GL_DYNAMIC_DRAW);
+	shader.end();
 
 	attractionDistance = ofGetWidth() / 4;
 	killDistance = ofGetWidth() / 1000;
@@ -59,18 +71,15 @@ void ofApp::update(){
 	ofx::KDTree<ofVec2f>::SearchResults attractorSearchResults;
 
 	// loop through nodes with attraction, and add a node in the direction of the attraction
+	bool nodeAdded = false;
 	int numNodes = nodePositions.size();
 	for (int i = 0; i < numNodes; i++) {
 		if (nodeAttractions[i].length() > 0) {
+			nodeAdded = true;
+			ofVec2f orgPos = nodePositions[i];
 			ofVec2f newPos = nodePositions[i] + nodeAttractions[i].normalize() * segmentLength;
 
-			nodes.addVertex(ofPoint(nodePositions[i].x, nodePositions[i].y, 0.));
-			nodes.addVertex(ofPoint(newPos.x, newPos.y, 0.));
-			nodes.addIndex(nodes.getNumVertices() - 2);
-			nodes.addIndex(nodes.getNumVertices() - 1);
-
-			nodeAttractions.push_back(ofVec2f(0, 0));
-			nodePositions.push_back(newPos);
+			addNode(orgPos, newPos, nodeIndices.back() + 1, false, );
 
 			// check if new node is close to an attractor, and remove attractor if so
 			attractorSearchResults.clear();
@@ -84,6 +93,12 @@ void ofApp::update(){
 			nodeAttractions[i] = ofVec2f(0, 0);
 		}
 	}
+
+	if (nodeAdded) {
+		nodeVbo.updateVertexData(nodeVertices);
+		nodeVbo.addIndices(nodeIndices);
+		nodeVbo.addColors(nodeColors);
+	}
 }
 
 //--------------------------------------------------------------
@@ -91,13 +106,17 @@ void ofApp::draw() {
 	// draw nodes
 	ofSetColor(255);
 
-	nodes.draw();
+	nodeVbo.drawElements(GL_LINES, nodeVbo.getNumIndices());
 
 	// draw attractors
-	// ofSetColor(255, 0, 0);
-	// for (int i = 0; i < attractors.size(); i++) {
-	// 	ofDrawCircle(attractors[i], 1);
-	// }
+	bool drawAttractors = false;
+	if (drawAttractors)
+	{
+		ofSetColor(255, 0, 0);
+		for (int i = 0; i < attractors.size(); i++) {
+			ofDrawCircle(attractors[i], 1);
+		}
+	}
 
 	// draw frame rate
 	ofSetColor(255);
@@ -106,6 +125,30 @@ void ofApp::draw() {
 
 void ofApp::exit(){
     
+}
+
+void ofApp::addNode(ofVec2f posA, ofVec2f posB, int idx, bool isRoot, Node* parent=NULL) {
+	nodePositions[i] = posB;
+	nodeAttractions[i] = ofVec2f(0, 0);
+
+	nodeVertices.push_back(glm::vec3(posA.x, posA.y, 0.));
+	nodeVertices.push_back(glm::vec3(posB.x, posB.y, 0.));
+	nodeIndices.push_back(idx);
+	nodeIndices.push_back(idx+1);
+	nodeColors.push_back(ofFloatColor(1, 1, 1, 1));
+	nodeColors.push_back(ofFloatColor(1, 1, 1, 1));
+
+	Node node = Node();
+	node.idx = i;
+	node.width = 1;
+	node.opacity = 1;
+
+	if (isRoot) {
+		nodeRoots.push_back(node);
+	}
+	else {
+		parent->children.push_back(node);
+	}
 }
 
 //--------------------------------------------------------------

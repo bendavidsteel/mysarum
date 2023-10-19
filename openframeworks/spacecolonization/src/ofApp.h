@@ -2,19 +2,12 @@
 
 #include "ofMain.h"
 #include "ofBufferObject.h"
-#include "ofxSpatialHash.h"
 
-struct Node {
-	vector<Node> children;
-	int idx;
-	float width;
-	float opacity;
-};
+#include "spacecolonization.h"
 
 class ofApp : public ofBaseApp{
 
 	public:
-		ofApp();
 		void setup();
 		void update();
 		void draw();
@@ -33,21 +26,5 @@ class ofApp : public ofBaseApp{
 		void gotMessage(ofMessage msg);
 		void audioIn(float * input, int bufferSize, int nChannels);
 
-		vector<ofVec2f> nodePositions;
-		vector<glm::vec3> nodeVertices;
-		vector<unsigned int> nodeIndices;
-		vector<ofFloatColor> nodeColors;
-		vector<ofVec2f> nodeAttractions;
-
-		vector<ofVec2f> attractors;
-
-		ofVbo nodeVbo;
-		vector<Node> nodeRoots;
-
-		float attractionDistance;
-		float killDistance;
-		float segmentLength;
-
-		ofx::KDTree<ofVec2f> nodeHash;
-		ofx::KDTree<ofVec2f> attractorHash;
+		SpaceColonization spaceColonization;
 };

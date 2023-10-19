@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path" : "${workspaceRoot}/../../../../addons/ofxPoco"
+		},
+		{
+			"path": "${workspaceRoot}/../../../../libs/openFrameworks"
+		}
+	],
+	"settings": {}
+}

@@ -10,8 +10,6 @@ class ofApp : public ofBaseApp{
 		void setup();
 		void update();
 		void draw();
-		void dirAsColorChanged(bool & dirAsColor);
-
 		void keyPressed(int key);
 		void keyReleased(int key);
 		void mouseMoved(int x, int y );
@@ -27,6 +25,7 @@ class ofApp : public ofBaseApp{
 		struct Particle{
 			glm::vec4 pos;
 			glm::vec4 vel;
+			glm::vec4 attr;
 			ofFloatColor color;
 		};
 
@@ -37,11 +36,12 @@ class ofApp : public ofBaseApp{
 		ofEasyCam camera;
 		ofVbo vbo;
 		ofxPanel gui;
-		ofParameter<int> numCompare;
+		ofParameter<float> fov;
 		ofParameter<float> attractionCoeff, alignmentCoeff, repulsionCoeff;
 		ofParameter<float> attractionMaxDist, alignmentMaxDist, repulsionMaxDist;
 		ofParameter<float> maxSpeed;
 		ofParameter<float> randomForce;
+		ofParameter<float> kuramotoStrength, kuramotoMaxDist;
 		ofParameterGroup shaderUniforms;
 		ofParameter<float> fps;
 		ofParameter<bool> dirAsColor;

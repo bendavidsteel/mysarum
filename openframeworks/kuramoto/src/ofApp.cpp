@@ -6,41 +6,44 @@ void ofApp::setup(){
 	compute.setupShaderFromFile(GL_COMPUTE_SHADER,"compute1.glsl");
 	compute.linkProgram();
 	camera.setFarClip(ofGetWidth()*10);
-	numParticles = 512;
+	numParticles = 1024;
 	particles.resize(numParticles);
 	for(auto & p: particles){
-		p.pos.x = ofRandom(-ofGetWidth()*0.5,ofGetWidth()*0.5);
-		p.pos.y = ofRandom(-ofGetHeight()*0.5,ofGetHeight()*0.5);
-		p.pos.z = 0.;//ofRandom(-ofGetHeight()*0.5,ofGetHeight()*0.5);
-		p.pos.w = 1;
-		p.vel = {0,0,0,0};
+		p.pos.x = ofRandom(0.,ofGetWidth());
+		p.pos.y = ofRandom(0.,ofGetHeight());
+		p.pos.z = ofRandom(0.,ofGetHeight());
+		p.pos.w = 1.;
+		p.vel.x = ofRandom(-1,1);
+		p.vel.y = ofRandom(-1,1);
+		p.vel.z = ofRandom(-1,1);
+		p.vel.w = 1.;
+		p.attr.x = ofRandom(2., 5.); // frequency of oscillation
 	}
 	particlesBuffer.allocate(particles,GL_DYNAMIC_DRAW);
 	particlesBuffer2.allocate(particles,GL_DYNAMIC_DRAW);
 
 	vbo.setVertexBuffer(particlesBuffer,4,sizeof(Particle));
-	vbo.setColorBuffer(particlesBuffer,sizeof(Particle),sizeof(glm::vec4)*2);
-	vbo.disableColors();
-	dirAsColor = false;
+	vbo.setColorBuffer(particlesBuffer,sizeof(Particle),sizeof(glm::vec4)*3);
+	vbo.enableColors();
 
 	ofBackground(0);
 	ofEnableBlendMode(OF_BLENDMODE_ADD);
 
 	gui.setup();
 	shaderUniforms.setName("shader params");
-	shaderUniforms.add(attractionCoeff.set("attraction",0.,0,1));
+	shaderUniforms.add(attractionCoeff.set("attraction",0.,0,10.));
 	shaderUniforms.add(attractionMaxDist.set("attractionMaxDist",100,0,1000));
-	shaderUniforms.add(alignmentCoeff.set("alignment",0.,0,1));
+	shaderUniforms.add(alignmentCoeff.set("alignment",0.,0,10.));
 	shaderUniforms.add(alignmentMaxDist.set("alignmentMaxDist",100,0,1000));
-	shaderUniforms.add(repulsionCoeff.set("repulsion",0.,0,1));
+	shaderUniforms.add(repulsionCoeff.set("repulsion",0.,0,10.));
 	shaderUniforms.add(repulsionMaxDist.set("repulsionMaxDist",50,0,1000));
-	shaderUniforms.add(maxSpeed.set("max_speed",2500,0,5000));
-	shaderUniforms.add(randomForce.set("random_force",0,0,5000));
-	shaderUniforms.add(numCompare.set("numCompare", 512, 0, particles.size()));
+	shaderUniforms.add(maxSpeed.set("maxSpeed",0.8,0.,1.));
+	shaderUniforms.add(randomForce.set("randomStrength",0.1,0.,1.));
+	shaderUniforms.add(fov.set("fov", 0., -1., 1.));
+	shaderUniforms.add(kuramotoStrength.set("kuramotoStrength", 0., -1., 1.));
+	shaderUniforms.add(kuramotoMaxDist.set("kuramotoMaxDist", 100., 0., 1000.));
 	gui.add(shaderUniforms);
 	gui.add(fps.set("fps",60,0,60));
-	gui.add(dirAsColor.set("dir as color",false));
-	dirAsColor.addListener(this,&ofApp::dirAsColorChanged);
 
 	particlesBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 0);
 	particlesBuffer2.bindBase(GL_SHADER_STORAGE_BUFFER, 1);
@@ -48,13 +51,16 @@ void ofApp::setup(){
 
 //--------------------------------------------------------------
 void ofApp::update(){
+	float time = ofGetElapsedTimef();
+
 	fps = ofGetFrameRate();
 
 	compute.begin();
 	compute.setUniforms(shaderUniforms);
-	compute.setUniform1i("numParticles",particles.size());
-	compute.setUniform1f("timeLastFrame",ofGetLastFrameTime());
-	compute.setUniform1f("elapsedTime",ofGetElapsedTimef());
+	compute.setUniform3i("resolution", ofGetWidth(), ofGetHeight(), ofGetHeight());
+	compute.setUniform1i("numAgents",particles.size());
+	compute.setUniform1f("time", time);
+	compute.setUniform1f("timeDelta", 1.);
 
 	// since each work group has a local_size of 1024 (this is defined in the shader)
 	// we only have to issue 1 / 1024 workgroups to cover the full workload.
@@ -70,32 +76,27 @@ void ofApp::update(){
 
 //--------------------------------------------------------------
 void ofApp::draw(){
+	camera.setPosition(ofGetWidth()*0.5, ofGetHeight()*0.5, -ofGetHeight());
+	camera.lookAt(glm::vec3(ofGetWidth()*0.5, ofGetHeight()*0.5, ofGetHeight()*0.5));
+
 	ofEnableBlendMode(OF_BLENDMODE_ADD);
 	camera.begin();
 
 	ofSetColor(255,70);
 	glPointSize(5);
 	vbo.draw(GL_POINTS,0,particles.size());
-	ofSetColor(255);
-	glPointSize(2);
-	vbo.draw(GL_POINTS,0,particles.size());
+	// ofSetColor(255);
+	// glPointSize(2);
+	// vbo.draw(GL_POINTS,0,particles.size());
 
 	ofNoFill();
-	ofDrawBox(0,0,-ofGetHeight()*2,ofGetWidth()*4,ofGetHeight()*4,ofGetHeight()*4);
+	ofDrawBox(ofGetWidth()/2, ofGetHeight()/2, ofGetHeight()/2, ofGetWidth(), ofGetHeight(), ofGetHeight());
 
 	camera.end();
 
 	ofEnableBlendMode(OF_BLENDMODE_ALPHA);
 	ofSetColor(255);
 	gui.draw();
-}
-
-void ofApp::dirAsColorChanged(bool & dirAsColor){
-	if(dirAsColor){
-		vbo.enableColors();
-	}else{
-		vbo.disableColors();
-	}
 }
 
 //--------------------------------------------------------------

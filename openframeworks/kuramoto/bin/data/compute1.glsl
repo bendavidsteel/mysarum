@@ -69,38 +69,6 @@ float random( vec2  v ) { return floatConstruct(hash(floatBitsToUint(v))); }
 float random( vec3  v ) { return floatConstruct(hash(floatBitsToUint(v))); }
 float random( vec4  v ) { return floatConstruct(hash(floatBitsToUint(v))); }
 
-vec3 repulse(vec3 my_pos, vec3 their_pos){
-	vec3 dir = my_pos-their_pos;
-	float sqd = dot(dir,dir);
-	if(sqd < pow(repulsionMaxDist,2.0)){
-		return normalize(dir) * 1./sqd;
-	}
-	return vec3(0.0);
-} 
-
-vec3 align(vec3 my_pos, vec3 their_pos, vec3 my_vel, vec3 their_vel){
-	vec3 d = their_pos - my_pos;
-	vec3 dv = their_vel - my_vel;
-	float sqd = dot(d,d);
-	if (sqd < pow(alignmentMaxDist, 2.0)){
-		return normalize(dv) * 1./sqd;
-	}
-	return vec3(0.0);
-}
-
-vec3 attract(vec3 my_pos, vec3 their_pos){
-	vec3 dir = their_pos-my_pos;
-	float sqd = dot(dir,dir);
-	if(sqd < pow(attractionMaxDist,2.0)){
-		float f = 1.0/sqd;
-		return normalize(dir) * f;
-	}
-	return vec3(0.0);
-}
-
-float angle(vec3 my_vel, vec3 their_vel){
-	return dot(my_vel, their_vel) / (length(my_vel) * length(their_vel));
-}
 
 void doRebound(inout vec3 pos)
 {
@@ -141,25 +109,94 @@ void ensureRebound(inout vec3 pos, inout vec3 vel){
 	}
 }
 
+
+vec3 repulse(vec3 my_pos, vec3 their_pos){
+	vec3 dir = my_pos-their_pos;
+	float sqd = dot(dir,dir);
+	if(sqd < pow(repulsionMaxDist,2.0)){
+		return normalize(dir) * 1./sqd;
+	}
+	return vec3(0.0);
+} 
+
+vec3 align(vec3 my_pos, vec3 their_pos, vec3 my_vel, vec3 their_vel){
+	vec3 d = their_pos - my_pos;
+	vec3 dv = their_vel - my_vel;
+	float sqd = dot(d,d);
+	if (sqd < pow(alignmentMaxDist, 2.0)){
+		return normalize(dv) * 1./sqd;
+	}
+	return vec3(0.0);
+}
+
+vec3 attract(vec3 my_pos, vec3 their_pos){
+	vec3 dir = their_pos-my_pos;
+	float sqd = dot(dir,dir);
+	if(sqd < pow(attractionMaxDist,2.0)){
+		float f = 1.0/sqd;
+		return normalize(dir) * f;
+	}
+	return vec3(0.0);
+}
+
+float angle(vec3 my_vel, vec3 their_vel){
+	return dot(my_vel, their_vel) / (length(my_vel) * length(their_vel));
+}
+
+vec3 turnTowardVector(vec3 fromVector, vec3 toVector, float frac) {
+    // Calculate the dot product
+    float dotProduct = dot(fromVector, toVector);
+    
+    // Calculate the axis of rotation (cross product)
+    vec3 axis = normalize(cross(fromVector, toVector));
+	vec3 perpComponent = normalize(cross(axis, fromVector));
+    
+    // Calculate the angle of rotation
+    float angle = acos(dotProduct / (length(fromVector) * length(toVector)));
+
+	// apply fractional rotation
+	angle *= frac;
+    
+    // get vector rotated by angle around axis
+	vec3 rotatedVector = fromVector * cos(angle) + perpComponent * sin(angle);
+    
+    return rotatedVector;
+}
+
 layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
 void main(){
 	vec3 pos = p2[gl_GlobalInvocationID.x].pos.xyz;
 	vec3 vel = p2[gl_GlobalInvocationID.x].vel.xyz;
-	float freq = p2[gl_GlobalInvocationID.x].attr.x;
+	float naturalFreq = p2[gl_GlobalInvocationID.x].attr.x;
+	float phase = p2[gl_GlobalInvocationID.x].attr.y;
 
-	vec3 acc = vec3(0.);
+	vec3 velNorm = normalize(vel);
 
 	vec4 randSeed = vec4(pos.x, pos.y, pos.z, time);
-	vec3 randForce = vec3(random(randSeed.xyzw), random(randSeed.yzwx), random(randSeed.zwxy));
-	randForce = randForce * 2.0 - 1.0;
+	vec3 randVec = vec3(random(randSeed.xyzw), random(randSeed.yzwx), random(randSeed.zwxy));
+	randVec = randVec * 2.0 - 1.0;
 
-	acc += randForce * randomStrength;
-	// acc.z = 0.0;
+	// get random perpendicular direction to vel
+	vec3 randPerp = normalize(cross(velNorm, randVec));
+
+	float randomAngle = random(randSeed.xyzw) * randomStrength;
+
+	vec3 newVel = turnTowardVector(vel, randPerp, randomAngle);
 
 	vec3 color = vec3(1.0);
 
-	float kuramotoSum = 0.0;
+	float freqSum = 0.0;
+	float phaseSum = 0.0;
 	int kuramotoCount = 0;
+
+	vec3 repulseSum = vec3(0.0);
+	int repulseCount = 0;
+
+	vec3 alignSum = vec3(0.0);
+	int alignCount = 0;
+
+	vec3 attractSum = vec3(0.0);
+	int attractCount = 0;
 
 	for (int i = 0; i < numAgents; i++) {
 		if (i == gl_GlobalInvocationID.x) continue;
@@ -168,29 +205,62 @@ void main(){
 		if (angle(vel, theirPos - pos) < fov) continue;
 
 		vec3 theirVel = p2[i].vel.xyz;
-		// TODO use quaternions instead of force for direction nudges
-		acc += repulse(pos, theirPos) * repulsion;
-		acc += align(pos, theirPos, vel, theirVel) * alignment;
-		acc += attract(pos, theirPos) * attraction;
 
 		vec3 relPos = theirPos - pos;
 		float sqd = dot(relPos, relPos);
+
+		if (sqd < pow(repulsionMaxDist, 2.0)) {
+			repulseSum += relPos;
+			repulseCount++;
+		}
+
+		if (sqd < pow(alignmentMaxDist, 2.0)) {
+			alignSum += theirVel;
+			alignCount++;
+		}
+
+		if (sqd < pow(attractionMaxDist, 2.0)) {
+			attractSum += relPos;
+			attractCount++;
+		}
+
 		if (sqd < pow(kuramotoMaxDist, 2.0)) {
 			float theirFreq = p2[i].attr.x;
-			kuramotoSum += sin(theirFreq - freq);
+			float theirPhase = p2[i].attr.y;
+			phaseSum += sin(theirPhase - phase);
+			freqSum += theirFreq - naturalFreq;
 			kuramotoCount++;
 		}
 	}
+		
+	if (repulseCount > 0) {
+		vec3 repulseDir = repulseSum / repulseCount;
+		newVel = turnTowardVector(newVel, -repulseDir, repulsion);
+	}	
 
-	if (kuramotoCount > 0) {
-		freq += kuramotoStrength * kuramotoSum / kuramotoCount;
+	if (alignCount > 0) {
+		vec3 alignDir = alignSum / alignCount;
+		newVel = turnTowardVector(newVel, alignDir, alignment);
 	}
 
-	vec3 newVel = vel + acc * timeDelta;
-	// limit to max speed
-	// if (length(newVel) > maxSpeed) {
+	if (attractCount > 0) {
+		vec3 attractDir = attractSum / attractCount;
+		newVel = turnTowardVector(newVel, attractDir, attraction);
+	}
+
+	// float freq = naturalFreq;
+	// float phase = naturalPhase;
+	if (kuramotoCount > 0) {
+		// implement kuramoto
+		// freq = naturalFreq + kuramotoStrength * freqSum / kuramotoCount;
+		// Update phase based on the Kuramoto model
+		phase += (naturalFreq + (kuramotoStrength * phaseSum / kuramotoCount)) * timeDelta;
+		phase = mod(phase, 2.0 * 3.141592);
+	}
+
+	// newVel.z = 0.0;
 	newVel = normalize(newVel) * maxSpeed;
-	// }
+
 	vec3 newPos = pos + newVel * timeDelta;
 
 	ensureRebound(newPos, newVel);
@@ -198,8 +268,8 @@ void main(){
 	p[gl_GlobalInvocationID.x].pos.xyz = newPos;
 	p[gl_GlobalInvocationID.x].vel.xyz = newVel;
 
-	p[gl_GlobalInvocationID.x].attr.x = freq;
+	p[gl_GlobalInvocationID.x].attr.y = phase;
 
 	p[gl_GlobalInvocationID.x].color.rgb = color;
-	p[gl_GlobalInvocationID.x].color.a = 0.75 + 0.25 * sin(time * freq);
+	p[gl_GlobalInvocationID.x].color.a = 0.66 + 0.33 * sin((time * naturalFreq) + phase);
 }

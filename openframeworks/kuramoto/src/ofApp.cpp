@@ -6,7 +6,7 @@ void ofApp::setup(){
 	compute.setupShaderFromFile(GL_COMPUTE_SHADER,"compute1.glsl");
 	compute.linkProgram();
 	camera.setFarClip(ofGetWidth()*10);
-	numParticles = 1024;
+	numParticles = 1024 * 8;
 	particles.resize(numParticles);
 	for(auto & p: particles){
 		p.pos.x = ofRandom(0.,ofGetWidth());
@@ -17,7 +17,8 @@ void ofApp::setup(){
 		p.vel.y = ofRandom(-1,1);
 		p.vel.z = ofRandom(-1,1);
 		p.vel.w = 1.;
-		p.attr.x = ofRandom(2., 5.); // frequency of oscillation
+		p.attr.x = 0.1;//ofRandom(0.09, 0.11); // frequency of oscillation
+		p.attr.y = ofRandom(0., 2 * 3.1415); // phase of oscillation
 	}
 	particlesBuffer.allocate(particles,GL_DYNAMIC_DRAW);
 	particlesBuffer2.allocate(particles,GL_DYNAMIC_DRAW);
@@ -31,16 +32,16 @@ void ofApp::setup(){
 
 	gui.setup();
 	shaderUniforms.setName("shader params");
-	shaderUniforms.add(attractionCoeff.set("attraction",0.,0,10.));
-	shaderUniforms.add(attractionMaxDist.set("attractionMaxDist",100,0,1000));
-	shaderUniforms.add(alignmentCoeff.set("alignment",0.,0,10.));
+	shaderUniforms.add(attractionCoeff.set("attraction",0.02,0,1.));
+	shaderUniforms.add(attractionMaxDist.set("attractionMaxDist",300,0,1000));
+	shaderUniforms.add(alignmentCoeff.set("alignment",0.05,0,1.));
 	shaderUniforms.add(alignmentMaxDist.set("alignmentMaxDist",100,0,1000));
-	shaderUniforms.add(repulsionCoeff.set("repulsion",0.,0,10.));
-	shaderUniforms.add(repulsionMaxDist.set("repulsionMaxDist",50,0,1000));
-	shaderUniforms.add(maxSpeed.set("maxSpeed",0.8,0.,1.));
+	shaderUniforms.add(repulsionCoeff.set("repulsion",0.05,0,1.));
+	shaderUniforms.add(repulsionMaxDist.set("repulsionMaxDist",25,0,1000));
+	shaderUniforms.add(maxSpeed.set("maxSpeed",0.8,0.,3.));
 	shaderUniforms.add(randomForce.set("randomStrength",0.1,0.,1.));
 	shaderUniforms.add(fov.set("fov", 0., -1., 1.));
-	shaderUniforms.add(kuramotoStrength.set("kuramotoStrength", 0., -1., 1.));
+	shaderUniforms.add(kuramotoStrength.set("kuramotoStrength", 0., 0., 1.));
 	shaderUniforms.add(kuramotoMaxDist.set("kuramotoMaxDist", 100., 0., 1000.));
 	gui.add(shaderUniforms);
 	gui.add(fps.set("fps",60,0,60));

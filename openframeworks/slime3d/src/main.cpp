@@ -8,7 +8,7 @@ const int screenWidth = 1920;
 int main( ){
 	ofGLWindowSettings settings;
 	settings.setGLVersion(4,3);
-	settings.windowMode = OF_WINDOW;
+	settings.windowMode = OF_FULLSCREEN;
 	settings.setSize(screenWidth, screenHeight);
 	ofCreateWindow(settings);			// <-------- setup the GL context
 

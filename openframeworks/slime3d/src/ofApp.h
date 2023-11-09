@@ -1,16 +1,8 @@
 #pragma once
 
 #include "ofMain.h"
-#include "ofBufferObject.h"
-#include "ofxVideoRecorder.h"
-#include "ofxVolumetrics.h"
-#include "volumetrics.h"
 
-enum AgentSpawn{
-	RANDOM,
-	CENTRE,
-	RING
-};
+#include "physarum.h"
 
 class ofApp : public ofBaseApp{
 
@@ -31,53 +23,6 @@ class ofApp : public ofBaseApp{
 		void windowResized(int w, int h);
 		void dragEvent(ofDragInfo dragInfo);
 		void gotMessage(ofMessage msg);
-		void audioIn(float * input, int bufferSize, int nChannels);
 
-		ofxVideoRecorder vidRecorder;
-		ofSoundStream soundStream;
-		bool bRecording;
-		int sampleRate;
-		int channels;
-		string fileName;
-		string fileExt;
-
-		void recordingComplete(ofxVideoRecorderOutputFileCompleteEventArgs& args);
-
-		struct Agent{
-			glm::vec4 pos;
-			glm::vec4 vel;
-			glm::vec4 attributes;
-		};
-
-		struct Species{
-			glm::vec4 colour;
-			glm::vec4 sensorAttributes;
-			glm::vec4 movementAttributes;
-		};
-
-		ofShader compute_agents;
-		ofShader compute_decay;
-		ofShader compute_diffuse;
-		ofShader compute_flow;
-		ofShader renderer;
-
-		ofPixels pixels;
-		ofFbo fbo;
-
-		vector<Agent> particles;
-		ofBufferObject particlesBuffer;
-		vector<Species> allSpecies;
-		ofBufferObject allSpeciesBuffer;
-		ofxTexture3d trailMap;
-		ofxTexture3d flowMap;
-
-		Volumetrics volume;
-
-		int volWidth;
-		int volHeight;
-		int volDepth;
-
-		float diffuseRate;
-		float decayRate;
-		float trailWeight;
+		Physarum physarum;
 };

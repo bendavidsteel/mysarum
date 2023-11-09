@@ -1,6 +1,6 @@
 #version 440
 
-layout(rgba8,binding=3) uniform restrict image3D flowMap;
+layout(rgba8,binding=4) uniform restrict image3D flowMap;
 
 uniform float time;
 uniform ivec2 resolution;

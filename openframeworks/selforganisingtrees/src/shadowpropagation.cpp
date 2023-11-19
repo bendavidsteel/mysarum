@@ -21,6 +21,9 @@ void ShadowPropagation::updateBudEnvironment() {
 }
 
 void ShadowPropagation::updateBudEnvironment(shared_ptr<Metamer> metamer, Tree tree) {
+    metamer->terminalGrowthDirection = ofVec3f(0, 0, 0);
+    metamer->axillaryGrowthDirection = ofVec3f(0, 0, 0);
+
     ofVec3f pos = metamer->pos;
     float s = shadows[int(pos.x) + (int(pos.y) * width) + (int(pos.z) * width * height)];
     float q = std::max(C - s + a, float(0.));
@@ -46,7 +49,7 @@ void ShadowPropagation::updateBudEnvironment(shared_ptr<Metamer> metamer, Tree t
                     continue;
                 }
                 if (metamer->terminal != NULL) {
-                    float angle = (point - pos).angle(metamer->direction);
+                    float angle = (point - pos).angleRad(metamer->direction);
                     if (angle < tree.perceptionAngle / 2.) {
                         float shadow = shadows[i + j * width + k * width * height];
                         if (shadow < minShadowTerminal) {
@@ -57,7 +60,7 @@ void ShadowPropagation::updateBudEnvironment(shared_ptr<Metamer> metamer, Tree t
                 }
 
                 if (metamer->axillary != NULL) {
-                    float angle = (point - pos).angle(metamer->axillaryDirection);
+                    float angle = (point - pos).angleRad(metamer->axillaryDirection);
                     if (angle < tree.perceptionAngle / 2.) {
                         float shadow = shadows[i + j * width + k * width * height];
                         if (shadow < minShadowAxillary) {

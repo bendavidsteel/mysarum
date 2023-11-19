@@ -10,6 +10,7 @@ struct Metamer {
 	ofVec3f axillaryDirection;
 	ofVec3f axillaryGrowthDirection;
 	float axillaryQ;
+	shared_ptr<Metamer> parent;
 	int idx;
 	int treeIdx;
 	float width;

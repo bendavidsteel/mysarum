@@ -53,57 +53,7 @@ void SpaceColonization::setMaxPerceptionFactor(float _maxPerceptionFactor) {
 }
 
 void SpaceColonization::updateBudEnvironment(vector<Tree> trees) {
-	// budHash.buildIndex();
-    // ofx::KDTree<ofVec3f>::SearchResults budSearchResults;
-
-	// loop through markers and find nearest node, and add attractor force
-	// for (int i = 0; i < markers.size(); i++) {
-	// 	budSearchResults.clear();
-	// 	// max number of buds to look for in radius
-	// 	int budSearchSize = 10;
-	// 	budSearchResults.resize(budSearchSize);
-
-	// 	// max radius to search for buds
-	// 	float maxMetamerLength = 2.;
-	// 	float budSearchRadius = maxMetamerLength * maxPerceptionFactor;
-	// 	int numPoints = budHash.findPointsWithinRadius(markers[i], budSearchRadius, budSearchResults);
-
-	// 	if (numPoints < 1) {
-	// 		continue;
-	// 	}
-
-	// 	int closestBud = budSearchResults[0].first;
-	// 	shared_ptr<Metamer> closestMetamer = metamersWithBuds[closestBud];
-	// 	float closestBudDistSq = budSearchResults[0].second;
-	// 	float occupancyFactor = trees[closestMetamer->treeIdx].occupancyFactor;
-
-	// 	// check if in occupancy zone
-	// 	if (closestBudDistSq < std::pow(closestMetamer->length * occupancyFactor, 2.)) {
-	// 		markers.erase(markers.begin() + i);
-	// 		i--;
-	// 		continue;
-	// 	}
-
-	// 	for (int j = 0; j < numPoints; j++) {
-	// 		shared_ptr<Metamer> metamer = metamersWithBuds[budSearchResults[j].first];
-	// 		float budDistSq = budSearchResults[j].second;
-
-	// 		float perceptionAngle = trees[metamer->treeIdx].perceptionAngle;
-	// 		float perceptionFactor = trees[metamer->treeIdx].perceptionFactor;
-			
-	// 		if (budDistSq < std::pow(metamer->length * perceptionFactor, 2.)) {
-	// 			ofVec3f markerDir = (markers[i] - metamer->pos).normalize();
-	// 			float angle = markerDir.angle(metamer->direction);
-	// 			float axillaryAngle = markerDir.angle(metamer->axillaryDirection);
-	// 			if (axillaryAngle < angle && axillaryAngle < perceptionAngle) {
-	// 				metamer->axillaryGrowthDirection += markerDir;
-	// 			} else if (angle < axillaryAngle && angle < perceptionAngle) {
-	// 				metamer->terminalGrowthDirection += markerDir;
-	// 			}
-	// 		}
-	// 	}
-	// }
-
+	
 	for (int i = 0; i < markers.size(); i++) {
 		markerClosestBudDist[i] = std::numeric_limits<float>::max();
 		markerClosestBudIdx[i] = -1;
@@ -119,6 +69,9 @@ void SpaceColonization::updateBudEnvironment(vector<Tree> trees) {
 		markerSearchResults.resize(markerSearchSize);
 
 		shared_ptr<Metamer> metamer = metamersWithBuds[i];
+		metamer->terminalGrowthDirection = ofVec3f(0., 0., 0.);
+		metamer->axillaryGrowthDirection = ofVec3f(0., 0., 0.);
+
 		Tree tree = trees[metamer->treeIdx];
 
 		float perceptionAngle = tree.perceptionAngle;
@@ -144,14 +97,16 @@ void SpaceColonization::updateBudEnvironment(vector<Tree> trees) {
 			ofVec3f markerDir = (marker - metamer->pos).normalize();
 			float angle = markerDir.angleRad(metamer->direction);
 			float axillaryAngle = markerDir.angleRad(metamer->axillaryDirection);
-			if (axillaryAngle < angle && axillaryAngle < perceptionAngle) {
-				markerClosestBudDist[markerSearchResults[j].first] = markerDistSq;
-				markerClosestBudIdx[markerSearchResults[j].first] = i;
-				metamer->axillaryGrowthDirection += markerDir;
-			} else if (angle < axillaryAngle && angle < perceptionAngle) {
-				markerClosestBudDist[markerSearchResults[j].first] = markerDistSq;
-				markerClosestBudIdx[markerSearchResults[j].first] = i;
-				metamer->terminalGrowthDirection += markerDir;
+			if (metamer->axillary == NULL && axillaryAngle < angle && axillaryAngle < perceptionAngle) {
+				if (markerDistSq < markerClosestBudDist[markerSearchResults[j].first]) {
+					markerClosestBudDist[markerSearchResults[j].first] = markerDistSq;
+					markerClosestBudIdx[markerSearchResults[j].first] = i;
+				}
+			} else if (metamer->terminal == NULL && angle < axillaryAngle && angle < perceptionAngle) {
+				if (markerDistSq < markerClosestBudDist[markerSearchResults[j].first]) {
+					markerClosestBudDist[markerSearchResults[j].first] = markerDistSq;
+					markerClosestBudIdx[markerSearchResults[j].first] = i;
+				}
 			}
 		}
 	}
@@ -184,12 +139,17 @@ void SpaceColonization::updateBudEnvironment(shared_ptr<Metamer> metamer, Tree t
 			ofVec3f markerDir = (marker - metamer->pos).normalize();
 			float angle = markerDir.angleRad(metamer->direction);
 			float axillaryAngle = markerDir.angleRad(metamer->axillaryDirection);
-			if (axillaryAngle < angle && axillaryAngle < perceptionAngle) {
+			if (metamer->axillary == NULL && axillaryAngle < angle && axillaryAngle < perceptionAngle) {
 				metamer->axillaryGrowthDirection += markerDir;
-			} else if (angle < axillaryAngle && angle < perceptionAngle) {
+			} else if (metamer->terminal == NULL && angle < axillaryAngle && angle < perceptionAngle) {
 				metamer->terminalGrowthDirection += markerDir;
 			}
 		}
+	}
+
+	if (numMarkers > 0) {
+		metamer->axillaryGrowthDirection.normalize();
+		metamer->terminalGrowthDirection.normalize();
 	}
 }
 

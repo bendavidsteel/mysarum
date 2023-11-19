@@ -8,6 +8,17 @@
 #include "spacecolonization.h"
 #include "trees.h"
 
+struct AcropetalState {
+    shared_ptr<Metamer> metamer;
+    float v;
+    int treeIdx;
+};
+
+struct BasipetalState {
+    shared_ptr<Metamer> metamer;
+    int treeIdx;
+    bool processedChildren;
+};
 
 
 class SelfOrganising {
@@ -19,10 +30,10 @@ class SelfOrganising {
 		void draw();
 
 		Tree addTree(ofVec3f pos, ofVec3f dir, int idx);
-		void basipetalPass();
-		float recurBasipetally(shared_ptr<Metamer> metamer, int treeIdx);
+		void startAcropetalPass();
 		void acropetalPass();
-		void recurAcropetally(shared_ptr<Metamer> metamer, float v, int treeIdx);
+		void startBasipetalPass();
+		void basipetalPass();
 		void addNewTerminalShoot(shared_ptr<Metamer> metamer, float v, int treeIdx);
 		void addNewAxillaryShoot(shared_ptr<Metamer> metamer, float v, int treeIdx);
 		void addNewShoot(shared_ptr<Metamer> metamer, float v, ofVec3f defaultDir, ofVec3f growthDir, bool isTerminal, int treeIdx);
@@ -35,13 +46,12 @@ class SelfOrganising {
 		vector<unsigned int> metamerIndices;
 		vector<ofFloatColor> metamerColors;
         vector<float> metamerWidths;
-		vector<ofVec3f> budAttractions;
 		int metamerIdx;
 
-		vector<ofVec3f> markers;
+		std::stack<BasipetalState> basipetalStack;
+		std::stack<AcropetalState> acropetalStack;
+
 		vector<Tree> trees;
-		vector<shared_ptr<Metamer>> metamersWithBuds;
-		vector<ofVec3f> budPositions;
 
 		ofVbo metamerVbo;
 
@@ -50,4 +60,6 @@ class SelfOrganising {
         ofShader shader;
 		ofEasyCam cam;
 		float mapSize;
+
+		int processStep;
 };

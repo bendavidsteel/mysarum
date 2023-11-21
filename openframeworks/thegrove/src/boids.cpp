@@ -66,10 +66,35 @@ void Boids::setup(int _numBins, int _width, int _height, int _depth){
 }
 
 //--------------------------------------------------------------
-void Boids::update(float windStrength, ofVec2f windDirection){
+void Boids::update(float windStrength, ofVec2f windDirection, float activity){
 	float time = ofGetElapsedTimef();
 
 	fps = ofGetFrameRate();
+
+	maxSpeed = activity * 2.0;
+	kuramotoStrength = activity * 0.005;
+	float brightness = activity;
+
+	fov += ofRandom(-0.01, 0.01);
+	if (fov < -0.8) {
+		fov = -0.8;
+	} else if (fov > 0.8) {
+		fov = 0.8;
+	}
+
+	attractionCoeff += ofRandom(-0.001, 0.001);
+	if (attractionCoeff < 0.01) {
+		attractionCoeff = 0.01;
+	} else if (attractionCoeff > 0.1) {
+		attractionCoeff = 0.1;
+	}
+
+	repulsionCoeff += ofRandom(-0.001, 0.001);
+	if (repulsionCoeff < 0.01) {
+		repulsionCoeff = 0.01;
+	} else if (repulsionCoeff > 0.1) {
+		repulsionCoeff = 0.1;
+	}
 
 	compute.begin();
 	compute.setUniforms(shaderUniforms);
@@ -81,6 +106,7 @@ void Boids::update(float windStrength, ofVec2f windDirection){
 	compute.setUniform1i("numBins", numBins);
 	compute.setUniform1f("windStrength", windStrength);
 	compute.setUniform2f("windDirection", windDirection.x, windDirection.y);
+	compute.setUniform1f("brightness", brightness);
 
 	// since each work group has a local_size of 1024 (this is defined in the shader)
 	// we only have to issue 1 / 1024 workgroups to cover the full workload.

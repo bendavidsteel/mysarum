@@ -89,7 +89,7 @@ float simplex3d_fractal(vec3 m) {
 void main(){
     vec3 pos = vertexCoord.xyz;
     vec3 p = vec3(1.0) * pos / vec3(resolution.xyz);
-    p.z += time*0.025;
+    p.z += time*0.1;
     
     float noise = simplex3d_fractal(p*8.0+8.0);
 

@@ -38,6 +38,7 @@ uniform float kuramotoStrength;
 uniform float kuramotoMaxDist;
 uniform float windStrength;
 uniform vec2 windDirection;
+uniform float brightness;
 
 // A single iteration of Bob Jenkins' One-At-A-Time hashing algorithm.
 uint hash( uint x ) {
@@ -328,5 +329,5 @@ void main(){
 
 	float amp = sin((time * naturalFreq) + phase);
 	p[gl_GlobalInvocationID.x].color.rgb = color;
-	p[gl_GlobalInvocationID.x].color.a = 0.66 + 0.33 * amp;
+	p[gl_GlobalInvocationID.x].color.a = (0.66 + 0.33 * amp) * brightness;
 }

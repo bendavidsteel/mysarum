@@ -181,13 +181,29 @@ void Physarum::setup(int _numBins, int _width, int _height, int _depth){
 }
 
 //--------------------------------------------------------------
-void Physarum::update(float windStrength, ofVec2f windDirection){
+void Physarum::update(float windStrength, ofVec2f windDirection, float activity){
 	double deltaTime = 1.; //ofGetLastFrameTime();
 	float time = ofGetElapsedTimef();
+
+	moveSpeed = activity;
 
 	int localSizeX = 8;
 	int localSizeY = 8;
 	int localSizeZ = 8;
+
+	sensorAngleRad += ofRandom(-0.001, 0.001);
+	if (sensorAngleRad < 15. * PI / 180.) {
+		sensorAngleRad = 15. * PI / 180.;
+	} else if (sensorAngleRad > 90. * PI / 180.) {
+		sensorAngleRad = 90. * PI / 180.;
+	}
+
+	sensorOffsetDist += ofRandom(-0.1, 0.1);
+	if (sensorOffsetDist < 1.) {
+		sensorOffsetDist = 1.;
+	} else if (sensorOffsetDist > 20.) {
+		sensorOffsetDist = 20.;
+	}
 
 	compute_agents.begin();
 	compute_agents.setUniform3i("resolution", volWidth, volHeight, volDepth);
@@ -196,6 +212,7 @@ void Physarum::update(float windStrength, ofVec2f windDirection){
 	compute_agents.setUniform1f("trailWeight", trailWeight);
 	compute_agents.setUniform1f("windStrength", windStrength);
 	compute_agents.setUniform2f("windDirection", windDirection.x, windDirection.y);
+	compute_agents.setUniform1f("activity", activity);
 	compute_agents.setUniforms(speciesUniforms);
 	
 	// since each work group has a local_size of 1024 (this is defined in the shader)
@@ -273,15 +290,15 @@ void Physarum::update(float windStrength, ofVec2f windDirection){
 	Agent * ptr = (Agent *) particlesBuffer.map(GL_READ_ONLY);
 
 	for (int idx = 0; idx < particles.size(); idx++) {
-		int bin = (int) ptr[idx].state.x * (numBins - 1);
 		float weight = 1./ (float) particles.size();
-		maxSenseHist[bin] += weight;
+		int maxSenseBin = (int) (ptr[idx].state.x * (numBins - 1));
+		maxSenseHist[maxSenseBin] += weight;
 
-		bin = (int) ptr[idx].state.y * (numBins - 1);
-		avgSenseHist[bin] += weight;
+		int avgSenseBin = (int) (ptr[idx].state.y * (numBins - 1));
+		avgSenseHist[avgSenseBin] += weight;
 
-		bin = (int) ptr[idx].state.z * (numBins - 1);
-		turnSpeedHist[bin] += weight;
+		int turnSpeedBin = (int) (ptr[idx].state.z * (numBins - 1));
+		turnSpeedHist[turnSpeedBin] += weight;
 	}
 
 	particlesBuffer.unmap();

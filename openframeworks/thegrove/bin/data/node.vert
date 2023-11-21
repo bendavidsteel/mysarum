@@ -19,8 +19,8 @@ void main()
     vec4 modifiedPosition = modelViewProjectionMatrix * position;
 
     // wind
-    modifiedPosition.x += windDirection.x * windStrength * position.y / width;
-    modifiedPosition.y += windDirection.y * windStrength * position.y / width;
+    // modifiedPosition.x += windDirection.x * windStrength * position.y / width;
+    // modifiedPosition.y += windDirection.y * windStrength * position.y / width;
 
 	gl_Position = modifiedPosition;
     vs_out.color = color;

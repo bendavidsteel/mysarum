@@ -22,7 +22,7 @@ void Noise::setup(int _width, int _height){
 //--------------------------------------------------------------
 void Noise::update(){
 	float noiseScale = 0.1;
-	float noiseVel = ofGetElapsedTimef() / 100.;
+	float noiseVel = ofGetElapsedTimef() / 10.;
 
 	ofPixels & pixels = img.getPixels();
 	int w = img.getWidth();

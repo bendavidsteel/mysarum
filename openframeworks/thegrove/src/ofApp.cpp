@@ -24,11 +24,17 @@ void ofApp::setup(){
 
     windStrength = 0.;
     windDirection = ofVec2f(0, 0);
+
+    boidActivity = 0.;
+    physarumActivity = 0.;
+    selfOrganisingActivity = 0.;
     
     //patching-------------------------------
 
     selfOrganisingSynths.resize(numBins);
     boidSynths.resize(numBins);
+    boidsAmpCtrls.resize(numBins);
+    boidsPitchCtrls.resize(numBins);
 
     for (int i = 0; i < numBins; i++) {
         float pitch = ofMap(i, 0, numBins - 1, 60, 84);
@@ -36,29 +42,25 @@ void ofApp::setup(){
         selfOrganisingSynths[i] >> engine.audio_out(0);
         selfOrganisingSynths[i] >> engine.audio_out(1);
 
-        pitch = ofMap(i, 0, numBins - 1, 84, 96);
-        boidSynths[i].setup(pitch);
-        boidSynths[i] >> engine.audio_out(0);
-        boidSynths[i] >> engine.audio_out(1);
+        boidsPitchCtrls[i] >> boidSynths[i].in("pitch");
+        boidsAmpCtrls[i] >> boidSynths[i].in_amp();
+        boidSynths[i] * dB(-24.0f) >> engine.audio_out(0);
+        boidSynths[i] * dB(-24.0f) >> engine.audio_out(1);
+
+        pitch = ofMap(i, 0, numBins - 1, 84.0f, 96.0f);
+        boidsPitchCtrls[i].set(pitch);
+        boidsAmpCtrls[i].set(0.);
     }
 
-    physarumSynth.datatable.setup(numBins);
-    physarumSynth >> engine.audio_out(0);
-    physarumSynth >> engine.audio_out(1);
+    physarumSynth.datatable.setup(numBins, numBins);
+    physarumSynth.setup(1);
 
-    // synth.datatable.setup( numBins, numBins ); // as many samples as the webcam width
-	//synth.datatable.smoothing(0.5f);
+    physarumTrigger.out_trig() >> physarumSynth.voices[0].in("trig");
+    physarumPitch >> physarumSynth.voices[0].in("pitch");
 
-    // synth.setup( voicesNum );
-    // for(int i=0; i<voicesNum; ++i){
-    //     // connect each voice to a pitch and trigger output
-    //     keyboard.out_trig(i)  >> synth.voices[i].in("trig");
-    //     keyboard.out_pitch(i) >> synth.voices[i].in("pitch");
-    // }
+    physarumSynth.ch(0) * dB(2.0f) >> engine.audio_out(0);
+    physarumSynth.ch(1) * dB(2.0f) >> engine.audio_out(1);
 
-    // // patch synth to the engine
-    // synth.ch(0) >> engine.audio_out(0);
-    // synth.ch(1) >> engine.audio_out(1);
 
     // graphic setup---------------------------
     ofSetVerticalSync(true);
@@ -87,20 +89,37 @@ void ofApp::setup(){
 
 //--------------------------------------------------------------
 void ofApp::update(){
-    windStrength += ofRandom(-0.01, 0.01);
+    windStrength += ofRandom(-0.005, 0.005);
     if (windStrength < 0.) {
         windStrength = 0.;
     } else if (windStrength > 0.1) {
         windStrength = 0.1;
     }
 
+    float time = ofGetElapsedTimef();
+    if (time > 20. && selfOrganisingActivity < 1.0) {
+        selfOrganisingActivity += 0.01;
+    }
+
+    if (time > 10. && physarumActivity < 1.0) {
+        physarumActivity += 0.01;
+    }
+
+    if (time > 0. && boidActivity < 1.0) {
+        boidActivity += 0.01;
+    }
+
+    // selfOrganisingAmp.set(selfOrganisingActivity);
+    // boidAmp.set(boidActivity);
+    // physarumAmp.set(physarumActivity);
+
     float windAngle = windDirection.angleRad(ofVec2f(1, 0));
     windAngle += ofRandom(-0.1, 0.1);
     windDirection = ofVec2f(std::cos(windAngle), std::sin(windAngle));
 
-    boids.update(windStrength, windDirection);
-    physarum.update(windStrength, windDirection);
-    selfOrganising.update(windStrength, windDirection);
+    boids.update(windStrength, windDirection, boidActivity);
+    physarum.update(windStrength, windDirection, physarumActivity);
+    selfOrganising.update(windStrength, windDirection, selfOrganisingActivity);
     noise.update();
     
     if(true){//synth.datatable.ready() ){
@@ -115,81 +134,41 @@ void ofApp::update(){
 
         vector<float> newMetamerHist = selfOrganising.getNewMetamerHist();
 
+        float maxTurnSpeed = 0.;
+        float maxAvgSense = 0.;
+
         physarumSynth.datatable.begin();
         for (int i = 0; i < numBins; i++) {
             float metamerVal = newMetamerHist[i];
-            if (metamerVal > 0.) {
+            if (metamerVal > 0. && selfOrganisingActivity > 0.) {
                 selfOrganisingSynths[i].gate.trigger(metamerVal);
             } else {
                 selfOrganisingSynths[i].gate.off();
             }
 
             float boidAmpVal = ampHist[i];
-            boidSynths[i].amp.set(boidAmpVal);
+            boidsAmpCtrls[i].set(boidAmpVal * boidActivity);
+            float boidsPeerVal = peerHist[i];
+            float boidsPitch = ofMap(boidsPeerVal, 0., 1., 84.0f, 96.0f);
+            boidsPitchCtrls[i].set(boidsPitch);
 
             float physarumAmpVal = maxSenseHist[i];
             physarumSynth.datatable.data(i, physarumAmpVal);
+
+            float physarumTurnSpeedVal = turnSpeedHist[i];
+            if (physarumTurnSpeedVal > maxTurnSpeed) {
+                maxTurnSpeed = physarumTurnSpeedVal;
+            }
+            float physarumAvgSenseVal = avgSenseHist[i];
+            if (physarumAvgSenseVal > maxAvgSense) {
+                maxAvgSense = physarumAvgSenseVal;
+            }
         }
         physarumSynth.datatable.end(true);
-        
-        // ------------------ GENERATING THE WAVE ----------------------
-        
-        // a pdsp::DataTable easily convert data to a waveform in real time
-        // if you don't need to generate waves in real time but
-        // interpolate between already stored waves pdsp::WaveTable is a better choice
-        // for example if you want to convert an image you already have to a wavetable
-        
-		// switch( mode ){
-		// 	case 0: // converting pixels to waveform samples
-        // synth.datatable.begin();
-        // for(int n=0; n<numBins; ++n){
-        //     float sample = ofMap(ampHist[n], 0, 1., -0.5f, 0.5f);
-        //     synth.datatable.data(n, sample);
-        // }
-        // synth.datatable.end(false);
-		// 	break; // remember, raw waveform could have DC offsets, we have filtered them in the synth using an hpf
-			
-		// 	case 1: // converting pixels to partials for additive synthesis
-		// 		synth.datatable.begin();
-		// 		for(int n=0; n<numBins; ++n){
-		// 			float partial = ofMap(ampHist[n], 0, 1., 0.0f, 1.0f);
-		// 			synth.datatable.data(n, partial);
-		// 		}
-		// 		synth.datatable.end(true);
-		// 	break;
-		// }
-		
-		// ----------------- PLOTTING THE WAVEFORM ---------------------
-		// waveplot.begin();
-		// ofClear(0, 0, 0, 0);
-		
-		// ofSetColor(255);
-		// ofDrawRectangle(1, 1, waveplot.getWidth()-2, waveplot.getHeight()-2);
-		// ofTranslate(2, 2);
-        // ofSetColor(255);
-		// // switch( mode ){
-		// // 	case 0: // plot the raw waveforms
-        // ofPolyline line;
-        // for(int n=0; n<numBins; ++n){
-        //     float y = ofMap(ampHist[n], 0, 1., 0., 1.);
-        //     ofPoint p;
-        //     p.set(waveplot.getWidth() * n / numBins, y * waveplot.getHeight());
-        //     line.addVertex(p);
-        // }
-        // line.draw();
-		// 	break;
-			
-		// 	case 1: // plot the partials
-		// 		for(int n=0; n<numBins; ++n){
-		// 			float partial = ofMap(ampHist[n], 0, 255, 0.0f, 1.0f);
-		// 			int h = waveplot.getHeight() * partial;
-		// 			int y = waveplot.getHeight() - h;
-		// 			ofDrawLine(n*2, y, n*2, numBins );
-		// 		}
-		// 	break;
-		// }
-		// waveplot.end();
-		
+
+        physarumTrigger.trigger(maxTurnSpeed * physarumActivity);
+        float pitch = ofMap(maxAvgSense, 0., 1., 40.f, 48.f);
+        physarumPitch.set(pitch);
     }
     
 }
@@ -217,7 +196,7 @@ void ofApp::draw(){
 	float timeOfDay = ofGetElapsedTimef() * 0.1;
 	float camDist = width * 1.1;
 	float camX = centreX + (camDist * std::sin(timeOfDay));
-	float camY = centreY - depth * 0.2;//(camDist * (0.5 * std::sin(timeOfDay / 3) + 0.5));
+	float camY = centreY - (depth * 0.2) + (depth * 0.2 * std::sin(timeOfDay / 3));
 	float camZ = centreZ + (camDist * std::cos(timeOfDay));
 	// float camX = centreX;
 	// float camY = centreY - camDist;
@@ -243,10 +222,13 @@ void ofApp::draw(){
 
     cam.end();
     
-    boids.drawGui(10, 10);
-    physarum.drawGui(10, ofGetHeight() * 0.25 + 10);
+    bool drawGui = false;
+    if (drawGui) {
+        boids.drawGui(10, 10);
+        physarum.drawGui(10, ofGetHeight() * 0.25 + 10);
 
-    ofDrawBitmapString("fps: " + ofToString(ofGetFrameRate()), ofGetWidth() - 100, 20);
+        ofDrawBitmapString("fps: " + ofToString(ofGetFrameRate()), ofGetWidth() - 100, 20);
+    }
 
 // //     string info = "datatable mode (press m to change): ";
 // //     switch(mode){

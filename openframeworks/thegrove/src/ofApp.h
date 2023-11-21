@@ -38,6 +38,10 @@ class ofApp : public ofBaseApp{
 		float windStrength;
 		ofVec2f windDirection;
 
+		float boidActivity;
+		float physarumActivity;
+		float selfOrganisingActivity;
+
 		ofCamera cam;
 
         int numBins;
@@ -45,8 +49,17 @@ class ofApp : public ofBaseApp{
         pdsp::Engine engine;
 
 		vector<BoidsSynth> boidSynths;
+		vector<pdsp::ValueControl>  boidsAmpCtrls;
+    	vector<pdsp::ValueControl>  boidsPitchCtrls;
+
 		vector<SelfOrganisingSynth> selfOrganisingSynths;
+
 		PhysarumSynth physarumSynth;
+		pdsp::TriggerControl physarumTrigger;
+		pdsp::ValueControl physarumPitch;
+
+		pdsp::ValueControl boidAmp;
+		pdsp::ValueControl selfOrganisingAmp;
 		
         ofxPanel                    gui;
 };

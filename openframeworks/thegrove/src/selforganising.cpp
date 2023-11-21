@@ -97,7 +97,7 @@ Tree SelfOrganising::addTree(ofVec3f startPos, ofVec3f dir, int treeIdx) {
 
 	Tree tree;
 	tree.initialWidth = 0.5;
-	tree.axillaryAngle = 0.3 * PI;
+	tree.axillaryAngle = 0.2 * PI;
 	tree.baseLength = 10.;
 
 	shared_ptr<Metamer> newMetamer(new Metamer());
@@ -119,7 +119,7 @@ Tree SelfOrganising::addTree(ofVec3f startPos, ofVec3f dir, int treeIdx) {
 
 	tree.root = newMetamer;
 	tree.alpha = 2.;
-	tree.lambda = 0.56;
+	tree.lambda = 0.52;
 	tree.occupancyFactor = 2.;
 	tree.perceptionFactor = 5.;
 	tree.perceptionAngle = 0.3 * PI;
@@ -215,7 +215,7 @@ void SelfOrganising::basipetalPass() {
 			// This is the root metamer
 			Tree & tree = trees[state.treeIdx];
 			tree.v = tree.alpha * (state.metamer->terminalQ + state.metamer->axillaryQ);
-			if (tree.v > 500) {
+			if (tree.v > 1000) {
 				tree.lambda = 0.46;
 				tree.tropismDir = ofVec3f(0., -1., 0.);
 			}
@@ -364,7 +364,7 @@ shared_ptr<Metamer> SelfOrganising::addMetamer(shared_ptr<Metamer> parent_metame
 }
 
 
-void SelfOrganising::update(float _windStrength, ofVec2f _windDirection) {
+void SelfOrganising::update(float _windStrength, ofVec2f _windDirection, float activity) {
 	for (int i = 0; i < numBins; i++) {
 		newMetamerHist[i] = 0;
 	}
@@ -376,6 +376,7 @@ void SelfOrganising::update(float _windStrength, ofVec2f _windDirection) {
 	for (int i = 0; i < trees.size(); i++) {
 		Tree & tree = trees[i];
 		tree.tropismDir = ofVec3f(windDirection.x * _windStrength, tree.tropismDir.y, windDirection.y * _windStrength);
+		tree.alpha = 2. * activity;
 	}
 
 	if (metamerIdx < MAX_METAMERS * 0.5) {

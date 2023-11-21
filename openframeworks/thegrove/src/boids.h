@@ -8,7 +8,7 @@ class Boids{
 
 	public:
 		void setup(int _numBins, int _width, int _height, int _depth);
-		void update(float windStrength, ofVec2f windDirection);
+		void update(float windStrength, ofVec2f windDirection, float activity);
 		void draw();
 		void drawGui(int x, int y);
 

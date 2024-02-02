@@ -105,10 +105,10 @@ def update_state(state, action, num_agents, decay_rate, map_size):
     position, theta, concentrations = unpack_state(state.state, num_agents, map_size)
     action = jnp.concatenate([action, jnp.ones_like(action)], axis=1)
     d_theta, speed, deposit_amount = unpack_act(action)
-    N = normal(theta)
+    new_theta = jnp.mod(theta + d_theta, 2 * jnp.pi)
+    N = normal(new_theta)
     speed = speed.reshape((-1, 1))
     new_position = jnp.mod(position + speed * N, map_size)
-    new_theta = jnp.mod(theta + d_theta, 2 * jnp.pi)
     quantized_positions = jnp.round(position).astype(int)
     concentrations = concentrations.at[quantized_positions[:, 0], quantized_positions[:, 1]].add(deposit_amount).clip(0, 1)
 
@@ -141,11 +141,14 @@ def calc_entropy(concentrations: jnp.ndarray) -> jnp.ndarray:
         # get the spectrum of the image
         spectrum = jnp.fft.fft2(concentrations)
         spectrum = jnp.abs(spectrum)
-        spectrum = spectrum / spectrum.sum()
+        spec_sum = spectrum.sum()
+        spec_sum_d = jnp.where(spec_sum == 0.0, 1.0, spec_sum)
+        spectrum = jnp.where(spec_sum == 0.0, 0.0, spectrum / spec_sum_d)
         spectrum = spectrum.flatten()
 
         # calculate the entropy
-        ent += -(spectrum * jnp.log(spectrum)).sum()
+        epsilon = 1e-12
+        ent += -(spectrum * jnp.log(spectrum + epsilon)).sum()
 
     return ent
 

@@ -30,6 +30,8 @@ from flax.struct import dataclass
 from evojax.task.base import VectorizedTask
 from evojax.task.base import TaskState
 
+import rewards
+
 @dataclass
 class State(TaskState):
     obs: jnp.ndarray
@@ -59,10 +61,10 @@ def pack_state(position: jnp.ndarray, theta: jnp.ndarray, concentrations: jnp.nd
     return jnp.concatenate([position, theta, concentrations])
 
 def unpack_state(state: jnp.ndarray, num_agents: int, map_size: int) -> jnp.ndarray:
-    position = state[:num_agents * 2].reshape((num_agents, 2))
-    theta = state[num_agents * 2:num_agents * 3].reshape((num_agents,))
-    concentrations = state[num_agents * 3:].reshape((map_size, map_size))
-    return position, theta, concentrations
+    position = state[..., :num_agents * 2].reshape((num_agents, 2))
+    theta = state[..., num_agents * 2:num_agents * 3].reshape((num_agents,))
+    concentration = state[..., num_agents * 3:].reshape((map_size, map_size))
+    return position, theta, concentration
 
 
 def displacement(p1: jnp.ndarray, p2: jnp.ndarray) -> jnp.ndarray:
@@ -124,38 +126,9 @@ def update_state(state, action, num_agents, decay_rate, map_size):
     new_state = pack_state(new_position, new_theta, concentrations)
     return new_state
 
-
-def calc_entropy(concentrations: jnp.ndarray) -> jnp.ndarray:
-    # calculate the multi-scale entropy of the image
-    # progressively downsample the image and calculate the entropy
-    # of each scale
-    ent = 0
-    for i in range(1, 4):
-        # downsample the image
-        window = jnp.array([[0.0625, 0.125, 0.0625],
-                            [0.125, 0.25, 0.125],
-                            [0.0625, 0.125, 0.0625]], dtype=jnp.float16)
-        concentrations = jsp.signal.convolve(concentrations, window, mode='same')
-        concentrations = concentrations[::2, ::2]
-
-        # get the spectrum of the image
-        spectrum = jnp.fft.fft2(concentrations)
-        spectrum = jnp.abs(spectrum)
-        spec_sum = spectrum.sum()
-        spec_sum_d = jnp.where(spec_sum == 0.0, 1.0, spec_sum)
-        spectrum = jnp.where(spec_sum == 0.0, 0.0, spectrum / spec_sum_d)
-        spectrum = spectrum.flatten()
-
-        # calculate the entropy
-        epsilon = 1e-12
-        ent += -(spectrum * jnp.log(spectrum + epsilon)).sum()
-
-    return ent
-
-
 def get_reward(state: State, max_steps: jnp.int32, reward_type: jnp.int32, num_agents: jnp.int32, map_size: jnp.int32):
     position, theta, concentrations = unpack_state(state.state, num_agents, map_size)
-    reward = calc_entropy(concentrations)
+    reward = rewards.get_multiscale_entropy(concentrations)
     reward = jax.lax.cond(
         reward_type == 0,
         lambda x: -x,
@@ -198,7 +171,7 @@ class PhysarumTask(VectorizedTask):
         self.max_steps = max_steps
         self.num_agents = num_agents
         self.map_size = map_size
-        self.obs_shape = tuple([num_agents, (2 * sense_dist) ** 2 + 1])
+        self.obs_shape = tuple([0]) # we can save VRAM space by just using the state as the observation
         self.act_shape = tuple([num_agents, 3])
 
         def reset_fn(key):
@@ -207,7 +180,7 @@ class PhysarumTask(VectorizedTask):
             theta = sample_theta(key, num_agents)
             concentrations = jnp.zeros((map_size, map_size), dtype=jnp.float16)
             state = pack_state(position, theta, concentrations)
-            return State(obs=pack_obs(state, num_agents, sense_dist, map_size),
+            return State(obs=jnp.zeros(()),
                          state=state,
                          steps=jnp.zeros((), dtype=jnp.int32),
                          key=next_key)
@@ -219,7 +192,7 @@ class PhysarumTask(VectorizedTask):
 
         def step_fn(state, action):
             new_state = update_state(state, action, num_agents, decay_rate, map_size)
-            new_obs = pack_obs(new_state, num_agents, sense_dist, map_size)
+            new_obs = jnp.zeros(())
             new_steps = jnp.int32(state.steps + 1)
             next_key, _ = jax.random.split(state.key)
             reward = get_reward(state, max_steps, reward_type, num_agents, map_size)

@@ -20,18 +20,19 @@ from evojax.policy.base import PolicyNetwork, PolicyState
 from evojax.task.base import TaskState
 from evojax.util import create_logger, get_params_format_fn
 
-from physarum_task import PhysarumTask
+from physarum_task import PhysarumTask, unpack_state
 
 
 class PhysarumPolicyNetwork(PolicyNetwork):
-    def __init__(self, num_agents, patch_size, jit=True, logger=None):
+    def __init__(self, num_agents, map_size, max_sensor_dist, jit=True, logger=None):
         if logger is None:
             self._logger = create_logger(name='PhysarumPolicyNetwork')
         else:
             self._logger = logger
 
         self.num_agents = num_agents
-        self.patch_size = patch_size
+        self.map_size = map_size
+        self.max_sensor_dist = max_sensor_dist
 
         params = FrozenDict({
             'sensor_distance': random.uniform(random.PRNGKey(0), (1,), minval=0.1, maxval=10.),
@@ -42,29 +43,38 @@ class PhysarumPolicyNetwork(PolicyNetwork):
         self._format_params_fn = jax.vmap(format_params_fn)
 
         # Wrap the action computation in jax.vmap for vectorization
+        self._get_actions_fn = jax.vmap(self._compute_actions)
         if jit:
-            self._get_actions_fn = jax.jit(jax.vmap(self._compute_actions))
-        else:
-            self._get_actions_fn = jax.vmap(self._compute_actions)
+            self._get_actions_fn = jax.jit(self._get_actions_fn)
 
-    def _compute_actions(self, concentrations, directions, params):
-        front_offsets, left_offsets, right_offsets = self._get_offsets(directions, params)
+    def _compute_actions(self, state, params):
+        positions, directions, concentration = unpack_state(state, self.num_agents, self.map_size)
+        sensor_dist = (self.max_sensor_dist / 4) * (1 + params['sensor_distance'])
+        sensor_dist = jnp.clip(sensor_dist, 0., self.max_sensor_dist / 2)
+        # map -1 to 1, to 0 to pi
+        sensor_angle = (jnp.pi / 2) * (1 + params['sensor_angle']) 
+        sensor_angle = jnp.clip(sensor_angle, 0., jnp.pi)
+
+        front_offsets, left_offsets, right_offsets = self._get_offsets(directions, sensor_dist, sensor_angle)
 
         # concentrations are centered on positions
-        positions = jnp.stack([self.patch_size / 2, self.patch_size / 2], axis=-1)
         front_sensors = positions + front_offsets
         left_sensors = positions + left_offsets
         right_sensors = positions + right_offsets
 
-        def get_concentration(concentrations, sensors):
-            return concentrations[sensors[0].astype(jnp.int32), sensors[1].astype(jnp.int32)]
+        def get_concentration(sensors):
+            return concentration[sensors[0], sensors[1]]
         
-        get_concentration = jax.vmap(get_concentration)
-        front_concentration = get_concentration(concentrations, front_sensors)
-        left_concentration = get_concentration(concentrations, left_sensors)
-        right_concentration = get_concentration(concentrations, right_sensors)
+        front_sensors = front_sensors.astype(jnp.int32)
+        left_sensors = left_sensors.astype(jnp.int32)
+        right_sensors = right_sensors.astype(jnp.int32)
 
-        sensor_angle = params['sensor_angle']
+        get_concentration = jax.vmap(get_concentration)
+
+        front_concentration = get_concentration(front_sensors)
+        left_concentration = get_concentration(left_sensors)
+        right_concentration = get_concentration(right_sensors)
+
         steer_left = left_concentration > front_concentration
         steer_right = right_concentration > front_concentration
         d_theta = sensor_angle * steer_left - sensor_angle * steer_right
@@ -76,22 +86,17 @@ class PhysarumPolicyNetwork(PolicyNetwork):
 
         return actions
 
-    def _get_offsets(self, directions, params):
-        sensor_distance = params['sensor_distance']
-        sensor_angle = params['sensor_angle']
-        front_offsets = sensor_distance * jnp.concatenate([jnp.cos(directions), jnp.sin(directions)], axis=-1)
-        left_offsets = sensor_distance * jnp.concatenate([jnp.cos(directions + sensor_angle), jnp.sin(directions + sensor_angle)], axis=-1)
-        right_offsets = sensor_distance * jnp.concatenate([jnp.cos(directions - sensor_angle), jnp.sin(directions - sensor_angle)], axis=-1)
+    def _get_offsets(self, directions, sensor_distance, sensor_angle):
+        front_offsets = sensor_distance * jnp.stack([jnp.cos(directions), jnp.sin(directions)], axis=-1)
+        left_offsets = sensor_distance * jnp.stack([jnp.cos(directions + sensor_angle), jnp.sin(directions + sensor_angle)], axis=-1)
+        right_offsets = sensor_distance * jnp.stack([jnp.cos(directions - sensor_angle), jnp.sin(directions - sensor_angle)], axis=-1)
         return front_offsets, left_offsets, right_offsets
 
     def get_actions(self, t_states: TaskState, params: jnp.ndarray, p_states: PolicyState) -> Tuple[jnp.ndarray, PolicyState]:
         if self.num_params > 0:
             params = self._format_params_fn(params)
 
-        concentrations, directions = t_states.obs[..., :-1], t_states.obs[..., -1:]
-        concentrations = jnp.reshape(concentrations, (concentrations.shape[:-1] + (self.patch_size, self.patch_size)))
-
-        actions = self._get_actions_fn(concentrations, directions, params)
+        actions = self._get_actions_fn(t_states.state, params)
 
         # Update policy state if necessary
         new_p_states = p_states
@@ -126,8 +131,6 @@ class PhysarumVisualize:
         self.chemical_image = ax.imshow(test_task.render(self.task_state, 0), cmap='viridis', origin='lower', vmin=0., vmax=1.)
 
     def update(self, t):
-        assert self.task_state.obs.ndim == 3
-        num_tasks, num_agents, num_obs = self.task_state.obs.shape
         action, self.policy_state = self.action_fn(self.task_state, self.best_params, self.policy_state)
         self.task_state, reward, done = self.step_fn(self.task_state, action)
         self.chemical_image.set_data(self.test_task.render(self.task_state, 0))
@@ -144,12 +147,14 @@ def main():
     init_std = 0.095
     center_lr = 0.011
     std_lr = 0.054
-    max_iter = 100
+    max_iter = 500
     log_interval = 10
     test_interval = 100
-    num_tests = 100
+    num_tests = 1
+    n_evaluations = 1
     n_repeats = 1
-    pop_size = 4
+    pop_size = 64
+    elite_ratio = 0.1
     seed = 42
     algo = 'ars'
 
@@ -168,7 +173,7 @@ def main():
     sense_dist = 5
     train_task = PhysarumTask(max_steps=max_steps, num_agents=num_agents, map_size=map_size, sense_dist=sense_dist, jit=jit)
     test_task = PhysarumTask(max_steps=max_steps, num_agents=num_agents, map_size=map_size, sense_dist=sense_dist, jit=jit)
-    policy = PhysarumPolicyNetwork(num_agents, patch_size=sense_dist * 2, logger=logger, jit=jit)
+    policy = PhysarumPolicyNetwork(num_agents, map_size, sense_dist, logger=logger, jit=jit)
 
     if max_iter > 0 and policy.num_params > 0:
             
@@ -187,7 +192,7 @@ def main():
             solver = ARS_native(
                 param_size=policy.num_params,
                 pop_size=pop_size,
-                elite_ratio=0.1,
+                elite_ratio=elite_ratio,
             )
         else:
             raise ValueError(f"Unknown algorithm: {algo}.")
@@ -201,9 +206,8 @@ def main():
             max_iter=max_iter,
             log_interval=log_interval,
             test_interval=test_interval,
-            n_evaluations=10,
+            n_evaluations=n_evaluations,
             n_repeats=n_repeats,
-            use_for_loop=True,
             test_n_repeats=num_tests,
             seed=seed,
             log_dir=log_dir,
@@ -222,9 +226,16 @@ def main():
     if max_iter > 0:
         best_params = trainer.solver.best_params[None, :]
     else:
-        best_params = jnp.zeros((policy.num_params))
+        # best_params = jnp.zeros((policy.num_params))
+        best_params = jnp.array([0., 0.])
 
-    physarum = PhysarumVisualize(test_task, policy, best_params, jit=jit, max_steps=max_steps)
+    max_steps = 1000
+    num_agents = 1000
+    map_size = 400
+    sense_dist = 5
+    viz_task = PhysarumTask(max_steps=max_steps, num_agents=num_agents, map_size=map_size, sense_dist=sense_dist, jit=jit)
+    policy = PhysarumPolicyNetwork(num_agents, map_size, sense_dist, logger=logger, jit=jit)
+    physarum = PhysarumVisualize(viz_task, policy, best_params, jit=jit, max_steps=max_steps)
 
     gif_file = os.path.join(log_dir, 'physarum.gif')
     physarum.draw(gif_file)

@@ -6,7 +6,8 @@ def get_multiscale_entropy(concentrations: jnp.ndarray) -> jnp.ndarray:
     # progressively downsample the image and calculate the entropy
     # of each scale
     ent = 0
-    for i in range(1, 4):
+    num_scale = 10
+    for _ in range(num_scale):
         # downsample the image
         window = jnp.array([[0.0625, 0.125, 0.0625],
                             [0.125, 0.25, 0.125],
@@ -25,6 +26,8 @@ def get_multiscale_entropy(concentrations: jnp.ndarray) -> jnp.ndarray:
         # calculate the entropy
         epsilon = 1e-12
         ent += -(spectrum * jnp.log(spectrum + epsilon)).sum()
+
+    ent /= (num_scale * spectrum.size)
 
     # we want to maximise entropy
     return ent

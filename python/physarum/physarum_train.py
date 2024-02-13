@@ -17,6 +17,7 @@ import tqdm
 from evojax import Trainer, util
 from evojax.algo import PGPE, ARS_native
 from evojax.policy.base import PolicyNetwork, PolicyState
+from evojax.policy.mlp import MLP
 from evojax.task.base import TaskState
 from evojax.util import create_logger, get_params_format_fn
 
@@ -24,7 +25,7 @@ from physarum_task import PhysarumTask, unpack_state
 
 
 class PhysarumPolicyNetwork(PolicyNetwork):
-    def __init__(self, num_agents, map_size, max_sensor_dist, jit=True, logger=None):
+    def __init__(self, num_agents, map_size, max_sensor_dist, action_method='mlp', jit=True, logger=None):
         if logger is None:
             self._logger = create_logger(name='PhysarumPolicyNetwork')
         else:
@@ -34,10 +35,23 @@ class PhysarumPolicyNetwork(PolicyNetwork):
         self.map_size = map_size
         self.max_sensor_dist = max_sensor_dist
 
-        params = FrozenDict({
+        param_dict = {
             'sensor_distance': random.uniform(random.PRNGKey(0), (1,), minval=0.1, maxval=10.),
             'sensor_angle': random.uniform(random.PRNGKey(1), (1,), minval=0.1, maxval=jnp.pi / 2),
-        })
+        }
+
+        self.action_method = action_method
+        if self.action_method == 'mlp':
+            hidden_dims = [5]
+            input_dim = 3
+            output_dim = 3
+            output_act_fn = 'tanh'
+            self.model = MLP(
+                feat_dims=hidden_dims, out_dim=output_dim, out_fn=output_act_fn)
+            params = self.model.init(random.PRNGKey(0), jnp.ones([1, input_dim]))
+            param_dict['mlp'] = params
+
+        params = FrozenDict(param_dict)
 
         self.num_params, format_params_fn = get_params_format_fn(params)
         self._format_params_fn = jax.vmap(format_params_fn)
@@ -49,8 +63,8 @@ class PhysarumPolicyNetwork(PolicyNetwork):
 
     def _compute_actions(self, state, params):
         positions, directions, concentration = unpack_state(state, self.num_agents, self.map_size)
-        sensor_dist = (self.max_sensor_dist / 4) * (1 + params['sensor_distance'])
-        sensor_dist = jnp.clip(sensor_dist, 0., self.max_sensor_dist / 2)
+        sensor_dist = (self.max_sensor_dist / 2) * (1 + params['sensor_distance'])
+        sensor_dist = jnp.clip(sensor_dist, 0., self.max_sensor_dist)
         # map -1 to 1, to 0 to pi
         sensor_angle = (jnp.pi / 2) * (1 + params['sensor_angle']) 
         sensor_angle = jnp.clip(sensor_angle, 0., jnp.pi)
@@ -75,6 +89,16 @@ class PhysarumPolicyNetwork(PolicyNetwork):
         left_concentration = get_concentration(left_sensors)
         right_concentration = get_concentration(right_sensors)
 
+        if self.action_method == 'default':
+            actions = self._default_concentration_action(front_concentration, left_concentration, right_concentration, sensor_angle)
+        elif self.action_method == 'mlp':
+            mlp_params = params['mlp']
+            inputs = jnp.stack([front_concentration, left_concentration, right_concentration], axis=-1)
+            actions = self.model.apply(mlp_params, inputs)
+
+        return actions
+    
+    def _default_concentration_action(self, front_concentration, left_concentration, right_concentration, sensor_angle):
         steer_left = left_concentration > front_concentration
         steer_right = right_concentration > front_concentration
         d_theta = sensor_angle * steer_left - sensor_angle * steer_right
@@ -83,7 +107,6 @@ class PhysarumPolicyNetwork(PolicyNetwork):
         deposit = jnp.ones_like(d_theta)
 
         actions = jnp.stack([d_theta, speed, deposit], axis=-1)
-
         return actions
 
     def _get_offsets(self, directions, sensor_distance, sensor_angle):
@@ -156,7 +179,7 @@ def main():
     pop_size = 64
     elite_ratio = 0.1
     seed = 42
-    algo = 'ars'
+    algo = 'pgpe'
 
     log_dir = './log/physarum'
     if not os.path.exists(log_dir):
@@ -167,13 +190,37 @@ def main():
     logger.info('EvoJAX Physarum')
     logger.info('=' * 30)
 
-    max_steps = 1000
+    reward_type = 'mse'
+    maximise_reward = True
+
+    max_steps = 500
     num_agents = 500
     map_size = 100
-    sense_dist = 5
-    train_task = PhysarumTask(max_steps=max_steps, num_agents=num_agents, map_size=map_size, sense_dist=sense_dist, jit=jit)
-    test_task = PhysarumTask(max_steps=max_steps, num_agents=num_agents, map_size=map_size, sense_dist=sense_dist, jit=jit)
-    policy = PhysarumPolicyNetwork(num_agents, map_size, sense_dist, logger=logger, jit=jit)
+    sense_dist = 10
+    train_task = PhysarumTask(
+        max_steps=max_steps, 
+        num_agents=num_agents, 
+        map_size=map_size,
+        reward_type=reward_type,
+        maximise_reward=maximise_reward,
+        jit=jit
+    )
+    test_task = PhysarumTask(
+        max_steps=max_steps, 
+        num_agents=num_agents, 
+        map_size=map_size,
+        reward_type=reward_type,
+        maximise_reward=maximise_reward,
+        jit=jit
+    )
+
+    policy = PhysarumPolicyNetwork(
+        num_agents, 
+        map_size, 
+        sense_dist, 
+        logger=logger, 
+        jit=jit
+    )
 
     if max_iter > 0 and policy.num_params > 0:
             
@@ -227,15 +274,9 @@ def main():
         best_params = trainer.solver.best_params[None, :]
     else:
         # best_params = jnp.zeros((policy.num_params))
-        best_params = jnp.array([0., 0.])
+        best_params = jnp.array([-0.2, 0.0])
 
-    max_steps = 1000
-    num_agents = 1000
-    map_size = 400
-    sense_dist = 5
-    viz_task = PhysarumTask(max_steps=max_steps, num_agents=num_agents, map_size=map_size, sense_dist=sense_dist, jit=jit)
-    policy = PhysarumPolicyNetwork(num_agents, map_size, sense_dist, logger=logger, jit=jit)
-    physarum = PhysarumVisualize(viz_task, policy, best_params, jit=jit, max_steps=max_steps)
+    physarum = PhysarumVisualize(test_task, policy, best_params, jit=jit, max_steps=max_steps)
 
     gif_file = os.path.join(log_dir, 'physarum.gif')
     physarum.draw(gif_file)

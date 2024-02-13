@@ -126,14 +126,16 @@ def update_state(state, action, num_agents, decay_rate, map_size):
     new_state = pack_state(new_position, new_theta, concentrations)
     return new_state
 
-def get_reward(state: State, max_steps: jnp.int32, reward_type: jnp.int32, num_agents: jnp.int32, map_size: jnp.int32):
-    position, theta, concentrations = unpack_state(state.state, num_agents, map_size)
-    reward = rewards.get_multiscale_entropy(concentrations)
-    reward = jax.lax.cond(
-        reward_type == 0,
-        lambda x: -x,
-        lambda x: -x * (state.steps / max_steps) ** 2,
-        reward)
+def get_reward(state: State, max_steps: jnp.int32, reward_func, maximise_reward: bool, num_agents: jnp.int32, map_size: jnp.int32):
+    _, _, concentrations = unpack_state(state.state, num_agents, map_size)
+    reward = reward_func(concentrations)
+    if not maximise_reward:
+        reward = -reward
+    # reward = jax.lax.cond(
+    #     reward_type == 0,
+    #     lambda x: x,
+    #     lambda x: x * (state.steps / max_steps) ** 2,
+    #     reward)
     return reward
 
 
@@ -160,12 +162,11 @@ class PhysarumTask(VectorizedTask):
     def __init__(
             self,
             max_steps: int = 150,
-            reward_type: int = 0,  # (0: as it is, 1: increase rewards for late step)
-            action_type: int = 0,   # (0: theta, 1: theta/speed)
             num_agents: int = 1000,
             map_size: int = 100,
-            sense_dist: int = 5,
             decay_rate: float = 0.1,
+            reward_type: str = 'mse',
+            maximise_reward: bool = True,
             jit=True
             ):
         self.max_steps = max_steps
@@ -173,6 +174,9 @@ class PhysarumTask(VectorizedTask):
         self.map_size = map_size
         self.obs_shape = tuple([0]) # we can save VRAM space by just using the state as the observation
         self.act_shape = tuple([num_agents, 3])
+
+        if reward_type == 'mse':
+            reward_func = rewards.get_multiscale_entropy
 
         def reset_fn(key):
             next_key, key = jax.random.split(key)
@@ -195,7 +199,7 @@ class PhysarumTask(VectorizedTask):
             new_obs = jnp.zeros(())
             new_steps = jnp.int32(state.steps + 1)
             next_key, _ = jax.random.split(state.key)
-            reward = get_reward(state, max_steps, reward_type, num_agents, map_size)
+            reward = get_reward(state, max_steps, reward_func, maximise_reward, num_agents, map_size)
             done = jnp.where(max_steps <= new_steps, True, False)
             return State(obs=new_obs,
                          state=new_state,

@@ -17,15 +17,16 @@ This flocking task is based on the following colab notebook:
 https://github.com/google/jax-md/blob/main/notebooks/flocking.ipynb
 """
 
-from PIL import Image, ImageDraw
+from PIL import Image
 from functools import partial
 from typing import Tuple
 
+from flax.struct import dataclass
 import jax
 from jax import vmap
 import jax.numpy as jnp
 import jax.scipy as jsp
-from flax.struct import dataclass
+import numpy as np
 
 from evojax.task.base import VectorizedTask
 from evojax.task.base import TaskState
@@ -126,16 +127,31 @@ def update_state(state, action, num_agents, decay_rate, map_size):
     new_state = pack_state(new_position, new_theta, concentrations)
     return new_state
 
-def get_reward(state: State, max_steps: jnp.int32, reward_func, maximise_reward: bool, num_agents: jnp.int32, map_size: jnp.int32):
+def get_reward(state: State, max_steps: jnp.int32, reward_type, maximise_reward: bool, num_agents: jnp.int32, map_size: jnp.int32):
     _, _, concentrations = unpack_state(state.state, num_agents, map_size)
-    reward = reward_func(concentrations)
-    if not maximise_reward:
-        reward = -reward
+    if reward_type == 'mse':
+        reward = rewards.get_multiscale_entropy(concentrations)
+    elif reward_type == 'energy':
+        reward = rewards.get_energy(concentrations)
+    elif reward_type == 'diff_sine':
+        reward = rewards.get_diff_sine(concentrations, state.steps)
+
+    reward = jax.lax.cond(
+        maximise_reward,
+        lambda x: x,
+        lambda x: -x,
+        reward)
+    reward = jax.lax.cond(
+        True,
+        lambda x: x,
+        lambda x: x * (state.steps / max_steps) ** 2,
+        reward)
     # reward = jax.lax.cond(
-    #     reward_type == 0,
-    #     lambda x: x,
-    #     lambda x: x * (state.steps / max_steps) ** 2,
-    #     reward)
+    #     state.steps >= max_steps - 5,
+    #     lambda x: reward_func(x),
+    #     lambda x: 0.0,
+    #     concentrations
+    # )
     return reward
 
 
@@ -154,7 +170,9 @@ def rotate(px, py, cx, cy, angle):
 
 def render_single(obs_single, num_agents, map_size):
     _, _, concentration = unpack_state(obs_single, num_agents, map_size)
-    return concentration
+    image = (np.array(concentration) * 255).astype(np.uint8)
+    pillow_image = Image.fromarray(image, mode='L')
+    return pillow_image
 
 
 class PhysarumTask(VectorizedTask):
@@ -174,9 +192,6 @@ class PhysarumTask(VectorizedTask):
         self.map_size = map_size
         self.obs_shape = tuple([0]) # we can save VRAM space by just using the state as the observation
         self.act_shape = tuple([num_agents, 3])
-
-        if reward_type == 'mse':
-            reward_func = rewards.get_multiscale_entropy
 
         def reset_fn(key):
             next_key, key = jax.random.split(key)
@@ -199,7 +214,7 @@ class PhysarumTask(VectorizedTask):
             new_obs = jnp.zeros(())
             new_steps = jnp.int32(state.steps + 1)
             next_key, _ = jax.random.split(state.key)
-            reward = get_reward(state, max_steps, reward_func, maximise_reward, num_agents, map_size)
+            reward = get_reward(state, max_steps, reward_type, maximise_reward, num_agents, map_size)
             done = jnp.where(max_steps <= new_steps, True, False)
             return State(obs=new_obs,
                          state=new_state,

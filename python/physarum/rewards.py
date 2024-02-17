@@ -6,7 +6,7 @@ def get_multiscale_entropy(concentrations: jnp.ndarray) -> jnp.ndarray:
     # progressively downsample the image and calculate the entropy
     # of each scale
     ent = 0
-    num_scale = 10
+    num_scale = 5
     for _ in range(num_scale):
         # downsample the image
         window = jnp.array([[0.0625, 0.125, 0.0625],
@@ -31,3 +31,14 @@ def get_multiscale_entropy(concentrations: jnp.ndarray) -> jnp.ndarray:
 
     # we want to maximise entropy
     return ent
+
+
+def get_energy(concentrations: jnp.ndarray) -> jnp.ndarray:
+    return jnp.sum(concentrations) / concentrations.size
+
+
+def get_diff_sine(concentrations: jnp.ndarray, state_steps: jnp.ndarray) -> jnp.ndarray:
+    desired_value = 0.5 * (jnp.sin(state_steps / 50) + 1)
+    concentrations_mean = jnp.mean(concentrations)
+    return jnp.abs(concentrations_mean - desired_value)
+

@@ -10,8 +10,7 @@ from flax.core import FrozenDict
 import jax
 import jax.numpy as jnp
 from jax import random
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
+import PIL
 import tqdm
 
 from evojax import Trainer, util
@@ -34,10 +33,17 @@ class PhysarumPolicyNetwork(PolicyNetwork):
         self.num_agents = num_agents
         self.map_size = map_size
         self.max_sensor_dist = max_sensor_dist
+        self.max_sensor_angle = jnp.pi
+        self.min_speed = 0.5
+        self.max_speed = 2.0
+        self.min_deposit = 0.0
+        self.max_deposit = 5.0
+        self.min_turn = -jnp.pi
+        self.max_turn = jnp.pi
 
         param_dict = {
-            'sensor_distance': random.uniform(random.PRNGKey(0), (1,), minval=0.1, maxval=10.),
-            'sensor_angle': random.uniform(random.PRNGKey(1), (1,), minval=0.1, maxval=jnp.pi / 2),
+            'sensor_distance': random.uniform(random.PRNGKey(0), (1,), minval=0.1, maxval=self.max_sensor_dist),
+            'sensor_angle': random.uniform(random.PRNGKey(1), (1,), minval=0.1, maxval=self.max_sensor_angle),
         }
 
         self.action_method = action_method
@@ -66,8 +72,8 @@ class PhysarumPolicyNetwork(PolicyNetwork):
         sensor_dist = (self.max_sensor_dist / 2) * (1 + params['sensor_distance'])
         sensor_dist = jnp.clip(sensor_dist, 0., self.max_sensor_dist)
         # map -1 to 1, to 0 to pi
-        sensor_angle = (jnp.pi / 2) * (1 + params['sensor_angle']) 
-        sensor_angle = jnp.clip(sensor_angle, 0., jnp.pi)
+        sensor_angle = (self.max_sensor_angle / 2) * (1 + params['sensor_angle']) 
+        sensor_angle = jnp.clip(sensor_angle, 0., self.max_sensor_angle)
 
         front_offsets, left_offsets, right_offsets = self._get_offsets(directions, sensor_dist, sensor_angle)
 
@@ -95,6 +101,16 @@ class PhysarumPolicyNetwork(PolicyNetwork):
             mlp_params = params['mlp']
             inputs = jnp.stack([front_concentration, left_concentration, right_concentration], axis=-1)
             actions = self.model.apply(mlp_params, inputs)
+            # scale the actions to the correct range
+            actions = (actions + 1) / 2
+            actions *= jnp.array([
+                self.max_turn - self.min_turn,
+                self.max_speed - self.min_speed,
+                self.max_deposit - self.min_deposit
+            ])
+            actions += jnp.array([self.min_turn, self.min_speed, self.min_deposit])
+        else:
+            raise ValueError(f"Unknown action method: {self.action_method}")
 
         return actions
     
@@ -126,57 +142,50 @@ class PhysarumPolicyNetwork(PolicyNetwork):
 
         return actions, new_p_states
 
-class PhysarumVisualize:
-    def __init__(self, test_task, policy, best_params, max_steps=100, jit=True):
-        self.max_steps = max_steps
-        self.test_task = test_task
+def visualize(test_task, policy, best_params, file_path, max_steps=100, jit=True):
 
-        if jit:
-            task_reset_fn = jax.jit(test_task.reset)
-            policy_reset_fn = jax.jit(policy.reset)
-            self.step_fn = jax.jit(test_task.step)
-            self.action_fn = jax.jit(policy.get_actions)
-        else:
-            task_reset_fn = test_task.reset
-            policy_reset_fn = policy.reset
-            self.step_fn = test_task.step
-            self.action_fn = policy.get_actions
+    if jit:
+        task_reset_fn = jax.jit(test_task.reset)
+        policy_reset_fn = jax.jit(policy.reset)
+        step_fn = jax.jit(test_task.step)
+        action_fn = jax.jit(policy.get_actions)
+    else:
+        task_reset_fn = test_task.reset
+        policy_reset_fn = policy.reset
+        step_fn = test_task.step
+        action_fn = policy.get_actions
 
-        best_params = best_params.reshape(1, *best_params.shape)
-        self.best_params = best_params
+    best_params = best_params.reshape(1, *best_params.shape)
+    best_params = best_params
 
-        key = jax.random.PRNGKey(0)[None, :]
+    key = jax.random.PRNGKey(0)[None, :]
 
-        self.task_state = task_reset_fn(key)
-        self.policy_state = policy_reset_fn(self.task_state)  
+    task_state = task_reset_fn(key)
+    policy_state = policy_reset_fn(task_state)  
 
-        self.fig, ax = plt.subplots(figsize=(10, 10))
-        self.chemical_image = ax.imshow(test_task.render(self.task_state, 0), cmap='viridis', origin='lower', vmin=0., vmax=1.)
+    imgs = [test_task.render(task_state, 0)]
 
-    def update(self, t):
-        action, self.policy_state = self.action_fn(self.task_state, self.best_params, self.policy_state)
-        self.task_state, reward, done = self.step_fn(self.task_state, action)
-        self.chemical_image.set_data(self.test_task.render(self.task_state, 0))
-        return self.chemical_image,
+    for _ in tqdm.tqdm(range(max_steps)):
+        action, policy_state = action_fn(task_state, best_params, policy_state)
+        task_state, reward, done = step_fn(task_state, action)
+        imgs.append(test_task.render(task_state, 0))
 
-    def draw(self, file_path):
-        ani = FuncAnimation(self.fig, self.update, frames=tqdm.tqdm(range(self.max_steps)), interval=25, blit=True)
-        ani.save(file_path)
+    imgs[0].save(file_path, save_all=True, append_images=imgs[1:], optimize=False, duration=40, loop=0)
 
 
 def main():
     debug = False
     jit = True
-    init_std = 0.095
-    center_lr = 0.011
-    std_lr = 0.054
-    max_iter = 500
+    init_std = 0.6
+    center_lr = 0.4
+    std_lr = 0.4
+    max_iter = 200
     log_interval = 10
     test_interval = 100
     num_tests = 1
     n_evaluations = 1
     n_repeats = 1
-    pop_size = 64
+    pop_size = 128
     elite_ratio = 0.1
     seed = 42
     algo = 'pgpe'
@@ -190,13 +199,13 @@ def main():
     logger.info('EvoJAX Physarum')
     logger.info('=' * 30)
 
-    reward_type = 'mse'
-    maximise_reward = True
+    reward_type = 'diff_sine'
+    maximise_reward = False
 
     max_steps = 500
-    num_agents = 500
+    num_agents = 1000
     map_size = 100
-    sense_dist = 10
+    sense_dist = 20
     train_task = PhysarumTask(
         max_steps=max_steps, 
         num_agents=num_agents, 
@@ -217,7 +226,8 @@ def main():
     policy = PhysarumPolicyNetwork(
         num_agents, 
         map_size, 
-        sense_dist, 
+        sense_dist,
+        action_method='mlp',
         logger=logger, 
         jit=jit
     )
@@ -273,13 +283,11 @@ def main():
     if max_iter > 0:
         best_params = trainer.solver.best_params[None, :]
     else:
-        # best_params = jnp.zeros((policy.num_params))
-        best_params = jnp.array([-0.2, 0.0])
-
-    physarum = PhysarumVisualize(test_task, policy, best_params, jit=jit, max_steps=max_steps)
+        best_params = jnp.zeros((policy.num_params))
+        # best_params = jnp.array([-0.2, 0.0])
 
     gif_file = os.path.join(log_dir, 'physarum.gif')
-    physarum.draw(gif_file)
+    visualize(test_task, policy, best_params, gif_file, jit=jit, max_steps=max_steps)
     logger.info('GIF saved to {}.'.format(gif_file))
 
 

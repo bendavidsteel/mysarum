@@ -44,12 +44,14 @@ int main()
     // Initialization
     //--------------------------------------------------------------------------------------
     const int screenWidth = 800;
-    const int screenHeight = 450;
+    const int screenHeight = 800;
 
     InitWindow(screenWidth, screenHeight, "raylib");
 
     Hypercycles hypercycles;
-    hypercycles.setup(screenWidth, screenHeight);
+    int mapWidth = 10;
+    int mapHeight = 10;
+    hypercycles.setup(mapWidth, mapHeight);
 
     //--------------------------------------------------------------------------------------
 

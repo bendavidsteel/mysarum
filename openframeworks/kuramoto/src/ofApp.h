@@ -1,8 +1,11 @@
 #pragma once
 
 #include "ofMain.h"
-#include "ofBufferObject.h"
+#include "ofxMidi.h"
+#include "ofxPDSP.h"
 #include "ofxGui.h"
+#include "synth.h"
+#include "boids.h"
 
 class ofApp : public ofBaseApp{
 
@@ -22,29 +25,29 @@ class ofApp : public ofBaseApp{
 		void dragEvent(ofDragInfo dragInfo);
 		void gotMessage(ofMessage msg);
 		
-		struct Particle{
-			glm::vec4 pos;
-			glm::vec4 vel;
-			glm::vec4 attr;
-			ofFloatColor color;
-		};
+		Boids boids;
+        int boidsWidth;
+        int boidsHeight;
+        int boidsPosX;
+        int boidsPosY;
 
-		ofShader compute;
-		vector<Particle> particles;
-		ofBufferObject particlesBuffer, particlesBuffer2;
-		GLuint vaoID;
-		ofEasyCam camera;
-		ofVbo vbo;
-		ofxPanel gui;
-		ofParameter<float> fov;
-		ofParameter<float> attractionCoeff, alignmentCoeff, repulsionCoeff;
-		ofParameter<float> attractionMaxDist, alignmentMaxDist, repulsionMaxDist;
-		ofParameter<float> maxSpeed;
-		ofParameter<float> randomForce;
-		ofParameter<float> kuramotoStrength, kuramotoMaxDist;
-		ofParameterGroup shaderUniforms;
-		ofParameter<float> fps;
-		ofParameter<bool> dirAsColor;
+        int numBins;
 
-		int numParticles;
+        pdsp::Engine   engine;
+
+        PolySynth                   synth;
+        
+        pdsp::ComputerKeyboard  keyboard;
+
+        ofxPanel                    gui;
+        
+        int col;
+        int channel;
+        
+        int mode;
+        
+        ofParameter<float> smooth;
+		void smoothCall( float & value );
+		
+		ofFbo waveplot;
 };

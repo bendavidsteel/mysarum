@@ -7,7 +7,8 @@
 enum AgentSpawn{
 	RANDOM,
 	CENTRE,
-	RING
+	RING,
+	CIRCLE
 };
 
 class ofApp : public ofBaseApp{
@@ -29,17 +30,6 @@ class ofApp : public ofBaseApp{
 		void windowResized(int w, int h);
 		void dragEvent(ofDragInfo dragInfo);
 		void gotMessage(ofMessage msg);
-		void audioIn(float * input, int bufferSize, int nChannels);
-
-		ofxVideoRecorder vidRecorder;
-		ofSoundStream soundStream;
-		bool bRecording;
-		int sampleRate;
-		int channels;
-		string fileName;
-		string fileExt;
-
-		void recordingComplete(ofxVideoRecorderOutputFileCompleteEventArgs& args);
 
 		struct Agent{
 			glm::vec4 pos;

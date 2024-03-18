@@ -16,3 +16,16 @@ https://www.reddit.com/r/generative/comments/z6rzhc/physarum/
 https://www.reddit.com/r/generative/comments/vf4511/figures_of_discomfort_is_a_generative_art_project/
 https://www.youtube.com/watch?v=XSkaM-8Vgz8&t=1731s
 https://www.reddit.com/r/AlienProject/top/?t=all
+
+https://www.complexity-explorables.org/explorables/
+
+# TODO 
+https://en.wikipedia.org/wiki/Kuramoto_model
+https://github.com/s373/ofxDna
+Slime as height map
+https://boris.okunskiy.name/posts/blender-differential-growth
+https://old.reddit.com/r/proceduralgeneration/comments/rj9bms/differential_bloom/
+https://soniccharge.com/synplant
+https://www.youtube.com/watch?v=cGpYMTWFnUE
+https://github.com/aubio/aubio
+https://eodev.sourceforge.net/

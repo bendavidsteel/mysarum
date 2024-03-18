@@ -16,9 +16,10 @@ void Hypercycles::setup(int _screenWidth, int _screenHeight) {
     // initialize grid on the host
     for (int i = 0; i < screenWidth * screenHeight; i++) {
         // initialise initial grid randomly
-        d_grid_in[i] = GetRandomValue(0, 1) == 1;
+        d_grid_in[i] = (i % 2 == 0);
         d_grid_out[i] = false;
     }
+    even = true;
 
     // initialize opengl
     GLenum err = glewInit();
@@ -74,10 +75,16 @@ void Hypercycles::updateCpp() {
 }
 
 void Hypercycles::updateCuda() {
-    Automata::updateCA(d_grid_in, d_grid_out, screenWidth, screenHeight);
-    Automata::updateCAColour(d_grid_out, h_grid_out, screenWidth, screenHeight);
+    if (even) {
+        Automata::updateCA(d_grid_in, d_grid_out, screenWidth, screenHeight);
+        Automata::updateCAColour(d_grid_out, h_grid_out, screenWidth, screenHeight);
+    } else {
+        Automata::updateCA(d_grid_out, d_grid_in, screenWidth, screenHeight);
+        Automata::updateCAColour(d_grid_in, h_grid_out, screenWidth, screenHeight);
+    }
     // Wait for GPU to finish before accessing on host
     cudaDeviceSynchronize();
+    even = !even;
 
     // Map buffer object for writing from CUDA
     cudaGraphicsMapResources(1, &cuda_resource, 0);
@@ -106,7 +113,9 @@ void Hypercycles::updateCuda() {
     // glUnmapBuffer(GL_ARRAY_BUFFER);
 
     // Update the texture with the buffer data
+    glBindTexture(GL_TEXTURE_2D, textureId);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, screenWidth, screenHeight, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glBindTexture(GL_TEXTURE_2D, 0);
 
     // Unbind the buffer
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
@@ -120,7 +129,8 @@ void Hypercycles::draw() {
     ClearBackground(RAYWHITE);
 
     // Draw the texture
-    DrawTexture(texture, 0, 0, WHITE);
+    DrawTextureEx(texture, { 0, 0 }, 0, 80, WHITE);
+    // DrawTexture(texture, 0, 0, WHITE);
 
     EndDrawing();
 }

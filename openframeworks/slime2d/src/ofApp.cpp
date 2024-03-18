@@ -8,6 +8,10 @@ void ofApp::setup(){
 	decayRate = 0.98;
 	trailWeight = 1;
 
+	int mapWidth = ofGetWidth();
+	int mapHeight = ofGetHeight();
+	int mapFactor = 1;
+
 	AgentSpawn strategy = CENTRE;
 
 	int numSpecies = 2;
@@ -113,6 +117,12 @@ void ofApp::draw(){
     renderer.end();
 
 	ofDrawBitmapString(ofGetFrameRate(),20,20);
+}
+
+void ofApp::exit() {
+	compute_agents.unload();
+	compute_decay.unload();
+	renderer.unload();
 }
 
 //--------------------------------------------------------------

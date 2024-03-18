@@ -17,6 +17,8 @@ struct Metamer {
 	ofVec3f pos;
 	ofVec3f direction;
 	float length;
+	bool toDrop;
+	bool dropped;
 };
 
 struct Tree {
@@ -34,5 +36,7 @@ struct Tree {
 	float perceptionAngle;
 	float perceptionFactor;
 	float occupancyFactor;
+	float branchExp;
+	float dropRatio;
 	shared_ptr<Metamer> root;
 };

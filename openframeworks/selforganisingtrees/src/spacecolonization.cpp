@@ -19,7 +19,7 @@ int SpaceColonization::getDepth() {
 void SpaceColonization::setup(int width, int height, int depth) {
 	// string markerspawn = "random";
 
-	int nummarkers = 10000;
+	int nummarkers = 1000;
 	for (int i = 0; i < nummarkers; i++) {
 		markers.push_back(ofVec3f(ofRandom(0, width), ofRandom(0, height), ofRandom(0, depth)));
 		markerClosestBudDist.push_back(std::numeric_limits<float>::max());
@@ -48,27 +48,35 @@ void SpaceColonization::setup(int width, int height, int depth) {
 	// }
 }
 
-void SpaceColonization::setMaxPerceptionFactor(float _maxPerceptionFactor) {
-	maxPerceptionFactor = _maxPerceptionFactor;
-}
 
-void SpaceColonization::updateBudEnvironment(vector<Tree> trees) {
+void SpaceColonization::startUpdateBudEnvironment() {
 	
 	for (int i = 0; i < markers.size(); i++) {
 		markerClosestBudDist[i] = std::numeric_limits<float>::max();
 		markerClosestBudIdx[i] = -1;
 	}
-	markerHash.buildIndex();
+	if (markerRemoved) {
+		markerHash.buildIndex();
+		markerRemoved = false;
+	}
+	updateBudCount = 0;
+}
 
+int SpaceColonization::getUpdateCount() {
+	return updateBudCount;
+}
+
+void SpaceColonization::updateBudEnvironment(vector<Tree> trees) {
 	ofx::KDTree<ofVec3f>::SearchResults markerSearchResults;
-	for (int i = 0; i < metamersWithBuds.size(); i++) {
+	int thisUpdateBudCount = 0;
+	while (updateBudCount < metamersWithBuds.size() && thisUpdateBudCount < 10) {
 		markerSearchResults.clear();
 
 		// max number of buds to look for in radius
 		int markerSearchSize = 100;
 		markerSearchResults.resize(markerSearchSize);
 
-		shared_ptr<Metamer> metamer = metamersWithBuds[i];
+		shared_ptr<Metamer> metamer = metamersWithBuds[updateBudCount];
 		metamer->terminalGrowthDirection = ofVec3f(0., 0., 0.);
 		metamer->axillaryGrowthDirection = ofVec3f(0., 0., 0.);
 
@@ -83,6 +91,8 @@ void SpaceColonization::updateBudEnvironment(vector<Tree> trees) {
 		int numMarkers = markerHash.findPointsWithinRadius(metamer->pos, budSearchRadius, markerSearchResults);
 
 		if (numMarkers < 1) {
+			updateBudCount++;
+			thisUpdateBudCount++;
 			continue;
 		}
 
@@ -92,23 +102,20 @@ void SpaceColonization::updateBudEnvironment(vector<Tree> trees) {
 
 			if (markerDistSq < std::pow(metamer->length * occupancyFactor, 2.)) {
 				markers.erase(markers.begin() + markerSearchResults[j].first);
+				markerRemoved = true;
 			}
 			
-			ofVec3f markerDir = (marker - metamer->pos).normalize();
-			float angle = markerDir.angleRad(metamer->direction);
-			float axillaryAngle = markerDir.angleRad(metamer->axillaryDirection);
-			if (metamer->axillary == NULL && axillaryAngle < angle && axillaryAngle < perceptionAngle) {
-				if (markerDistSq < markerClosestBudDist[markerSearchResults[j].first]) {
-					markerClosestBudDist[markerSearchResults[j].first] = markerDistSq;
-					markerClosestBudIdx[markerSearchResults[j].first] = i;
-				}
-			} else if (metamer->terminal == NULL && angle < axillaryAngle && angle < perceptionAngle) {
-				if (markerDistSq < markerClosestBudDist[markerSearchResults[j].first]) {
-					markerClosestBudDist[markerSearchResults[j].first] = markerDistSq;
-					markerClosestBudIdx[markerSearchResults[j].first] = i;
-				}
+			if (markerDistSq < markerClosestBudDist[markerSearchResults[j].first]) {
+				markerClosestBudDist[markerSearchResults[j].first] = markerDistSq;
+				markerClosestBudIdx[markerSearchResults[j].first] = updateBudCount;
 			}
 		}
+
+		updateBudCount++;
+		thisUpdateBudCount++;
+	}
+	if (updateBudCount == metamersWithBuds.size()) {
+		updateBudCount = 0;
 	}
 }
 
@@ -148,8 +155,20 @@ void SpaceColonization::updateBudEnvironment(shared_ptr<Metamer> metamer, Tree t
 	}
 
 	if (numMarkers > 0) {
-		metamer->axillaryGrowthDirection.normalize();
-		metamer->terminalGrowthDirection.normalize();
+		if (metamer->axillary == NULL) {
+			metamer->axillaryGrowthDirection.normalize();
+			metamer->axillaryQ = 1.;
+		}
+
+		if (metamer->terminal == NULL) {
+			metamer->terminalGrowthDirection.normalize();
+			metamer->terminalQ = 1.;
+		}
+	} else {
+		metamer->axillaryGrowthDirection = metamer->axillaryDirection;
+		metamer->terminalGrowthDirection = metamer->direction;
+		metamer->axillaryQ = 0.;
+		metamer->terminalQ = 0.;
 	}
 }
 

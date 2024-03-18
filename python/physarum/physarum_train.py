@@ -14,7 +14,7 @@ import PIL
 import tqdm
 
 from evojax import Trainer, util
-from evojax.algo import PGPE, ARS_native
+from evojax.algo import PGPE, ARS_native, MAPElites, CMA_ES_JAX
 from evojax.policy.base import PolicyNetwork, PolicyState
 from evojax.policy.mlp import MLP
 from evojax.task.base import TaskState
@@ -24,7 +24,15 @@ from physarum_task import PhysarumTask, unpack_state
 
 
 class PhysarumPolicyNetwork(PolicyNetwork):
-    def __init__(self, num_agents, map_size, max_sensor_dist, action_method='mlp', jit=True, logger=None):
+    def __init__(
+            self, 
+            num_agents, 
+            map_size, 
+            max_sensor_dist,
+            method='mlp', 
+            jit=True, 
+            logger=None
+        ):
         if logger is None:
             self._logger = create_logger(name='PhysarumPolicyNetwork')
         else:
@@ -33,29 +41,33 @@ class PhysarumPolicyNetwork(PolicyNetwork):
         self.num_agents = num_agents
         self.map_size = map_size
         self.max_sensor_dist = max_sensor_dist
-        self.max_sensor_angle = jnp.pi
-        self.min_speed = 0.5
-        self.max_speed = 2.0
+        self.max_sensor_angle = jnp.pi / 8
+        self.min_acceleration = -0.1
+        self.max_acceleration = 0.1
         self.min_deposit = 0.0
         self.max_deposit = 5.0
         self.min_turn = -jnp.pi
         self.max_turn = jnp.pi
 
-        param_dict = {
-            'sensor_distance': random.uniform(random.PRNGKey(0), (1,), minval=0.1, maxval=self.max_sensor_dist),
-            'sensor_angle': random.uniform(random.PRNGKey(1), (1,), minval=0.1, maxval=self.max_sensor_angle),
-        }
+        param_dict = {}
 
-        self.action_method = action_method
-        if self.action_method == 'mlp':
-            hidden_dims = [5]
-            input_dim = 3
-            output_dim = 3
+        self.method = method
+        if self.method == 'mlp':
+            action_hidden_dims = [3]
+            num_sensors = 4
+            num_outputs = 3
             output_act_fn = 'tanh'
-            self.model = MLP(
-                feat_dims=hidden_dims, out_dim=output_dim, out_fn=output_act_fn)
-            params = self.model.init(random.PRNGKey(0), jnp.ones([1, input_dim]))
-            param_dict['mlp'] = params
+            self.action_model = MLP(feat_dims=action_hidden_dims, out_dim=num_outputs, out_fn=output_act_fn)
+            action_params = self.action_model.init(random.PRNGKey(0), jnp.ones([1, num_sensors]))
+            param_dict['action_mlp'] = action_params
+            num_sensor_inputs = 1
+            sensor_hidden_dims = [3]
+            self.sensor_model = MLP(feat_dims=sensor_hidden_dims, out_dim=num_sensors, out_fn=output_act_fn)
+            sensor_params = self.sensor_model.init(random.PRNGKey(0), jnp.ones([1, num_sensor_inputs]))
+            param_dict['sensor_mlp'] = sensor_params
+        else:
+            param_dict['sensor_distance'] = random.uniform(random.PRNGKey(0), (1,), minval=0.1, maxval=self.max_sensor_dist)
+            param_dict['sensor_angle'] = random.uniform(random.PRNGKey(1), (1,), minval=0.1, maxval=self.max_sensor_angle)
 
         params = FrozenDict(param_dict)
 
@@ -68,47 +80,66 @@ class PhysarumPolicyNetwork(PolicyNetwork):
             self._get_actions_fn = jax.jit(self._get_actions_fn)
 
     def _compute_actions(self, state, params):
-        positions, directions, concentration = unpack_state(state, self.num_agents, self.map_size)
-        sensor_dist = (self.max_sensor_dist / 2) * (1 + params['sensor_distance'])
-        sensor_dist = jnp.clip(sensor_dist, 0., self.max_sensor_dist)
-        # map -1 to 1, to 0 to pi
-        sensor_angle = (self.max_sensor_angle / 2) * (1 + params['sensor_angle']) 
-        sensor_angle = jnp.clip(sensor_angle, 0., self.max_sensor_angle)
+        positions, speed, directions, concentration = unpack_state(state, self.num_agents, self.map_size)
 
-        front_offsets, left_offsets, right_offsets = self._get_offsets(directions, sensor_dist, sensor_angle)
+        if self.method == 'mlp':
+            sensor_params = params['sensor_mlp']
+            sensor_inputs = jnp.stack([speed], axis=-1)
+            sensor_specs = self.sensor_model.apply(sensor_params, sensor_inputs)
+
+            sensor_specs = sensor_specs.reshape(sensor_inputs.shape[0], -1, 2)
+
+            # get offsets
+            sensor_dist = self.max_sensor_dist * sensor_specs[..., 0]
+            sensor_dist = jnp.expand_dims(jnp.clip(sensor_dist, 0., self.max_sensor_dist), -1)
+            # map 0 to 1, to 0 to pi
+            sensor_angle = self.max_sensor_angle * sensor_specs[..., 1]
+            sensor_angle = jnp.clip(sensor_angle, 0., self.max_sensor_angle)
+
+            dirs = jnp.expand_dims(directions, -1)
+            right_offsets = sensor_dist * jnp.stack([jnp.cos(dirs + sensor_angle), jnp.sin(dirs + sensor_angle)], axis=-1)
+            left_offsets = sensor_dist * jnp.stack([jnp.cos(dirs - sensor_angle), jnp.sin(dirs - sensor_angle)], axis=-1)
+            offsets = jnp.concatenate([right_offsets, left_offsets], axis=-2) 
+
+        elif self.method == 'default':
+            sensor_dist = (self.max_sensor_dist / 2) * (1 + params['sensor_distance'])
+            sensor_dist = jnp.clip(sensor_dist, 0., self.max_sensor_dist)
+            # map -1 to 1, to 0 to pi
+            sensor_angle = (self.max_sensor_angle / 2) * (1 + params['sensor_angle']) 
+            sensor_angle = jnp.clip(sensor_angle, 0., self.max_sensor_angle)
+
+            front_offsets, left_offsets, right_offsets = self._get_offsets(directions, sensor_dist, sensor_angle)
+            offsets = jnp.stack([front_offsets, left_offsets, right_offsets], axis=-1)
 
         # concentrations are centered on positions
-        front_sensors = positions + front_offsets
-        left_sensors = positions + left_offsets
-        right_sensors = positions + right_offsets
+        sensor_positions = positions.reshape(-1, 1, 2) + offsets
+        sensor_positions = sensor_positions.astype(jnp.int32)
 
         def get_concentration(sensors):
             return concentration[sensors[0], sensors[1]]
-        
-        front_sensors = front_sensors.astype(jnp.int32)
-        left_sensors = left_sensors.astype(jnp.int32)
-        right_sensors = right_sensors.astype(jnp.int32)
+        get_concentration = jax.vmap(jax.vmap(get_concentration))
 
-        get_concentration = jax.vmap(get_concentration)
+        # front_concentration = get_concentration(front_sensors)
+        # left_concentration = get_concentration(left_sensors)
+        # right_concentration = get_concentration(right_sensors)
+        concentrations = get_concentration(sensor_positions)
 
-        front_concentration = get_concentration(front_sensors)
-        left_concentration = get_concentration(left_sensors)
-        right_concentration = get_concentration(right_sensors)
-
-        if self.action_method == 'default':
+        if self.method == 'default':
+            front_concentration = concentrations[..., 0]
+            left_concentration = concentrations[..., 1]
+            right_concentration = concentrations[..., 2]
             actions = self._default_concentration_action(front_concentration, left_concentration, right_concentration, sensor_angle)
-        elif self.action_method == 'mlp':
-            mlp_params = params['mlp']
-            inputs = jnp.stack([front_concentration, left_concentration, right_concentration], axis=-1)
-            actions = self.model.apply(mlp_params, inputs)
+        elif self.method == 'mlp':
+            mlp_params = params['action_mlp']
+            actions = self.action_model.apply(mlp_params, concentrations)
             # scale the actions to the correct range
             actions = (actions + 1) / 2
             actions *= jnp.array([
                 self.max_turn - self.min_turn,
-                self.max_speed - self.min_speed,
+                self.max_acceleration - self.min_acceleration,
                 self.max_deposit - self.min_deposit
             ])
-            actions += jnp.array([self.min_turn, self.min_speed, self.min_deposit])
+            actions += jnp.array([self.min_turn, self.min_acceleration, self.min_deposit])
         else:
             raise ValueError(f"Unknown action method: {self.action_method}")
 
@@ -179,7 +210,7 @@ def main():
     init_std = 0.6
     center_lr = 0.4
     std_lr = 0.4
-    max_iter = 200
+    max_iter = 50
     log_interval = 10
     test_interval = 100
     num_tests = 1
@@ -188,7 +219,7 @@ def main():
     pop_size = 128
     elite_ratio = 0.1
     seed = 42
-    algo = 'pgpe'
+    algo = 'cma'
 
     log_dir = './log/physarum'
     if not os.path.exists(log_dir):
@@ -199,7 +230,7 @@ def main():
     logger.info('EvoJAX Physarum')
     logger.info('=' * 30)
 
-    reward_type = 'diff_sine'
+    reward_type = 'random_circle_diff'
     maximise_reward = False
 
     max_steps = 500
@@ -227,7 +258,7 @@ def main():
         num_agents, 
         map_size, 
         sense_dist,
-        action_method='mlp',
+        method='mlp',
         logger=logger, 
         jit=jit
     )
@@ -250,6 +281,18 @@ def main():
                 param_size=policy.num_params,
                 pop_size=pop_size,
                 elite_ratio=elite_ratio,
+            )
+        elif algo == 'mapelites':
+            solver = MAPElites(
+                param_size=policy.num_params,
+                pop_size=pop_size,
+                bd_extractor=None,
+            )
+        elif algo == 'cma':
+            solver = CMA_ES_JAX(
+                param_size=policy.num_params,
+                pop_size=pop_size,
+                seed=seed,
             )
         else:
             raise ValueError(f"Unknown algorithm: {algo}.")

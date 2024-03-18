@@ -15,10 +15,6 @@ layout(std140, binding=1) buffer particleBack{
     Particle p2[];
 };
 
-layout(std140, binding=2) buffer indices{
-	uint idx[];
-};
-
 uniform ivec3 resolution;
 uniform int numAgents;
 uniform float timeDelta;
@@ -270,6 +266,7 @@ void main(){
 
 	p[gl_GlobalInvocationID.x].attr.y = phase;
 
+	float amp = sin((time * naturalFreq) + phase);
 	p[gl_GlobalInvocationID.x].color.rgb = color;
-	p[gl_GlobalInvocationID.x].color.a = 0.66 + 0.33 * sin((time * naturalFreq) + phase);
+	p[gl_GlobalInvocationID.x].color.a = 0.66 + 0.33 * amp;
 }

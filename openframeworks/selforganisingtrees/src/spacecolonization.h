@@ -6,16 +6,18 @@ class SpaceColonization {
     public:
         SpaceColonization();
         void setup(int width, int height, int depth);
+        void startUpdateBudEnvironment();
         void updateBudEnvironment(vector<Tree> trees);
         void updateBudEnvironment(shared_ptr<Metamer> metamer, Tree tree);
         void addToEnvironment(shared_ptr<Metamer> metamer);
         void removeFromEnvironment(shared_ptr<Metamer> metamer);
 
+        int getUpdateCount();
+
         int getWidth();
         int getHeight();
         int getDepth();
-
-        void setMaxPerceptionFactor(float maxPerceptionFactor);
+        
     private:
         vector<ofVec3f> budPositions;
         vector<shared_ptr<Metamer>> metamersWithBuds;
@@ -27,4 +29,7 @@ class SpaceColonization {
 
         float maxPerceptionFactor;
         int width, height, depth;
+
+        int updateBudCount;
+        bool markerRemoved;
 };

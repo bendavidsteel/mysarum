@@ -47,8 +47,7 @@ class SpaceColonization {
 		float growthFactor;
 
 		ofx::KDTree<ofVec3f> nodeHash;
-		ofx::KDTree<ofVec3f> attractorHash;
 
         ofShader shader;
-		ofCamera cam;
+		ofEasyCam cam;
 };

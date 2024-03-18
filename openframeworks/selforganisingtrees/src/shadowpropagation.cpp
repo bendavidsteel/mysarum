@@ -1,23 +1,37 @@
 #include "shadowpropagation.h"
 
-void ShadowPropagation::setup(float mapSize) {
+void ShadowPropagation::setup(int _width, int _height, int _depth) {
     C = 1.;
     a = 0.5;
     b = 1.1;
-    qmax = 6;
+    qmax = 12;
 
-    width = int(mapSize);
-    height = int(mapSize);
-    depth = int(mapSize);
+    width = _width;
+    height = _height;
+    depth = _depth;
+
+    bool randomShadows = true;
 
     shadows.resize(width * height * depth);
     for (int i = 0; i < width * height * depth; i++) {
-        shadows[i] = 0.;
+        if (randomShadows) {
+            shadows[i] = ofRandom(0, C/3.);
+        } else {
+            shadows[i] = 0.;
+        }
     }
 }
 
-void ShadowPropagation::updateBudEnvironment() {
+void ShadowPropagation::startUpdateBudEnvironment() {
     return;
+}
+
+void ShadowPropagation::updateBudEnvironment(vector<Tree> trees) {
+    return;
+}
+
+int ShadowPropagation::getUpdateCount() {
+    return 0;
 }
 
 void ShadowPropagation::updateBudEnvironment(shared_ptr<Metamer> metamer, Tree tree) {
@@ -51,7 +65,7 @@ void ShadowPropagation::updateBudEnvironment(shared_ptr<Metamer> metamer, Tree t
                 if (metamer->terminal != NULL) {
                     float angle = (point - pos).angleRad(metamer->direction);
                     if (angle < tree.perceptionAngle / 2.) {
-                        float shadow = shadows[i + j * width + k * width * height];
+                        float shadow = shadows[i + (j * width) + (k * width * height)];
                         if (shadow < minShadowTerminal) {
                             minShadowTerminal = shadow;
                             minShadowDirTerminal = point - pos;
@@ -62,7 +76,7 @@ void ShadowPropagation::updateBudEnvironment(shared_ptr<Metamer> metamer, Tree t
                 if (metamer->axillary != NULL) {
                     float angle = (point - pos).angleRad(metamer->axillaryDirection);
                     if (angle < tree.perceptionAngle / 2.) {
-                        float shadow = shadows[i + j * width + k * width * height];
+                        float shadow = shadows[i + (j * width) + (k * width * height)];
                         if (shadow < minShadowAxillary) {
                             minShadowAxillary = shadow;
                             minShadowDirAxillary = point - pos;
@@ -92,7 +106,7 @@ void ShadowPropagation::addToEnvironment(shared_ptr<Metamer> metamer) {
         for (int i = -q; i <= q; i++) {
             for (int k = -q; k <= q; k++) {
                 int x = min(max(int(pos.x) + i, 0), width - 1);
-                int y = min(max(int(pos.y) + q, 0), height - 1);
+                int y = min(max(int(pos.y) - q, 0), height - 1);
                 int z = min(max(int(pos.z) + k, 0), depth - 1);
                 int idx = x + (y * width) + (z * width * height);
                 float shadow = shadows[idx];
@@ -108,7 +122,7 @@ void ShadowPropagation::removeFromEnvironment(shared_ptr<Metamer> metamer) {
     for (int q = 0; q <= qmax; q++) {
         for (int i = -q; i <= q; i++) {
             for (int k = -q; k <= q; k++) {
-                int idx = int(pos.x + i) + int(pos.y + q) * width + int(pos.z + k) * width * height;
+                int idx = int(pos.x + i) + int(pos.y - q) * width + int(pos.z + k) * width * height;
                 float shadow = shadows[idx];
                 shadow -= a * std::pow(b, -q);
                 shadows[idx] = shadow;

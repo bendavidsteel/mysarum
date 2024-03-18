@@ -19,16 +19,17 @@ https://github.com/google/jax-md/blob/main/notebooks/flocking.ipynb
 
 from PIL import Image
 from functools import partial
-from typing import Tuple
+from typing import Dict, Tuple
 
 from flax.struct import dataclass
 import jax
 from jax import vmap
 import jax.numpy as jnp
+from jax.numpy import ndarray
 import jax.scipy as jsp
 import numpy as np
 
-from evojax.task.base import VectorizedTask
+from evojax.task.base import VectorizedTask, BDExtractor
 from evojax.task.base import TaskState
 
 import rewards
@@ -50,22 +51,24 @@ def sample_theta(key: jnp.ndarray, n: jnp.ndarray) -> jnp.ndarray:
 
 
 def unpack_act(action: jnp.ndarray) -> jnp.ndarray:
-    d_theta, d_speed, desposit_amount = action[..., 0], action[..., 1], action[..., 2]
-    return d_theta, d_speed, desposit_amount
+    d_theta, acceleration, desposit_amount = action[..., 0], action[..., 1], action[..., 2]
+    return d_theta, acceleration, desposit_amount
 
 
-def pack_state(position: jnp.ndarray, theta: jnp.ndarray, concentrations: jnp.ndarray) -> jnp.ndarray:
+def pack_state(position: jnp.ndarray, speed: jnp.ndarray, theta: jnp.ndarray, concentrations: jnp.ndarray) -> jnp.ndarray:
     # flatten to 1d array to allow packing
     position = position.reshape((-1,))
+    speed = speed.reshape((-1,))
     theta = theta.reshape((-1,))
     concentrations = concentrations.reshape((-1,))
-    return jnp.concatenate([position, theta, concentrations])
+    return jnp.concatenate([position, speed, theta, concentrations])
 
 def unpack_state(state: jnp.ndarray, num_agents: int, map_size: int) -> jnp.ndarray:
     position = state[..., :num_agents * 2].reshape((num_agents, 2))
-    theta = state[..., num_agents * 2:num_agents * 3].reshape((num_agents,))
-    concentration = state[..., num_agents * 3:].reshape((map_size, map_size))
-    return position, theta, concentration
+    speed = state[..., num_agents * 2:num_agents * 3].reshape((num_agents,))
+    theta = state[..., num_agents * 3:num_agents * 4].reshape((num_agents,))
+    concentration = state[..., num_agents * 4:].reshape((map_size, map_size))
+    return position, speed, theta, concentration
 
 
 def displacement(p1: jnp.ndarray, p2: jnp.ndarray) -> jnp.ndarray:
@@ -105,13 +108,14 @@ def normal(theta: jnp.ndarray) -> jnp.ndarray:
 
 
 def update_state(state, action, num_agents, decay_rate, map_size):
-    position, theta, concentrations = unpack_state(state.state, num_agents, map_size)
+    position, speed, theta, concentrations = unpack_state(state.state, num_agents, map_size)
     action = jnp.concatenate([action, jnp.ones_like(action)], axis=1)
-    d_theta, speed, deposit_amount = unpack_act(action)
+    d_theta, acceleration, deposit_amount = unpack_act(action)
     new_theta = jnp.mod(theta + d_theta, 2 * jnp.pi)
-    N = normal(new_theta)
-    speed = speed.reshape((-1, 1))
-    new_position = jnp.mod(position + speed * N, map_size)
+    unit_vel = normal(new_theta)
+    new_speed = speed + acceleration
+    new_speed = new_speed.reshape((-1, 1)).clip(0.5, 1.5)
+    new_position = jnp.mod(position + new_speed * unit_vel, map_size)
     quantized_positions = jnp.round(position).astype(int)
     concentrations = concentrations.at[quantized_positions[:, 0], quantized_positions[:, 1]].add(deposit_amount).clip(0, 1)
 
@@ -124,17 +128,19 @@ def update_state(state, action, num_agents, decay_rate, map_size):
     concentrations = jsp.signal.convolve(concentrations, window, mode='same')
     concentrations = concentrations * (1 - decay_rate)
 
-    new_state = pack_state(new_position, new_theta, concentrations)
+    new_state = pack_state(new_position, new_speed, new_theta, concentrations)
     return new_state
 
 def get_reward(state: State, max_steps: jnp.int32, reward_type, maximise_reward: bool, num_agents: jnp.int32, map_size: jnp.int32):
-    _, _, concentrations = unpack_state(state.state, num_agents, map_size)
+    _, _, _, concentrations = unpack_state(state.state, num_agents, map_size)
     if reward_type == 'mse':
         reward = rewards.get_multiscale_entropy(concentrations)
     elif reward_type == 'energy':
         reward = rewards.get_energy(concentrations)
     elif reward_type == 'diff_sine':
         reward = rewards.get_diff_sine(concentrations, state.steps)
+    elif reward_type == 'random_circle_diff':
+        reward = rewards.get_random_circle_diff(concentrations, random_key=state.key)
 
     reward = jax.lax.cond(
         maximise_reward,
@@ -169,7 +175,7 @@ def rotate(px, py, cx, cy, angle):
     return x, y
 
 def render_single(obs_single, num_agents, map_size):
-    _, _, concentration = unpack_state(obs_single, num_agents, map_size)
+    _, _, _, concentration = unpack_state(obs_single, num_agents, map_size)
     image = (np.array(concentration) * 255).astype(np.uint8)
     pillow_image = Image.fromarray(image, mode='L')
     return pillow_image
@@ -196,9 +202,10 @@ class PhysarumTask(VectorizedTask):
         def reset_fn(key):
             next_key, key = jax.random.split(key)
             position = sample_position(key, num_agents, map_size)
+            speed = jnp.ones((num_agents,), dtype=jnp.float16)
             theta = sample_theta(key, num_agents)
             concentrations = jnp.zeros((map_size, map_size), dtype=jnp.float16)
-            state = pack_state(position, theta, concentrations)
+            state = pack_state(position, speed, theta, concentrations)
             return State(obs=jnp.zeros(()),
                          state=state,
                          steps=jnp.zeros((), dtype=jnp.int32),
@@ -235,3 +242,14 @@ class PhysarumTask(VectorizedTask):
 
     def render(self, state: State, task_id: int) -> Image:
         return render_single(state.state[task_id], self.num_agents, self.map_size)
+    
+
+class PhysarumBDExtractor(BDExtractor):
+    def init_state(self, extended_task_state):
+        return {'state': extended_task_state}
+    
+    def update(self, extended_task_state, action: jax.Array, reward, done):
+        return extended_task_state
+    
+    def summarize(self, extended_task_state):
+        return super().summarize(extended_task_state)

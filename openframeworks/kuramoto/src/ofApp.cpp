@@ -1,158 +1,234 @@
 #include "ofApp.h"
-#include "ofConstants.h"
+
+// before looking at this check out the basics examples,
+// and also the polysynth the wavesynth example
+
+// wavetable synth that converts realtime data to a wavetable
+// remember also to select the right audio output device, as ususal.
+// decomment #define USE_MIDI_KEYBOARD in ofApp.h to use a midi keyboard instead of the computer keys
 
 //--------------------------------------------------------------
 void ofApp::setup(){
-	compute.setupShaderFromFile(GL_COMPUTE_SHADER,"compute1.glsl");
-	compute.linkProgram();
-	camera.setFarClip(ofGetWidth()*10);
-	numParticles = 1024 * 8;
-	particles.resize(numParticles);
-	for(auto & p: particles){
-		p.pos.x = ofRandom(0.,ofGetWidth());
-		p.pos.y = ofRandom(0.,ofGetHeight());
-		p.pos.z = ofRandom(0.,ofGetHeight());
-		p.pos.w = 1.;
-		p.vel.x = ofRandom(-1,1);
-		p.vel.y = ofRandom(-1,1);
-		p.vel.z = ofRandom(-1,1);
-		p.vel.w = 1.;
-		p.attr.x = 0.1;//ofRandom(0.09, 0.11); // frequency of oscillation
-		p.attr.y = ofRandom(0., 2 * 3.1415); // phase of oscillation
-	}
-	particlesBuffer.allocate(particles,GL_DYNAMIC_DRAW);
-	particlesBuffer2.allocate(particles,GL_DYNAMIC_DRAW);
+    
+    ofSetWindowTitle("data to waveform");
+    
+    boidsWidth = ofGetWidth();  // try to grab at this size.
+    boidsHeight = ofGetHeight();
+    boidsPosX = 230;
+    boidsPosY = 10;
+    col = 160;			// col for getting pixels to wave
+    mode = 0;
 
-	vbo.setVertexBuffer(particlesBuffer,4,sizeof(Particle));
-	vbo.setColorBuffer(particlesBuffer,sizeof(Particle),sizeof(glm::vec4)*3);
-	vbo.enableColors();
+    numBins = 10;
+    boids.setup( numBins );
+    
+    waveplot.allocate(ofGetWidth() / 2, ofGetHeight() / 8);
+    
+    //patching-------------------------------
+    keyboard.setPolyMode( 8 );
 
-	ofBackground(0);
-	ofEnableBlendMode(OF_BLENDMODE_ADD);
+    int voicesNum = keyboard.getVoicesNumber();
 
-	gui.setup();
-	shaderUniforms.setName("shader params");
-	shaderUniforms.add(attractionCoeff.set("attraction",0.02,0,1.));
-	shaderUniforms.add(attractionMaxDist.set("attractionMaxDist",300,0,1000));
-	shaderUniforms.add(alignmentCoeff.set("alignment",0.05,0,1.));
-	shaderUniforms.add(alignmentMaxDist.set("alignmentMaxDist",100,0,1000));
-	shaderUniforms.add(repulsionCoeff.set("repulsion",0.05,0,1.));
-	shaderUniforms.add(repulsionMaxDist.set("repulsionMaxDist",25,0,1000));
-	shaderUniforms.add(maxSpeed.set("maxSpeed",0.8,0.,3.));
-	shaderUniforms.add(randomForce.set("randomStrength",0.1,0.,1.));
-	shaderUniforms.add(fov.set("fov", 0., -1., 1.));
-	shaderUniforms.add(kuramotoStrength.set("kuramotoStrength", 0., 0., 1.));
-	shaderUniforms.add(kuramotoMaxDist.set("kuramotoMaxDist", 100., 0., 1000.));
-	gui.add(shaderUniforms);
-	gui.add(fps.set("fps",60,0,60));
+    synth.datatable.setup( numBins, numBins ); // as many samples as the webcam width
+	//synth.datatable.smoothing(0.5f);
 
-	particlesBuffer.bindBase(GL_SHADER_STORAGE_BUFFER, 0);
-	particlesBuffer2.bindBase(GL_SHADER_STORAGE_BUFFER, 1);
+    synth.setup( voicesNum );
+    for(int i=0; i<voicesNum; ++i){
+        // connect each voice to a pitch and trigger output
+        keyboard.out_trig(i)  >> synth.voices[i].in("trig");
+        keyboard.out_pitch(i) >> synth.voices[i].in("pitch");
+    }
+
+    // patch synth to the engine
+    synth.ch(0) >> engine.audio_out(0);
+    synth.ch(1) >> engine.audio_out(1);
+
+    // graphic setup---------------------------
+    ofSetVerticalSync(true);
+    ofDisableAntiAliasing();
+    ofBackground(0);
+    ofSetColor(ofColor(0,100,100));
+    ofNoFill();
+    ofSetLineWidth(1.0f);
+
+    // GUI -----------------------------------
+    gui.setup("", "settings.xml", 10, boidsPosY);
+    gui.add( synth.ui );
+    gui.add( smooth.set("wave smoothing", 0.0f, 0.0f, 0.95f) );
+    smooth.addListener(this, &ofApp::smoothCall );
+    smooth.set(0.3f);
+
+    // audio / midi setup----------------------------
+    engine.listDevices();
+    engine.setDeviceID(0); // REMEMBER TO SET THIS AT THE RIGHT INDEX!!!!
+    engine.setup( 44100, 512, 3);     
+    
 }
 
 //--------------------------------------------------------------
 void ofApp::update(){
-	float time = ofGetElapsedTimef();
-
-	fps = ofGetFrameRate();
-
-	compute.begin();
-	compute.setUniforms(shaderUniforms);
-	compute.setUniform3i("resolution", ofGetWidth(), ofGetHeight(), ofGetHeight());
-	compute.setUniform1i("numAgents",particles.size());
-	compute.setUniform1f("time", time);
-	compute.setUniform1f("timeDelta", 1.);
-
-	// since each work group has a local_size of 1024 (this is defined in the shader)
-	// we only have to issue 1 / 1024 workgroups to cover the full workload.
-	// note how we add 1024 and subtract one, this is a fast way to do the equivalent
-	// of std::ceil() in the float domain, i.e. to round up, so that we're also issueing
-	// a work group should the total size of particles be < 1024
-	compute.dispatchCompute((particles.size() + 1024 -1 )/1024, 1, 1);
-
-	compute.end();
-
-	particlesBuffer.copyTo(particlesBuffer2);
+    boids.update();
+    
+    if(true){//synth.datatable.ready() ){
+		
+        vector<float> ampHist = boids.getAmpHistogram();
+        vector<float> alignHist = boids.getAlignHistogram();
+        vector<float> peerHist = boids.getPeerHistogram();
+        
+        // ------------------ GENERATING THE WAVE ----------------------
+        
+        // a pdsp::DataTable easily convert data to a waveform in real time
+        // if you don't need to generate waves in real time but
+        // interpolate between already stored waves pdsp::WaveTable is a better choice
+        // for example if you want to convert an image you already have to a wavetable
+        
+		// switch( mode ){
+		// 	case 0: // converting pixels to waveform samples
+        synth.datatable.begin();
+        for(int n=0; n<numBins; ++n){
+            float sample = ofMap(ampHist[n], 0, 1., -0.5f, 0.5f);
+            synth.datatable.data(n, sample);
+        }
+        synth.datatable.end(false);
+		// 	break; // remember, raw waveform could have DC offsets, we have filtered them in the synth using an hpf
+			
+		// 	case 1: // converting pixels to partials for additive synthesis
+		// 		synth.datatable.begin();
+		// 		for(int n=0; n<numBins; ++n){
+		// 			float partial = ofMap(ampHist[n], 0, 1., 0.0f, 1.0f);
+		// 			synth.datatable.data(n, partial);
+		// 		}
+		// 		synth.datatable.end(true);
+		// 	break;
+		// }
+		
+		// ----------------- PLOTTING THE WAVEFORM ---------------------
+		waveplot.begin();
+		ofClear(0, 0, 0, 0);
+		
+		ofSetColor(255);
+		ofDrawRectangle(1, 1, waveplot.getWidth()-2, waveplot.getHeight()-2);
+		ofTranslate(2, 2);
+        ofSetColor(255);
+		// switch( mode ){
+		// 	case 0: // plot the raw waveforms
+        ofPolyline line;
+        for(int n=0; n<numBins; ++n){
+            float y = ofMap(ampHist[n], 0, 1., 0., 1.);
+            ofPoint p;
+            p.set(waveplot.getWidth() * n / numBins, y * waveplot.getHeight());
+            line.addVertex(p);
+        }
+        line.draw();
+		// 	break;
+			
+		// 	case 1: // plot the partials
+		// 		for(int n=0; n<numBins; ++n){
+		// 			float partial = ofMap(ampHist[n], 0, 255, 0.0f, 1.0f);
+		// 			int h = waveplot.getHeight() * partial;
+		// 			int y = waveplot.getHeight() - h;
+		// 			ofDrawLine(n*2, y, n*2, numBins );
+		// 		}
+		// 	break;
+		// }
+		waveplot.end();
+		
+    }
+    
 }
 
 //--------------------------------------------------------------
 void ofApp::draw(){
-	camera.setPosition(ofGetWidth()*0.5, ofGetHeight()*0.5, -ofGetHeight());
-	camera.lookAt(glm::vec3(ofGetWidth()*0.5, ofGetHeight()*0.5, ofGetHeight()*0.5));
+    // draw GUI
+    // gui.draw();
 
-	ofEnableBlendMode(OF_BLENDMODE_ADD);
-	camera.begin();
 
-	ofSetColor(255,70);
-	glPointSize(5);
-	vbo.draw(GL_POINTS,0,particles.size());
-	// ofSetColor(255);
-	// glPointSize(2);
-	// vbo.draw(GL_POINTS,0,particles.size());
 
-	ofNoFill();
-	ofDrawBox(ofGetWidth()/2, ofGetHeight()/2, ofGetHeight()/2, ofGetWidth(), ofGetHeight(), ofGetHeight());
+	// ofPushMatrix();
+    // // draw some keyboard keys and infos
+	// switch(channel){
+	// 	case 0: ofSetColor(255, 0, 0); break;
+	// 	case 1: ofSetColor(0, 255, 0); break;
+	// 	case 2: ofSetColor(0, 0, 255); break;
+	// 	default: break;
+	// }
+	// ofTranslate(boidsPosX, boidsPosY);
+    boids.draw(0, 0, boidsWidth, boidsHeight);
+    boids.drawGui();
+    
+//     string info = "datatable mode (press m to change): ";
+//     switch(mode){
+// 		case 0: info+="raw waveform\n"; break;
+// 		case 1: info+="additive synthesis\n"; break;
+// 		default: break;
+// 	}
+	
+// 	ofTranslate( 0, boidsHeight );
+//     ofDrawBitmapString(info, 0, 10);
 
-	camera.end();
+// 	ofTranslate( 0, 50 );
+	waveplot.draw(ofGetWidth()/2, ofGetHeight() * 7/8);
+//     ofPopMatrix();
 
-	ofEnableBlendMode(OF_BLENDMODE_ALPHA);
-	ofSetColor(255);
-	gui.draw();
+// #ifndef USE_MIDI_KEYBOARD
+//     keyboard.draw( 10, ofGetHeight() - 10, 200, 110);
+// #endif
+
+// 	ofTranslate(boidsPosX, boidsPosY);
+//     ofSetColor(255);
+//     ofDrawLine(  col, 0, col, boidsHeight );
 }
 
 //--------------------------------------------------------------
 void ofApp::keyPressed(int key){
+#ifndef USE_MIDI_KEYBOARD
+    // sends key messages to ofxPDSPComputerKeyboard
+    keyboard.keyPressed( key ); 
+#endif
+    switch(key){
+		case ' ':
+			channel++;
+			if(channel==3) channel = 0;
+		break;
+		case 'm': case 'M':
+			mode++;
+			if(mode==2) mode = 0;
+		break;
+	}
 }
 
 //--------------------------------------------------------------
 void ofApp::keyReleased(int key){
-	if (key == 'f'){
-		ofToggleFullscreen();
-	}
-
-}
-
-//--------------------------------------------------------------
-void ofApp::mouseMoved(int x, int y ){
-
+#ifndef USE_MIDI_KEYBOARD
+    // sends key messages to ofxPDSPComputerKeyboard
+    keyboard.keyReleased( key );
+#endif
 }
 
 //--------------------------------------------------------------
 void ofApp::mouseDragged(int x, int y, int button){
-
 }
 
 //--------------------------------------------------------------
 void ofApp::mousePressed(int x, int y, int button){
-
 }
 
 //--------------------------------------------------------------
-void ofApp::mouseReleased(int x, int y, int button){
-
+void ofApp::smoothCall( float & value ) {
+	synth.datatable.smoothing( value  );
 }
 
 //--------------------------------------------------------------
-void ofApp::mouseEntered(int x, int y){
-
-}
-
+void ofApp::mouseReleased(int x, int y, int button){}
 //--------------------------------------------------------------
-void ofApp::mouseExited(int x, int y){
-
-}
-
+void ofApp::mouseMoved(int x, int y ){}
 //--------------------------------------------------------------
-void ofApp::windowResized(int w, int h){
-
-}
-
+void ofApp::mouseEntered(int x, int y){}
 //--------------------------------------------------------------
-void ofApp::gotMessage(ofMessage msg){
-
-}
-
+void ofApp::mouseExited(int x, int y){}
 //--------------------------------------------------------------
-void ofApp::dragEvent(ofDragInfo dragInfo){
-
-}
+void ofApp::windowResized(int w, int h){}
+//--------------------------------------------------------------
+void ofApp::gotMessage(ofMessage msg){}
+//--------------------------------------------------------------
+void ofApp::dragEvent(ofDragInfo dragInfo){}

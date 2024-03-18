@@ -23,8 +23,10 @@ class Hypercycles
 
         bool* d_grid_in;
         bool* d_grid_out;
+        bool even;
         RGBA* h_grid_out;
         Texture2D texture;
+        GLuint textureId;
         GLuint gl_buffer;
         size_t size_of_data;
         cudaGraphicsResource_t cuda_resource;

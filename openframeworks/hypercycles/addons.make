@@ -1,0 +1,9 @@
+ofxPoco
+ofxVideoRecorder
+ofxVolumetrics
+ofxGui
+ofxMidi
+ofxPDSP
+ofxAudioFile
+ofxOsc
+ofxColorTheory

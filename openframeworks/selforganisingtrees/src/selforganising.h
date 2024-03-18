@@ -4,8 +4,8 @@
 #include "ofBufferObject.h"
 #include "ofxSpatialHash.h"
 // #include "environment.h"
-// #include "shadowpropagation.h"
-#include "spacecolonization.h"
+#include "shadowpropagation.h"
+// #include "spacecolonization.h"
 #include "trees.h"
 
 struct AcropetalState {
@@ -39,7 +39,7 @@ class SelfOrganising {
 		void addNewShoot(shared_ptr<Metamer> metamer, float v, ofVec3f defaultDir, ofVec3f growthDir, bool isTerminal, int treeIdx);
         shared_ptr<Metamer> addMetamer(shared_ptr<Metamer> parent_metamer, ofVec3f pos, ofVec3f dir, bool isTerminal, int treeIdx);
 
-		SpaceColonization environment;
+		ShadowPropagation environment;
 
 		vector<ofVec3f> metamerPositions;
 		vector<glm::vec3> metamerVertices;
@@ -55,11 +55,11 @@ class SelfOrganising {
 
 		ofVbo metamerVbo;
 
-		float maxPerceptionFactor;
-
         ofShader shader;
 		ofEasyCam cam;
 		float mapSize;
 
 		int processStep;
+		int basipetalCount, maxBasipetalCount;
+		int acropetalCount, maxAcropetalCount;
 };

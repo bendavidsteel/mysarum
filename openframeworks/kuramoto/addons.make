@@ -1,1 +1,5 @@
 ofxGui
+ofxMidi
+ofxPDSP
+ofxAudioFile
+ofxOsc

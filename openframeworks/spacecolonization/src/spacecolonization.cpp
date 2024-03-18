@@ -12,9 +12,9 @@ SpaceColonization::SpaceColonization():
 //--------------------------------------------------------------
 void SpaceColonization::setup(){
 
-	attractionDistance = ofGetWidth() / 4;
-	killDistance = ofGetWidth() / 1000;
-	segmentLength = 1.;
+	segmentLength = 30.;
+	attractionDistance = 17 * segmentLength;
+	killDistance = 2 * segmentLength;
 	initialWidth = 1.;
 	maxWidth = 20.;
 	growthFactor = 0.00001;
@@ -30,6 +30,7 @@ void SpaceColonization::setup(){
 	string attractorSpawn = "trees";
 
 	if (attractorSpawn == "trees") {
+		// TODO use envelope mthod of creating attractors
 		int rootAttractors = 1000;
 		for (int i = 0; i < rootAttractors; i++) {
 			attractors.push_back(ofVec3f(ofRandom(-mapSize/2, mapSize/2), ofRandom(-mapSize/2, 0.), ofRandom(-mapSize/2, mapSize/2)));
@@ -62,6 +63,18 @@ void SpaceColonization::setup(){
 			addNode(pos, pos, i);
 		}
 		nodeIdx = numInitialNodes;
+	} else if (attractorSpawn == "random2d") {
+		int numAttractors = 1000;
+		for (int i = 0; i < numAttractors; i++) {
+			attractors.push_back(ofVec3f(ofRandom(-mapSize/2, mapSize/2), 0., ofRandom(-mapSize/2, mapSize/2)));
+		}
+
+		// create initial nodes
+		int numInitialNodes = int(ofRandom(3, 8));
+		for (int i = 0; i < numInitialNodes; i++) {
+			ofVec3f pos = ofVec3f(ofRandom(-mapSize/2, mapSize/2), 0., ofRandom(-mapSize/2, mapSize/2));
+			addNode(pos, pos, i);
+		}
 	}
 
 	shader.load("node.vert", "node.frag", "node.geom");
@@ -77,12 +90,13 @@ void SpaceColonization::setup(){
 	int widthAttLoc = shader.getAttributeLocation("width");
 	nodeVbo.setAttributeData(widthAttLoc, nodeWidths.data(), 1, MAX_NODES * 2, GL_DYNAMIC_DRAW);
 	shader.end();
+
+	// construct node spatial hash tree
+	nodeHash.buildIndex();
 }
 
 //--------------------------------------------------------------
 void SpaceColonization::update(){
-	// construct node spatial hash tree
-	nodeHash.buildIndex();
 	ofx::KDTree<ofVec3f>::SearchResults nodeSearchResults;
 
 	// loop through attractors and find nearest node, and add attractor force
@@ -100,6 +114,8 @@ void SpaceColonization::update(){
 			attractors.erase(attractors.begin() + i);
 			i--;
 			continue;
+		} else if (vectorToAttractor.length() > attractionDistance) {
+			continue;
 		} else {
 			nodeAttractions[closestNode] += vectorToAttractor.normalize();
 		}
@@ -111,21 +127,16 @@ void SpaceColonization::update(){
 	bool nodeAdded = false;
 	int numNodes = nodePositions.size();
 	for (int i = 0; i < numNodes; i++) {
-		if (nodeAttractions[i].length() > 0) {
-			// add probablistic growth - node more likely to grow if more attractors nearby
-			float prob = exp(-10 / nodeAttractions[i].length());
+		if ((nodeAttractions[i].length() > 0) && (nodeTree[i]->children.size() < 3)) {
+			nodeAdded = true;
+			ofVec3f orgPos = nodePositions[i];
+			// TODO add gravity as factor for new node position, and tropism
+			ofVec3f newPos = nodePositions[i] + nodeAttractions[i].normalize() * segmentLength;
 
-			if (ofRandom(0, 1) < prob)
-			{
-				nodeAdded = true;
-				ofVec3f orgPos = nodePositions[i];
-				ofVec3f newPos = nodePositions[i] + nodeAttractions[i].normalize() * segmentLength;
+			addNode(orgPos, newPos, nodeIdx, nodeTree[i]);
+			nodeIdx++;
 
-				addNode(orgPos, newPos, nodeIdx, nodeTree[i]);
-				nodeIdx++;
-
-				nodeAttractions[i] = ofVec3f(0, 0, 0);
-			}
+			nodeAttractions[i] = ofVec3f(0, 0, 0);
 		}
 	}
 
@@ -138,6 +149,8 @@ void SpaceColonization::update(){
 		int widthAttLoc = shader.getAttributeLocation("width");
 		nodeVbo.updateAttributeData(widthAttLoc, nodeWidths.data(), MAX_NODES * 2);
 		shader.end();
+
+		nodeHash.buildIndex();
 	}
 }
 
@@ -202,14 +215,14 @@ void SpaceColonization::addNode(ofVec3f posA, ofVec3f posB, int idx, shared_ptr<
 
     shared_ptr<Node> p(new Node);
 	p->idx = idx;
-	p->width = 1;
+	p->width = initialWidth;
 	p->opacity = 1;
 
 	nodeTree.push_back(p);
 
     parent->children.push_back(p);
     p->parent = parent;
-    recurWidth(p);
+    recurWidth(parent);
 }
 
 void SpaceColonization::addNode(ofVec3f posA, ofVec3f posB, int idx) {
@@ -240,10 +253,18 @@ void SpaceColonization::addNodeData(ofVec3f posA, ofVec3f posB, int idx) {
 
 void SpaceColonization::recurWidth(shared_ptr<Node> node) {
 	// recur up the tree, adding widths
-	if (node->parent != NULL) {
-		node->parent->width = min(float(node->parent->width + growthFactor * node->width), maxWidth);
-		nodeWidths[2 * node->parent->idx] = node->parent->width;
-        nodeWidths[(2 * node->parent->idx) + 1] = node->parent->width;
+	// TODO ideally branching points would have widths related by r1^n = r2^n + r3^n where n is 2 or 3
+	float childWidthSum = 0;
+	float power = 2.;
+	for (int i = 0; i < node->children.size(); i++) {
+		childWidthSum += std::pow(node->children[i]->width, 2);
+		
+	}
+	node->width = std::sqrt(childWidthSum);
+	nodeWidths[2 * node->idx] = node->width;
+	nodeWidths[(2 * node->idx) + 1] = node->width;
+	
+	if (node -> parent != NULL) {
 		recurWidth(node->parent);
 	}
 }

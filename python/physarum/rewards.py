@@ -1,3 +1,4 @@
+import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
 
@@ -42,3 +43,28 @@ def get_diff_sine(concentrations: jnp.ndarray, state_steps: jnp.ndarray) -> jnp.
     concentrations_mean = jnp.mean(concentrations)
     return jnp.abs(concentrations_mean - desired_value)
 
+
+def get_random_circle_diff(concentrations: jnp.ndarray, random_key) -> jnp.ndarray:
+    # generate a random circle
+    
+    
+
+    # calculate the difference between the random circle and the concentrations
+    return jnp.sum(jnp.abs(concentrations - circle)) / concentrations.size
+
+def generate_circle(size, random_key):
+    circle = jnp.zeros((size, size))
+    x = jax.random.uniform(random_key, shape=(), minval=0, maxval=size[0])
+    y = jax.random.uniform(random_key, shape=(), minval=0, maxval=size[1])
+    r = jax.random.uniform(random_key, shape=(), minval=0, maxval=size[0] / 4)
+
+    # Create a grid of coordinates
+    I, J = jnp.meshgrid(jnp.arange(size[0]), jnp.arange(size[1]), indexing='ij')
+    
+    # Compute the mask for the circle
+    mask = ((I - x) ** 2 + (J - y) ** 2) < (r ** 2)
+    
+    # Use the mask to set values in the circle array
+    circle = jnp.where(mask, 1, circle)
+
+    return circle

@@ -2,7 +2,7 @@
 // #include "test.cuh"
 #include "ofConstants.h"
 
-#define MAX_METAMERS 10000000
+#define MAX_METAMERS 1000000
 #define PI 3.14159265;
 
 SelfOrganising::SelfOrganising()
@@ -12,7 +12,8 @@ SelfOrganising::SelfOrganising()
 //--------------------------------------------------------------
 void SelfOrganising::setup(){
 	mapSize = 200.;
-	float maxPerceptionFactor = 5.;
+	maxAcropetalCount = 100;
+	maxBasipetalCount = 100;
 
 	// create node vbo
 	metamerVertices.reserve(MAX_METAMERS * 2);
@@ -22,9 +23,9 @@ void SelfOrganising::setup(){
 
 	string markerspawn = "tree";
 
-	int width = 200;
-	int height = 200;
-	int depth = 200;
+	int width = 100;
+	int height = 100;
+	int depth = 100;
 	environment.setup(width, height, depth);
 
 	if (markerspawn == "trees") {
@@ -62,8 +63,6 @@ void SelfOrganising::setup(){
 		}
 	}
 
-	environment.setMaxPerceptionFactor(trees[0].perceptionFactor);
-
 	shader.load("node.vert", "node.frag", "node.geom");
 
 	cam.setFarClip(ofGetWidth()*10);
@@ -85,9 +84,9 @@ Tree SelfOrganising::addTree(ofVec3f startPos, ofVec3f dir, int treeIdx) {
 	}
 
 	Tree tree;
-	tree.initialWidth = 0.02;
-	tree.axillaryAngle = 0.4 * PI;
-	tree.baseLength = 0.2;
+	tree.initialWidth = 0.1;
+	tree.axillaryAngle = 0.3 * PI;
+	tree.baseLength = 2.;
 
 	shared_ptr<Metamer> newMetamer(new Metamer());
 
@@ -107,16 +106,18 @@ Tree SelfOrganising::addTree(ofVec3f startPos, ofVec3f dir, int treeIdx) {
 	newMetamer->axillaryDirection = dir.rotateRad(tree.axillaryAngle, randomOrth);
 
 	tree.root = newMetamer;
-	tree.alpha = 1.001;
-	tree.lambda = 0.46;
+	tree.alpha = 2.;
+	tree.lambda = 0.48;
 	tree.occupancyFactor = 2.;
-	tree.perceptionFactor = 6.;
-	tree.perceptionAngle = 0.4 * PI;
+	tree.perceptionFactor = 5.;
+	tree.perceptionAngle = 0.3 * PI;
 	tree.idx = treeIdx;
-	tree.growthWeight = 0.7;
-	tree.defaultWeight = 0.1;
+	tree.growthWeight = 0.3;
+	tree.defaultWeight = 0.3;
 	tree.tropismWeight = 0.1;
 	tree.tropismDir = ofVec3f(0., -1., 0.);
+	tree.branchExp = 3.;
+	tree.dropRatio = 0.;
 	tree.v = 0.;
 
 	metamerVertices[2 * idx] = glm::vec3(startPos.x, startPos.y, startPos.z);
@@ -142,8 +143,14 @@ void SelfOrganising::startBasipetalPass() {
 }
 
 void SelfOrganising::basipetalPass() {
-	while (!basipetalStack.empty()) {
+	basipetalCount = 0;
+	while (!basipetalStack.empty() && basipetalCount < maxBasipetalCount) {
 		BasipetalState & state = basipetalStack.top();
+
+		if (state.metamer->dropped) {
+			basipetalStack.pop();
+			continue;
+		}
 
 		if (!state.processedChildren) {
 			state.processedChildren = true;
@@ -167,35 +174,39 @@ void SelfOrganising::basipetalPass() {
 		bool updateBud = state.metamer->terminal == NULL || state.metamer->axillary == NULL;
 		if (updateBud) {
 			environment.updateBudEnvironment(state.metamer, trees[state.treeIdx]);
-			if (state.metamer->terminal == NULL) {
-				state.metamer->terminalQ = state.metamer->terminalGrowthDirection.length() > 0 ? 1 : 0;
-			}
-			if (state.metamer->axillary == NULL) {
-				state.metamer->axillaryQ = state.metamer->axillaryGrowthDirection.length() > 0 ? 1 : 0;
-			}
 		}
 
 		// Process the current metamer
 		float sumWidthSq = 0;
 		if (state.metamer->terminal != NULL) {
 			state.metamer->terminalQ = state.metamer->terminal->terminalQ + state.metamer->terminal->axillaryQ;
-			sumWidthSq += std::pow(state.metamer->terminal->width, 2);
+			sumWidthSq += std::pow(state.metamer->terminal->width, trees[state.treeIdx].branchExp);
 		}
 
 		if (state.metamer->axillary != NULL) {
 			state.metamer->axillaryQ = state.metamer->axillary->terminalQ + state.metamer->axillary->axillaryQ;
-			sumWidthSq += std::pow(state.metamer->axillary->width, 2);
+			sumWidthSq += std::pow(state.metamer->axillary->width, trees[state.treeIdx].branchExp);
 		}
 
 		if (sumWidthSq > 0) {
-			state.metamer->width = std::sqrt(sumWidthSq);
+			state.metamer->width = std::pow(sumWidthSq, 1. / trees[state.treeIdx].branchExp);
 		} else {
 			float initialWidth = trees[state.treeIdx].initialWidth;
 			state.metamer->width = initialWidth;
 		}
 
 		metamerWidths[2*state.metamer->idx] = state.metamer->width;
-		metamerWidths[(2*state.metamer->idx) + 1] = state.metamer->width;
+		if (state.metamer->parent != NULL) {
+			metamerWidths[(2*state.metamer->idx) + 1] = state.metamer->parent->width;
+		} else {
+			metamerWidths[(2*state.metamer->idx) + 1] = state.metamer->width;
+		}
+
+		// assess whether to drop branch
+		float q = state.metamer->terminalQ + state.metamer->axillaryQ;
+		if (q / state.metamer->width < trees[state.treeIdx].dropRatio) {
+			state.metamer->toDrop = true;
+		}
 
 		if (state.metamer->parent == NULL) {
 			// This is the root metamer
@@ -204,6 +215,8 @@ void SelfOrganising::basipetalPass() {
 		}
 
 		basipetalStack.pop();
+
+		basipetalCount++;
 	}
 }
 
@@ -215,9 +228,37 @@ void SelfOrganising::startAcropetalPass() {
 }
 
 void SelfOrganising::acropetalPass() {
-	while (!acropetalStack.empty()) {
+	acropetalCount = 0;
+	while (!acropetalStack.empty() && acropetalCount < maxAcropetalCount) {
 		AcropetalState state = acropetalStack.top();
 		acropetalStack.pop();
+
+		acropetalCount++;
+
+		if (state.metamer->toDrop) {
+			environment.removeFromEnvironment(state.metamer);
+			state.metamer->toDrop = false;
+			state.metamer->dropped = true;
+
+			metamerColors[2 * state.metamer->idx] = ofFloatColor(0, 0, 0, 0);
+			metamerColors[(2 * state.metamer->idx) + 1] = ofFloatColor(0, 0, 0, 0);
+
+			if (state.metamer->terminal != NULL) {
+				state.metamer->terminal->toDrop = true;
+				acropetalStack.push({state.metamer->terminal, 0., state.treeIdx});
+			}
+
+			if (state.metamer->axillary != NULL) {
+				state.metamer->axillary->toDrop = true;
+				acropetalStack.push({state.metamer->axillary, 0., state.treeIdx});
+			}
+
+			continue;
+		}
+
+		if (state.metamer->dropped) {
+			continue;
+		}
 
 		float lambda = trees[state.treeIdx].lambda;
 		float lQm = lambda * state.metamer->terminalQ;
@@ -263,7 +304,7 @@ void SelfOrganising::addNewAxillaryShoot(shared_ptr<Metamer> metamer, float v, i
 void SelfOrganising::addNewShoot(shared_ptr<Metamer> metamer, float v, ofVec3f defaultDir, ofVec3f growthDir, bool isTerminal, int treeIdx) {
 	Tree tree = trees[treeIdx];
 	int n = 1;//std::floor(v);
-	float l = 1.;//v / n;
+	float l = 1;//v / float(n);
 
 	if (n > 0) {
 		if (metamer->terminal != NULL && metamer->axillary != NULL) {
@@ -333,34 +374,42 @@ shared_ptr<Metamer> SelfOrganising::addMetamer(shared_ptr<Metamer> parent_metame
 
 
 void SelfOrganising::update() {
-	if (metamerIdx < 5000) {
+	if (metamerIdx < 10000) {
 		if (processStep == 0) {
+			if (environment.getUpdateCount() == 0) {
+				environment.startUpdateBudEnvironment();
+			}
 			environment.updateBudEnvironment(trees);
-			processStep = 1;
+			if (environment.getUpdateCount() == 0) {
+				processStep = 1;
+			}
 		} else if (processStep == 1) {
 			if (basipetalStack.empty()) {
 				startBasipetalPass();
 			}
 			basipetalPass();
-			processStep = 2;
+			if (basipetalStack.empty()) {
+				processStep = 2;
+			}
 		} else if (processStep == 2) {
 			if (acropetalStack.empty()) {
 				startAcropetalPass();
 			}
 			acropetalPass();
-			processStep = 0;
-		}
+			if (acropetalStack.empty()) {
+				processStep = 0;
+			}
+			bool metamerAdded = true;
+			if (metamerAdded) {
+				metamerVbo.updateVertexData(metamerVertices.data(), MAX_METAMERS * 2);
+				metamerVbo.updateIndexData(metamerIndices.data(), MAX_METAMERS * 2);
+				metamerVbo.updateColorData(metamerColors.data(), MAX_METAMERS * 2);
 
-		bool metamerAdded = true;
-		if (metamerAdded) {
-			metamerVbo.updateVertexData(metamerVertices.data(), MAX_METAMERS * 2);
-			metamerVbo.updateIndexData(metamerIndices.data(), MAX_METAMERS * 2);
-			metamerVbo.updateColorData(metamerColors.data(), MAX_METAMERS * 2);
-
-			shader.begin();
-			int widthAttLoc = shader.getAttributeLocation("width");
-			metamerVbo.updateAttributeData(widthAttLoc, metamerWidths.data(), MAX_METAMERS * 2);
-			shader.end();
+				shader.begin();
+				int widthAttLoc = shader.getAttributeLocation("width");
+				metamerVbo.updateAttributeData(widthAttLoc, metamerWidths.data(), MAX_METAMERS * 2);
+				shader.end();
+			}
 		}
 	}
 }
@@ -371,15 +420,15 @@ void SelfOrganising::draw() {
 	ofSetColor(255);
 
 	float centreX = environment.getWidth() / 2.;
-	float centreY = 20.;
+	float centreY = 100.;
 	float centreZ = environment.getDepth() / 2.;
 	cam.lookAt(glm::vec3(centreX, centreY, centreZ));
 
 	// float timeOfDay = ofGetElapsedTimef() * 0.1;
-	float camDist = 100;
+	float camDist = 500;
 	float camX = centreX;// + (camDist * std::sin(timeOfDay));
-	float camY = centreY + 20;// * std::sin(timeOfDay / 3));
-	float camZ = centreZ + 40;// * std::cos(timeOfDay));
+	float camY = centreY + 100;// * std::sin(timeOfDay / 3));
+	float camZ = centreZ + 200;// * std::cos(timeOfDay));
 	cam.setPosition(camX, camY, camZ);
 
 	cam.begin();

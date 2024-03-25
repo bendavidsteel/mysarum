@@ -1,3 +1,7 @@
+import multiprocessing
+import threading
+import time
+
 import imageio
 import jax
 from jax import random
@@ -5,7 +9,7 @@ import jax.numpy as jnp
 import jax.scipy as jsp
 from jax import lax
 import numpy as np
-import soundcard as sc
+# import soundcard as sc
 from vispy import app, scene, visuals
 
 
@@ -29,30 +33,74 @@ class Physarum:
         self.sensor_angle = sensor_angle
         self.sensor_distance = sensor_distance
 
-        self.positions, self.directions, self.species = self.initialize_agents()
+        self.agents = self.initialize_agents()
         self.chemical_grid = self.initialize_chemical_grid()
 
-        self._move_agents = jax.jit(self.move_agents)
-        self._update_chemical_grid = jax.jit(self.update_chemical_grid)
+        jit = True
+        if jit:
+            self._move_agents = jax.jit(self.move_agents)
+            self._update_chemical_grid = jax.jit(self.update_chemical_grid)
+            self._update = jax.jit(self.update_sim)
+            # TODO jit audio update
+        else:
+            self._move_agents = self.move_agents
+            self._update_chemical_grid = self.update_chemical_grid
+            self._update = self.update_sim
 
+    def update_sim(self, agents, chemical_grid):
+        agents = self._move_agents(agents, chemical_grid)
+        chemical_grid = self._update_chemical_grid(chemical_grid, agents)
+        return agents, chemical_grid
+    
     def update(self):
-        self.positions, self.directions = self._move_agents(self.positions, self.directions, self.chemical_grid)
-        self.chemical_grid = self._update_chemical_grid(self.chemical_grid, self.positions)
+        self.agents, self.chemical_grid = self._update(self.agents, self.chemical_grid)
 
     def get_display(self):
         return np.array(self.chemical_grid[0])  # Convert JAX array to NumPy for compatibility with Vispy
+    
+    def get_audio(self, t):
+        max_sense = self.agents[:, self.alookup['max_sense']]
+        phase = self.agents[:, self.alookup['phase']]
+        max_sense = max_sense.reshape((1, -1))
+        phase = phase.reshape((1, -1))
+        t = t.reshape((-1, 1))
+        num_sources = phase.shape[1]
+        min_pitch = 40
+        max_pitch = 400
+        pitch = min_pitch + (max_pitch - min_pitch) * max_sense
+        # TODO goes OOM, fix
+        signals = (1 / num_sources) * jnp.sin(2 * jnp.pi * t * pitch + phase)
+        signal = jnp.sum(signals, axis=1)
+        return np.array(signal).astype(np.float32)
 
     def initialize_agents(self):
         key = jax.random.PRNGKey(0)
         positions = jax.random.uniform(key, (self.num_agents, 2), minval=0, maxval=self.grid_size, dtype=jnp.float16)
-        directions = jax.random.uniform(key, (self.num_agents,), minval=0, maxval=2 * jnp.pi, dtype=jnp.float16)
-        species = jax.random.randint(key, (self.num_agents,), minval=0, maxval=self.num_species, dtype=jnp.int8)
-        return positions, directions, species
+        directions = jax.random.uniform(key, (self.num_agents, 1), minval=0, maxval=2 * jnp.pi, dtype=jnp.float16)
+        species = jax.random.randint(key, (self.num_agents,1), minval=0, maxval=self.num_species, dtype=jnp.int8)
+        max_sense = jnp.zeros((self.num_agents, 1), dtype=jnp.float16)
+        phase = jax.random.uniform(key, (self.num_agents, 1), minval=0, maxval=2*jnp.pi, dtype=jnp.float16)
+        cols = [positions, directions, species, max_sense, phase]
+        col_names = ['positions', 'directions', 'species', 'max_sense', 'phase']
+        assert len(cols) == len(col_names)
+        self.alookup = {}
+        col_idx = 0
+        for col_name, col in zip(col_names, cols):
+            col_width = col.shape[1]
+            if col_width == 1:
+                self.alookup[col_name] = col_idx
+            else:
+                self.alookup[col_name] = slice(col_idx, col_idx+col_width)
+            col_idx += col_width
+        agents = jnp.concatenate(cols, axis=1)
+        return agents
 
     def initialize_chemical_grid(self):
         return jnp.zeros((self.num_channels, self.grid_size, self.grid_size), dtype=jnp.float16)
 
-    def move_agents(self, positions, directions, chemical_grid):
+    def move_agents(self, agents, chemical_grid):
+        positions = agents[:, self.alookup['positions']]
+        directions = agents[:, self.alookup['directions']]
         # Calculate sensor positions: front, left, and right
         front_offsets = self.sensor_distance * jnp.stack([jnp.cos(directions), jnp.sin(directions)], axis=-1)
         left_offsets = self.sensor_distance * jnp.stack([jnp.cos(directions + self.sensor_angle), jnp.sin(directions + self.sensor_angle)], axis=-1)
@@ -77,9 +125,13 @@ class Physarum:
         dy = self.speed * jnp.sin(new_directions)
         new_positions = (positions + jnp.stack([dx, dy], axis=-1)) % self.grid_size
 
-        return new_positions, new_directions
+        agents = agents.at[:, self.alookup['positions']].set(new_positions)
+        agents = agents.at[:, self.alookup['directions']].set(new_directions)
 
-    def update_chemical_grid(self, chemical_grid, positions):
+        return agents
+
+    def update_chemical_grid(self, chemical_grid, agents):
+        positions = agents[:, self.alookup['positions']]
         # Deposit chemical
         quantized_positions = jnp.round(positions).astype(int)
         chemical_grid = chemical_grid.at[:, quantized_positions[:, 0], quantized_positions[:, 1]].add(self.deposit_amount).clip(0, 1)
@@ -131,6 +183,18 @@ class BoidsPhysarum(Physarum):
         pass
 
 
+def audio_timer(get_audio, fs=44100, blocksize=16000, interval=1):
+    import soundcard as sc
+    default_speaker = sc.default_speaker()
+    num_channels = default_speaker.channels
+    with default_speaker.player(fs, channels=num_channels, blocksize=blocksize) as player:
+        next_call = time.time()
+        while True:
+            audio_data = get_audio(fs, num_channels)
+            player.play(audio_data)
+            next_call = next_call + interval
+            time.sleep(max(next_call - time.time(), 0))
+
 class VisualizeSimulation:
     def __init__(self):
         # Initial setup
@@ -139,10 +203,10 @@ class VisualizeSimulation:
         self.record = False
 
         # Audio setup
-        self.default_speaker = sc.default_speaker()
-        self.fs = 44100  # Sample rate
-        self.blocksize = 16000
-        self.num_channels = self.default_speaker.channels
+        # self.default_speaker = sc.default_speaker()
+        # self.fs = 44100  # Sample rate
+        # self.blocksize = 16000
+        # self.num_channels = self.default_speaker.channels
         self.phase = 0  # To keep track of phase between updates
 
         # Initialize simulation
@@ -170,32 +234,23 @@ class VisualizeSimulation:
         # view.camera.aspect = 1.0
 
         # start audio system
-        self.player = self.default_speaker.player(self.fs, self.blocksize)
-        self.player.__enter__()  # Manually enter the context
-
+        
         if self.record:
             self.writer = imageio.get_writer('physarum.gif', duration=0.1)
         self.idx = 0
 
         # Update the image data periodically
-        display_timer = app.Timer()
-        display_timer.connect(self.update_image)
-        display_timer.start(0)
+        self.display_timer = app.Timer()
+        self.display_timer.connect(self.update_image)
+        self.display_timer.start()
 
-        audio_timer = app.Timer()
-        audio_timer.connect(self.audio_playback)
-        audio_timer.start(0)
-
-    def generate_audio_data(self):
-        # Example method to generate audio data
-        length = self.fs // 10  # Generate 0.1 seconds of audio at a time, for example
-        t = np.arange(length) + self.phase
-        audio_data = np.sin(2 * np.pi * t * 440.0 / self.fs).astype(np.float32)
-        self.phase += length  # Update phase
-
-        if self.num_channels > 1:
-            audio_data = np.tile(audio_data.reshape(-1, 1), (1, self.num_channels))
-        return audio_data
+        use_process = False
+        kwargs = {'target': audio_timer, 'args': (self.generate_audio_data,), 'kwargs': {'interval':self.display_timer.interval}}
+        if use_process:
+            self.audio_timer = multiprocessing.Process(**kwargs)
+        else:
+            self.audio_timer = threading.Thread(**kwargs)
+        self.audio_timer.start()
 
     def update_image(self, event):
         self.idx += 1
@@ -203,38 +258,42 @@ class VisualizeSimulation:
         im = self.simulation.get_display()
         self.image.set_data(im)
         self.canvas.update()
+        # audio_data = self.generate_audio_data()
+        # self.player.play(audio_data)
         if self.record:
             im = self.canvas.render()
             self.writer.append_data(im)
 
-    def generate_audio_data(self):
+    def generate_audio_data(self, fs, num_channels):
         # Example method to generate audio data
-        length = self.fs // 10  # Generate 0.1 seconds of audio at a time, for example
+        length = fs // 10  # Generate 0.1 seconds of audio at a time, for example
         t = np.arange(length) + self.phase
-        audio_data = np.sin(2 * np.pi * t * 440.0 / self.fs).astype(np.float32)
+        audio_data = self.simulation.get_audio(t / fs)
         self.phase += length  # Update phase
 
-        if self.num_channels > 1:
-            audio_data = np.tile(audio_data.reshape(-1, 1), (1, self.num_channels))
+        if num_channels > 1:
+            audio_data = np.tile(audio_data.reshape(-1, 1), (1, num_channels))
         return audio_data
 
-    def audio_playback(self):
-        # Method to continuously generate and play audio data
-        audio_data = self.generate_audio_data()
-        self.player.play(audio_data)
 
     def close(self):
         if self.record:
             self.writer.close()
+        self.display_timer.stop()
+        self.audio_timer.close()
         self.canvas.close()
         self.player.__exit__(None, None, None)  # Manually exit the context
 
 def main():
+    visual = None
     try:
         visual = VisualizeSimulation()
         app.run()
+    except:
+        raise
     finally:
-        visual.close()
+        if hasattr(visual, 'close'):
+            visual.close()
 
 if __name__ == '__main__':
     main()

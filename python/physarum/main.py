@@ -21,31 +21,56 @@ def create_gaussian_kernel(size, sigma):
     gaussian_kernel = jnp.exp(-x2_y2 / (2 * sigma ** 2))
     return gaussian_kernel / jnp.sum(gaussian_kernel)
 
-class Physarum:
-    def __init__(self, num_agents=1000000, grid_size=1000, num_species=1, num_channels=1, speed=1.0, decay_rate=0.1, deposit_amount=5.0, sensor_angle=jnp.pi / 3, sensor_distance=5):
+def simple_colour_wheel(num_colours):
+    colour_points = np.linspace(0., 1., num_colours)
+    key_colours = np.array([
+        [1., 0., 0.],
+        [0., 1., 0.],
+        [0., 0., 1.]
+    ])
+    key_points = np.linspace(0., 1., len(key_colours))
+    colours = []
+    for point in colour_points:
+        for i in range(len(key_points) - 1):
+            if key_points[i] <= point < key_points[i+1]:
+                scaled_point = (point - key_points[i]) / (key_points[i+1] - key_points[i])
+                colours.append((1 - scaled_point) * key_colours[i] + scaled_point * key_colours[i+1])
+                break
+        else:
+            i = len(key_points) - 2
+            scaled_point = (point - key_points[i]) / (key_points[i+1] - key_points[i])
+            colours.append((1 - scaled_point) * key_colours[i] + scaled_point * key_colours[i+1])
+
+    assert len(colours) == num_colours
+    return np.array(colours)
+
+
+class DSCL:
+    def __init__(self, random_key, jit=True, num_agents=1000000, grid_size=1000, num_species=1, num_chemicals=1, speed=1.0, decay_rate=0.1, deposit_amount=5.0, sensor_angle=jnp.pi / 3, sensor_distance=5):
+        self.random_key = random_key
         self.num_agents = num_agents
         self.grid_size = grid_size
         self.num_species = num_species
-        self.num_channels = num_channels
-        self.speed = speed
+        self.num_chemicals = num_chemicals
         self.decay_rate = decay_rate
         self.deposit_amount = deposit_amount
-        self.sensor_angle = sensor_angle
-        self.sensor_distance = sensor_distance
 
         self.agents = self.initialize_agents()
         self.chemical_grid = self.initialize_chemical_grid()
 
-        jit = True
+        self.colours = jnp.array(simple_colour_wheel(self.num_chemicals))
+
         if jit:
             self._move_agents = jax.jit(self.move_agents)
             self._update_chemical_grid = jax.jit(self.update_chemical_grid)
             self._update = jax.jit(self.update_sim)
+            self._display = jax.jit(self.display_sim)
             # TODO jit audio update
         else:
             self._move_agents = self.move_agents
             self._update_chemical_grid = self.update_chemical_grid
             self._update = self.update_sim
+            self._display = self.display_sim
 
     def update_sim(self, agents, chemical_grid):
         agents = self._move_agents(agents, chemical_grid)
@@ -56,7 +81,11 @@ class Physarum:
         self.agents, self.chemical_grid = self._update(self.agents, self.chemical_grid)
 
     def get_display(self):
-        return np.array(self.chemical_grid[0])  # Convert JAX array to NumPy for compatibility with Vispy
+        return np.array(self._display())
+    
+    def display_sim(self):
+        colour_im = jnp.sum(jnp.expand_dims(self.chemical_grid, 1) * self.colours.reshape(self.colours.shape + (1,1)), axis=0)
+        return jnp.moveaxis(colour_im, 0, -1).astype(np.float32)
     
     def get_audio(self, t):
         max_sense = self.agents[:, self.alookup['max_sense']]
@@ -74,12 +103,54 @@ class Physarum:
         return np.array(signal).astype(np.float32)
 
     def initialize_agents(self):
-        key = jax.random.PRNGKey(0)
-        positions = jax.random.uniform(key, (self.num_agents, 2), minval=0, maxval=self.grid_size, dtype=jnp.float16)
-        directions = jax.random.uniform(key, (self.num_agents, 1), minval=0, maxval=2 * jnp.pi, dtype=jnp.float16)
-        species = jax.random.randint(key, (self.num_agents,1), minval=0, maxval=self.num_species, dtype=jnp.int8)
-        max_sense = jnp.zeros((self.num_agents, 1), dtype=jnp.float16)
-        phase = jax.random.uniform(key, (self.num_agents, 1), minval=0, maxval=2*jnp.pi, dtype=jnp.float16)
+        raise NotImplementedError
+
+    def initialize_chemical_grid(self):
+        return jnp.zeros((self.num_chemicals, self.grid_size, self.grid_size), dtype=jnp.float16)
+
+    def get_sense_reward(self, senses, agents):
+        return senses
+
+    def move_agents(self, agents, chemical_grid):
+        raise NotImplementedError
+
+    def deposit(self, chemical_grid, quantized_positions, agents):
+        return chemical_grid.at[:, quantized_positions[:, 0], quantized_positions[:, 1]].add(self.deposit_amount).clip(0, 1)
+
+    def update_chemical_grid(self, chemical_grid, agents):
+        positions = agents[:, self.alookup['positions']]
+        # Deposit chemical
+        quantized_positions = jnp.round(positions).astype(int)
+        chemical_grid = self.deposit(chemical_grid, quantized_positions, agents)
+
+        # Apply decay and diffusion
+        # x = jnp.linspace(-3, 3, 3)
+        # window = jsp.stats.norm.pdf(x) * jsp.stats.norm.pdf(x[:, None])
+        window = jnp.array([[0.0625, 0.125, 0.0625],
+                            [0.125, 0.25, 0.125],
+                            [0.0625, 0.125, 0.0625]], dtype=jnp.float16)
+        smooth_image = lax.conv(chemical_grid.reshape((chemical_grid.shape[0], 1, chemical_grid.shape[1], chemical_grid.shape[2])),    # lhs = NCHW image tensor
+                window.reshape((1, 1, window.shape[0], window.shape[1])), # rhs = OIHW conv kernel tensor
+                (1, 1),  # window strides
+                'SAME') # padding mode
+        smooth_image = smooth_image.reshape(chemical_grid.shape)
+        return smooth_image * (1 - self.decay_rate)
+    
+class Physarum(DSCL):
+    def __init__(self, *args, speed=1.0, sensor_angle=jnp.pi / 3, sensor_distance=5, **kwargs):
+        
+        self.speed = speed
+        self.sensor_angle = sensor_angle
+        self.sensor_distance = sensor_distance
+
+        super().__init__(*args, **kwargs)
+
+    def initialize_agents(self):
+        positions = jax.random.uniform(self.random_key, (self.num_agents, 2), minval=0, maxval=self.grid_size, dtype=jnp.float32)
+        directions = jax.random.uniform(self.random_key, (self.num_agents, 1), minval=0, maxval=2 * jnp.pi, dtype=jnp.float32)
+        species = jax.random.randint(self.random_key, (self.num_agents,1), minval=0, maxval=self.num_species, dtype=jnp.int8)
+        max_sense = jnp.zeros((self.num_agents, 1), dtype=jnp.float32)
+        phase = jax.random.uniform(self.random_key, (self.num_agents, 1), minval=0, maxval=2*jnp.pi, dtype=jnp.float32)
         cols = [positions, directions, species, max_sense, phase]
         col_names = ['positions', 'directions', 'species', 'max_sense', 'phase']
         assert len(cols) == len(col_names)
@@ -95,13 +166,11 @@ class Physarum:
         agents = jnp.concatenate(cols, axis=1)
         return agents
 
-    def initialize_chemical_grid(self):
-        return jnp.zeros((self.num_channels, self.grid_size, self.grid_size), dtype=jnp.float16)
-
     def move_agents(self, agents, chemical_grid):
         positions = agents[:, self.alookup['positions']]
         directions = agents[:, self.alookup['directions']]
         # Calculate sensor positions: front, left, and right
+        # TODO vectorize these 3 calcs into 1
         front_offsets = self.sensor_distance * jnp.stack([jnp.cos(directions), jnp.sin(directions)], axis=-1)
         left_offsets = self.sensor_distance * jnp.stack([jnp.cos(directions + self.sensor_angle), jnp.sin(directions + self.sensor_angle)], axis=-1)
         right_offsets = self.sensor_distance * jnp.stack([jnp.cos(directions - self.sensor_angle), jnp.sin(directions - self.sensor_angle)], axis=-1)
@@ -115,10 +184,12 @@ class Physarum:
         left_concentration = chemical_grid[:, left_sensors[:, 0].astype(jnp.int32), left_sensors[:, 1].astype(jnp.int32)]
         right_concentration = chemical_grid[:, right_sensors[:, 0].astype(jnp.int32), right_sensors[:, 1].astype(jnp.int32)]
 
+        front_reward, left_reward, right_reward = self.get_sense_reward([front_concentration, left_concentration, right_concentration], agents)
+
         # Determine steering direction
-        steer_left = left_concentration > front_concentration
-        steer_right = right_concentration > front_concentration
-        new_directions = (directions + self.sensor_angle * steer_left - self.sensor_angle * steer_right).sum(axis=0)
+        steer_left = left_reward > front_reward
+        steer_right = right_reward > front_reward
+        new_directions = (directions + self.sensor_angle * steer_left - self.sensor_angle * steer_right).mean(axis=0)
 
         # Move agents
         dx = self.speed * jnp.cos(new_directions)
@@ -130,25 +201,62 @@ class Physarum:
 
         return agents
 
-    def update_chemical_grid(self, chemical_grid, agents):
-        positions = agents[:, self.alookup['positions']]
-        # Deposit chemical
-        quantized_positions = jnp.round(positions).astype(int)
-        chemical_grid = chemical_grid.at[:, quantized_positions[:, 0], quantized_positions[:, 1]].add(self.deposit_amount).clip(0, 1)
 
-        # Apply decay and diffusion
-        # x = jnp.linspace(-3, 3, 3)
-        # window = jsp.stats.norm.pdf(x) * jsp.stats.norm.pdf(x[:, None])
-        window = jnp.array([[0.0625, 0.125, 0.0625],
-                            [0.125, 0.25, 0.125],
-                            [0.0625, 0.125, 0.0625]], dtype=jnp.float16)
-        smooth_image = lax.conv(chemical_grid.reshape((chemical_grid.shape[0], 1, chemical_grid.shape[1], chemical_grid.shape[2])),    # lhs = NCHW image tensor
-                window.reshape((1, 1, window.shape[0], window.shape[1])), # rhs = OIHW conv kernel tensor
-                (1, 1),  # window strides
-                'SAME') # padding mode
-        smooth_image = smooth_image.reshape(chemical_grid.shape)
-        return smooth_image * (1 - self.decay_rate)
-    
+class ParticleSystem(DSCL):
+    def __init__(self, *args, force_factor=0.5, num_sensors=8, sensor_distance=5, **kwargs):
+        
+        self.force_factor = force_factor
+        self.num_sensors = num_sensors
+        self.sensor_distance = sensor_distance
+
+        super().__init__(*args, **kwargs)
+
+    def initialize_agents(self):
+        positions = jax.random.uniform(self.random_key, (self.num_agents, 2), minval=0, maxval=self.grid_size, dtype=jnp.float32)
+        velocity = jnp.zeros((self.num_agents, 2), dtype=jnp.float32)
+        species = jax.random.randint(self.random_key, (self.num_agents,1), minval=0, maxval=self.num_species, dtype=jnp.int8)
+        max_sense = jnp.zeros((self.num_agents, 1), dtype=jnp.float16)
+        phase = jax.random.uniform(self.random_key, (self.num_agents, 1), minval=0, maxval=2*jnp.pi, dtype=jnp.float16)
+        cols = [positions, velocity, species, max_sense, phase]
+        col_names = ['positions', 'velocity', 'species', 'max_sense', 'phase']
+        assert len(cols) == len(col_names)
+        self.alookup = {}
+        col_idx = 0
+        for col_name, col in zip(col_names, cols):
+            col_width = col.shape[1]
+            if col_width == 1:
+                self.alookup[col_name] = col_idx
+            else:
+                self.alookup[col_name] = slice(col_idx, col_idx+col_width)
+            col_idx += col_width
+        agents = jnp.concatenate(cols, axis=1)
+        return agents
+
+    def move_agents(self, agents, chemical_grid):
+        positions = agents[:, self.alookup['positions']]
+        velocity = agents[:, self.alookup['velocity']]
+        # Calculate sensor positions: around the particle
+        angles = jnp.linspace(0., 2 * jnp.pi, self.num_sensors + 1)[:-1]
+        offsets = self.sensor_distance * jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=-1)
+        sensors = jnp.round((positions + jnp.expand_dims(offsets, 1)) % self.grid_size)
+        concentrations = chemical_grid[:, sensors[..., 0].astype(jnp.int32), sensors[..., 1].astype(jnp.int32)]
+        concentrations = jnp.moveaxis(concentrations, 0, 1)
+        # Sense the chemical concentration at each sensor
+        rewards = self.get_sense_reward(concentrations, agents)
+
+        # Move agents
+        # compute forces along sensors and concentrations
+        forces = jnp.expand_dims(rewards, 2) * jnp.expand_dims(jnp.expand_dims(offsets, 1), -1)
+        # get means along forces and concentrations
+        force = jnp.mean(jnp.mean(forces, axis=0), axis=0).T
+        force += 0.2 * jax.random.uniform(self.random_key, force.shape, minval=-1.0, maxval=1.0, dtype=jnp.float32)
+        new_velocity = (1 - self.force_factor) * velocity + self.force_factor * force
+        new_positions = (positions + velocity) % self.grid_size
+
+        agents = agents.at[:, self.alookup['positions']].set(new_positions)
+        agents = agents.at[:, self.alookup['velocity']].set(new_velocity)
+
+        return agents
 
 class ReactionDiffusionPhysarum(Physarum):
     def __init__(self, kill_rate=0.0545, feed_rate=0.0367, diffusion_rate=0.16):
@@ -156,7 +264,7 @@ class ReactionDiffusionPhysarum(Physarum):
         self.feed_rate = feed_rate
         self.diffusion_rate = diffusion_rate
 
-        super().__init__(num_channels=2)
+        super().__init__(num_chemicals=2)
 
     def move_agents(self, positions, directions, chemical_grid):
         # write the move_agents function here
@@ -182,6 +290,41 @@ class BoidsPhysarum(Physarum):
         # write the update_chemical_grid function here
         pass
 
+class ParticleLife(ParticleSystem):
+    def __init__(self, random_key, num_species=5, **kwargs):
+        if 'num_chemicals' in kwargs:
+            del kwargs['num_chemicals']
+        self.beta = 0.3
+        self.chemical_factors = jax.random.uniform(random_key, (num_species, num_species), minval=-1.0, maxval=1.0)
+        super().__init__(random_key, num_species=num_species, num_chemicals=num_species, **kwargs)
+
+    def get_sense_reward(self, senses, agents):
+        # get species
+        species = jnp.round(agents[:, self.alookup['species']]).astype(int)
+        # look up species chemical mapping
+        chemical_factors = self.chemical_factors[species].T
+        # return senses * chemical_factors
+        reward = jnp.where(
+            senses > self.beta,
+            (senses - self.beta) / (self.beta - 1.),
+            senses
+        )
+        reward = jnp.where(
+            jnp.logical_and(senses < self.beta, senses > self.beta / 2.),
+            (chemical_factors * 2.0) * (1 - senses / self.beta),
+            reward
+        )
+        reward = jnp.where(
+            senses < self.beta / 2.,
+            (chemical_factors * 2.0) * (senses / self.beta),
+            reward
+        )
+        return reward
+    
+    def deposit(self, chemical_grid, quantized_positions, agents):
+        species = jnp.round(agents[:, self.alookup['species']]).astype(int)
+        return chemical_grid.at[species, quantized_positions[:, 0], quantized_positions[:, 1]].add(self.deposit_amount).clip(0, 1)
+
 
 def audio_timer(get_audio, fs=44100, blocksize=16000, interval=1):
     import soundcard as sc
@@ -198,7 +341,7 @@ def audio_timer(get_audio, fs=44100, blocksize=16000, interval=1):
 class VisualizeSimulation:
     def __init__(self):
         # Initial setup
-        key = random.PRNGKey(0)
+        random_key = random.PRNGKey(0)
 
         self.record = False
 
@@ -210,18 +353,39 @@ class VisualizeSimulation:
         self.phase = 0  # To keep track of phase between updates
 
         # Initialize simulation
-        num_agents = 1000000
+        jit = False
+        num_agents = 100000
         num_species = 1
-        num_channels = 1
+        num_chemicals = 1
         grid_size = 1000
         speed = 1.0
-        decay_rate = 0.1
-        deposit_amount = 5.0
+        decay_rate = 0.01
+        deposit_amount = 1.0
         sensor_angle = jnp.pi / 3
-        sensor_distance = 5
-        self.simulation = Physarum(num_agents, grid_size, num_species, num_channels, speed, decay_rate, deposit_amount, sensor_angle, sensor_distance)
+        sensor_distance = 10
+        physarum_type = 'particle_life'
+        if physarum_type == 'physarum':
+            simulation_cls = Physarum
+        elif physarum_type == 'particle_life':
+            num_species = 8
+            simulation_cls = ParticleLife
+        elif physarum_type == 'particle_system':
+            simulation_cls = ParticleSystem
+        self.simulation = simulation_cls(
+            random_key,
+            jit=jit,
+            num_agents=num_agents, 
+            grid_size=grid_size, 
+            num_species=num_species, 
+            num_chemicals=num_chemicals, 
+            speed=speed, 
+            decay_rate=decay_rate, 
+            deposit_amount=deposit_amount, 
+            sensor_angle=sensor_angle, 
+            sensor_distance=sensor_distance
+        )
 
-        self.canvas = scene.SceneCanvas(keys='interactive', size=(1000, 1000))
+        self.canvas = scene.SceneCanvas(keys='interactive', size=(grid_size, grid_size))
         self.canvas.show()
 
         view = self.canvas.central_widget.add_view()
@@ -244,13 +408,15 @@ class VisualizeSimulation:
         self.display_timer.connect(self.update_image)
         self.display_timer.start()
 
-        use_process = False
-        kwargs = {'target': audio_timer, 'args': (self.generate_audio_data,), 'kwargs': {'interval':self.display_timer.interval}}
-        if use_process:
-            self.audio_timer = multiprocessing.Process(**kwargs)
-        else:
-            self.audio_timer = threading.Thread(**kwargs)
-        self.audio_timer.start()
+        do_audio = False
+        if do_audio:
+            use_process = False
+            kwargs = {'target': audio_timer, 'args': (self.generate_audio_data,), 'kwargs': {'interval':self.display_timer.interval}}
+            if use_process:
+                self.audio_timer = multiprocessing.Process(**kwargs)
+            else:
+                self.audio_timer = threading.Thread(**kwargs)
+            self.audio_timer.start()
 
     def update_image(self, event):
         self.idx += 1
@@ -280,9 +446,9 @@ class VisualizeSimulation:
         if self.record:
             self.writer.close()
         self.display_timer.stop()
-        self.audio_timer.close()
+        if hasattr(self, 'audio_timer'):
+            self.audio_timer.close()
         self.canvas.close()
-        self.player.__exit__(None, None, None)  # Manually exit the context
 
 def main():
     visual = None

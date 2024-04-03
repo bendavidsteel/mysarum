@@ -1,3 +1,4 @@
+from collections import namedtuple
 import multiprocessing
 import threading
 import time
@@ -81,10 +82,11 @@ class DSCL:
         self.agents, self.chemical_grid = self._update(self.agents, self.chemical_grid)
 
     def get_display(self):
-        return np.array(self._display())
+        return np.array(self._display(self.chemical_grid, self.colours))
     
-    def display_sim(self):
-        colour_im = jnp.sum(jnp.expand_dims(self.chemical_grid, 1) * self.colours.reshape(self.colours.shape + (1,1)), axis=0)
+    def display_sim(self, chemical_grid, colours):
+        colours = jnp.expand_dims(chemical_grid, 1) * jnp.expand_dims(jnp.expand_dims(colours, -1), -1)
+        colour_im = jnp.sum(colours, axis=0)
         return jnp.moveaxis(colour_im, 0, -1).astype(np.float32)
     
     def get_audio(self, t):
@@ -106,7 +108,7 @@ class DSCL:
         raise NotImplementedError
 
     def initialize_chemical_grid(self):
-        return jnp.zeros((self.num_chemicals, self.grid_size, self.grid_size), dtype=jnp.float16)
+        return jnp.zeros((self.num_chemicals, self.grid_size, self.grid_size), dtype=jnp.float32)
 
     def get_sense_reward(self, senses, agents):
         return senses
@@ -128,7 +130,8 @@ class DSCL:
         # window = jsp.stats.norm.pdf(x) * jsp.stats.norm.pdf(x[:, None])
         window = jnp.array([[0.0625, 0.125, 0.0625],
                             [0.125, 0.25, 0.125],
-                            [0.0625, 0.125, 0.0625]], dtype=jnp.float16)
+                            [0.0625, 0.125, 0.0625]], dtype=jnp.float32)
+        # window = jnp.array([[1/9, 1/9, 1/9],[1/9, 1/9, 1/9],[1/9, 1/9, 1/9]], dtype=jnp.float32)
         smooth_image = lax.conv(chemical_grid.reshape((chemical_grid.shape[0], 1, chemical_grid.shape[1], chemical_grid.shape[2])),    # lhs = NCHW image tensor
                 window.reshape((1, 1, window.shape[0], window.shape[1])), # rhs = OIHW conv kernel tensor
                 (1, 1),  # window strides
@@ -203,7 +206,7 @@ class Physarum(DSCL):
 
 
 class ParticleSystem(DSCL):
-    def __init__(self, *args, force_factor=0.5, num_sensors=8, sensor_distance=5, **kwargs):
+    def __init__(self, *args, force_factor=1.0, num_sensors=8, sensor_distance=5, **kwargs):
         
         self.force_factor = force_factor
         self.num_sensors = num_sensors
@@ -215,8 +218,8 @@ class ParticleSystem(DSCL):
         positions = jax.random.uniform(self.random_key, (self.num_agents, 2), minval=0, maxval=self.grid_size, dtype=jnp.float32)
         velocity = jnp.zeros((self.num_agents, 2), dtype=jnp.float32)
         species = jax.random.randint(self.random_key, (self.num_agents,1), minval=0, maxval=self.num_species, dtype=jnp.int8)
-        max_sense = jnp.zeros((self.num_agents, 1), dtype=jnp.float16)
-        phase = jax.random.uniform(self.random_key, (self.num_agents, 1), minval=0, maxval=2*jnp.pi, dtype=jnp.float16)
+        max_sense = jnp.zeros((self.num_agents, 1), dtype=jnp.float32)
+        phase = jax.random.uniform(self.random_key, (self.num_agents, 1), minval=0, maxval=2*jnp.pi, dtype=jnp.float32)
         cols = [positions, velocity, species, max_sense, phase]
         col_names = ['positions', 'velocity', 'species', 'max_sense', 'phase']
         assert len(cols) == len(col_names)
@@ -249,7 +252,7 @@ class ParticleSystem(DSCL):
         forces = jnp.expand_dims(rewards, 2) * jnp.expand_dims(jnp.expand_dims(offsets, 1), -1)
         # get means along forces and concentrations
         force = jnp.mean(jnp.mean(forces, axis=0), axis=0).T
-        force += 0.2 * jax.random.uniform(self.random_key, force.shape, minval=-1.0, maxval=1.0, dtype=jnp.float32)
+        # force += 0.1 * jax.random.uniform(self.random_key, force.shape, minval=-1.0, maxval=1.0, dtype=jnp.float32)
         new_velocity = (1 - self.force_factor) * velocity + self.force_factor * force
         new_positions = (positions + velocity) % self.grid_size
 
@@ -294,7 +297,7 @@ class ParticleLife(ParticleSystem):
     def __init__(self, random_key, num_species=5, **kwargs):
         if 'num_chemicals' in kwargs:
             del kwargs['num_chemicals']
-        self.beta = 0.3
+        self.beta = 0.5
         self.chemical_factors = jax.random.uniform(random_key, (num_species, num_species), minval=-1.0, maxval=1.0)
         super().__init__(random_key, num_species=num_species, num_chemicals=num_species, **kwargs)
 
@@ -325,6 +328,68 @@ class ParticleLife(ParticleSystem):
         species = jnp.round(agents[:, self.alookup['species']]).astype(int)
         return chemical_grid.at[species, quantized_positions[:, 0], quantized_positions[:, 1]].add(self.deposit_amount).clip(0, 1)
 
+class Lenia(DSCL):
+    def __init__(self, *args, num_sensors=8, sensor_distance=5, **kwargs):
+        
+        self.num_sensors = num_sensors
+        self.sensor_distance = sensor_distance
+
+        super().__init__(*args, **kwargs)
+
+    def initialize_agents(self):
+        positions = jax.random.uniform(self.random_key, (self.num_agents, 2), minval=0, maxval=self.grid_size, dtype=jnp.float32)
+        species = jax.random.randint(self.random_key, (self.num_agents,1), minval=0, maxval=self.num_species, dtype=jnp.int8)
+        max_sense = jnp.zeros((self.num_agents, 1), dtype=jnp.float32)
+        phase = jax.random.uniform(self.random_key, (self.num_agents, 1), minval=0, maxval=2*jnp.pi, dtype=jnp.float32)
+        cols = [positions, species, max_sense, phase]
+        col_names = ['positions', 'species', 'max_sense', 'phase']
+        assert len(cols) == len(col_names)
+        self.alookup = {}
+        col_idx = 0
+        for col_name, col in zip(col_names, cols):
+            col_width = col.shape[1]
+            if col_width == 1:
+                self.alookup[col_name] = col_idx
+            else:
+                self.alookup[col_name] = slice(col_idx, col_idx+col_width)
+            col_idx += col_width
+        agents = jnp.concatenate(cols, axis=1)
+        return agents
+
+    def move_agents(self, agents, chemical_grid):
+        positions = agents[:, self.alookup['positions']]
+        # Calculate sensor positions: around the particle
+        angles = jnp.linspace(0., 2 * jnp.pi, self.num_sensors + 1)[:-1]
+        offsets = self.sensor_distance * jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=-1)
+
+        Params = namedtuple('Params', 'mu_k sigma_k w_k mu_g sigma_g c_rep')
+        Fields = namedtuple('Fields', 'U G R E')
+
+        def peak_f(x, mu, sigma):
+            return jnp.exp(-((x-mu)/sigma)**2)
+
+        def fields_f(p: Params, x):
+            sensors = jnp.round((x + jnp.expand_dims(offsets, 1)) % self.grid_size)
+            # TODO reformulate r to be a differentiable function of x using bilinear interpolation
+            r = chemical_grid[:, sensors[..., 0].astype(jnp.int32), sensors[..., 1].astype(jnp.int32)]
+            U = peak_f(r, p.mu_k, p.sigma_k).sum()*p.w_k
+            G = peak_f(U, p.mu_g, p.sigma_g)
+            R = p.c_rep/2 * ((1.0-r).clip(0.0)**2).sum()
+            return Fields(U, G, R, E=R-G)
+
+        def motion_f(params, points):
+            grad_E = jax.grad(lambda x : fields_f(params, x).E)
+            return -jax.vmap(grad_E)(points)
+
+        # Move agents
+        dt = 0.1
+        params = Params(mu_k=0.0, sigma_k=0.1, w_k=1.0, mu_g=0.5, sigma_g=0.1, c_rep=1.0)
+        force = motion_f(params, positions)
+        new_positions = (positions + dt * force) % self.grid_size
+
+        agents = agents.at[:, self.alookup['positions']].set(new_positions)
+
+        return agents
 
 def audio_timer(get_audio, fs=44100, blocksize=16000, interval=1):
     import soundcard as sc
@@ -341,7 +406,7 @@ def audio_timer(get_audio, fs=44100, blocksize=16000, interval=1):
 class VisualizeSimulation:
     def __init__(self):
         # Initial setup
-        random_key = random.PRNGKey(0)
+        random_key = random.PRNGKey(1)
 
         self.record = False
 
@@ -354,23 +419,25 @@ class VisualizeSimulation:
 
         # Initialize simulation
         jit = False
-        num_agents = 100000
+        num_agents = 10000
         num_species = 1
         num_chemicals = 1
         grid_size = 1000
         speed = 1.0
-        decay_rate = 0.01
+        decay_rate = 0.001
         deposit_amount = 1.0
         sensor_angle = jnp.pi / 3
-        sensor_distance = 10
-        physarum_type = 'particle_life'
+        sensor_distance = 2
+        physarum_type = 'lenia'
         if physarum_type == 'physarum':
             simulation_cls = Physarum
         elif physarum_type == 'particle_life':
-            num_species = 8
+            num_species = 5
             simulation_cls = ParticleLife
         elif physarum_type == 'particle_system':
             simulation_cls = ParticleSystem
+        elif physarum_type == 'lenia':
+            simulation_cls = Lenia
         self.simulation = simulation_cls(
             random_key,
             jit=jit,

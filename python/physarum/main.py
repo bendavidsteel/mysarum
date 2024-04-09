@@ -241,17 +241,34 @@ class ParticleSystem(DSCL):
         # Calculate sensor positions: around the particle
         angles = jnp.linspace(0., 2 * jnp.pi, self.num_sensors + 1)[:-1]
         offsets = self.sensor_distance * jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=-1)
-        sensors = jnp.round((positions + jnp.expand_dims(offsets, 1)) % self.grid_size)
-        concentrations = chemical_grid[:, sensors[..., 0].astype(jnp.int32), sensors[..., 1].astype(jnp.int32)]
-        concentrations = jnp.moveaxis(concentrations, 0, 1)
-        # Sense the chemical concentration at each sensor
-        rewards = self.get_sense_reward(concentrations, agents)
+        # sensors = jnp.round((positions + jnp.expand_dims(offsets, 1)) % self.grid_size)
+        # concentrations = chemical_grid[:, sensors[..., 0].astype(jnp.int32), sensors[..., 1].astype(jnp.int32)]
+        # concentrations = jnp.moveaxis(concentrations, 0, 1)
+        # # Sense the chemical concentration at each sensor
+        # sensor_rewards = self.get_sense_reward(concentrations, agents)
+        def fields_f(position, agent):
+            sensors = jnp.round((position + offsets) % self.grid_size).astype(jnp.int32)
+            sensor_concentrations = chemical_grid[:, sensors[..., 0], sensors[..., 1]]
+            sensor_concentrations = jnp.moveaxis(sensor_concentrations, 0, 1)
+            pos_sensor = jnp.round(position).astype(jnp.int32) % self.grid_size
+            pos_concentration = chemical_grid[:, pos_sensor[0], pos_sensor[1]]
+            # Sense the chemical concentration at each sensor
+            sensor_rewards = self.get_sense_reward(sensor_concentrations, agent)
+            pos_reward = self.get_sense_reward(pos_concentration, agent)
+            slope = jnp.expand_dims(offsets, 1) * jnp.expand_dims(sensor_rewards - pos_reward, 2) / self.sensor_distance
+            reward = (slope * position).sum()
+            return reward
+        
+        def motion_f(points, agents):
+            grad = jax.grad(lambda pos, agent : fields_f(pos, agent))
+            return -jax.vmap(grad)(points, agents)
 
+        force = motion_f(positions, agents)
         # Move agents
         # compute forces along sensors and concentrations
-        forces = jnp.expand_dims(rewards, 2) * jnp.expand_dims(jnp.expand_dims(offsets, 1), -1)
-        # get means along forces and concentrations
-        force = jnp.mean(jnp.mean(forces, axis=0), axis=0).T
+        # forces = jnp.expand_dims(rewards, 2) * jnp.expand_dims(jnp.expand_dims(offsets, 1), -1)
+        # # get means along forces and concentrations
+        # force = jnp.mean(jnp.mean(forces, axis=0), axis=0).T
         # force += 0.1 * jax.random.uniform(self.random_key, force.shape, minval=-1.0, maxval=1.0, dtype=jnp.float32)
         new_velocity = (1 - self.force_factor) * velocity + self.force_factor * force
         new_positions = (positions + velocity) % self.grid_size
@@ -294,16 +311,16 @@ class BoidsPhysarum(Physarum):
         pass
 
 class ParticleLife(ParticleSystem):
-    def __init__(self, random_key, num_species=5, **kwargs):
+    def __init__(self, random_key, num_species=5, beta=0.3, **kwargs):
         if 'num_chemicals' in kwargs:
             del kwargs['num_chemicals']
-        self.beta = 0.5
+        self.beta = beta
         self.chemical_factors = jax.random.uniform(random_key, (num_species, num_species), minval=-1.0, maxval=1.0)
         super().__init__(random_key, num_species=num_species, num_chemicals=num_species, **kwargs)
 
     def get_sense_reward(self, senses, agents):
         # get species
-        species = jnp.round(agents[:, self.alookup['species']]).astype(int)
+        species = jnp.round(agents[..., self.alookup['species']]).astype(int)
         # look up species chemical mapping
         chemical_factors = self.chemical_factors[species].T
         # return senses * chemical_factors
@@ -408,7 +425,7 @@ class VisualizeSimulation:
         # Initial setup
         random_key = random.PRNGKey(1)
 
-        self.record = False
+        self.record = True
 
         # Audio setup
         # self.default_speaker = sc.default_speaker()
@@ -418,21 +435,23 @@ class VisualizeSimulation:
         self.phase = 0  # To keep track of phase between updates
 
         # Initialize simulation
-        jit = False
+        jit = True
         num_agents = 10000
         num_species = 1
         num_chemicals = 1
         grid_size = 1000
         speed = 1.0
-        decay_rate = 0.001
+        decay_rate = 0.01
         deposit_amount = 1.0
         sensor_angle = jnp.pi / 3
-        sensor_distance = 2
-        physarum_type = 'lenia'
+        sensor_distance = 3
+        kwargs = {}
+        physarum_type = 'particle_life'
         if physarum_type == 'physarum':
             simulation_cls = Physarum
         elif physarum_type == 'particle_life':
-            num_species = 5
+            num_species = 10
+            kwargs['beta'] = 0.5
             simulation_cls = ParticleLife
         elif physarum_type == 'particle_system':
             simulation_cls = ParticleSystem
@@ -449,7 +468,8 @@ class VisualizeSimulation:
             decay_rate=decay_rate, 
             deposit_amount=deposit_amount, 
             sensor_angle=sensor_angle, 
-            sensor_distance=sensor_distance
+            sensor_distance=sensor_distance,
+            **kwargs
         )
 
         self.canvas = scene.SceneCanvas(keys='interactive', size=(grid_size, grid_size))

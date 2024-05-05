@@ -2,6 +2,11 @@
 */.vscode/*
 *.a
 *.so
+*.code-workspace
+*.qbs
+*/GPATH
+*/GRTAGS
+*/GTAGS
 
 #########################
 # core examples

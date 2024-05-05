@@ -87,7 +87,8 @@ class DSCL:
     def display_sim(self, chemical_grid, colours):
         colours = jnp.expand_dims(chemical_grid, 1) * jnp.expand_dims(jnp.expand_dims(colours, -1), -1)
         colour_im = jnp.sum(colours, axis=0)
-        return jnp.moveaxis(colour_im, 0, -1).astype(np.float32)
+        max_intensity = 1.0
+        return (255.0 * jnp.moveaxis(colour_im, 0, -1) / max_intensity).astype(np.uint8)
     
     def get_audio(self, t):
         max_sense = self.agents[:, self.alookup['max_sense']]
@@ -112,6 +113,9 @@ class DSCL:
 
     def get_sense_reward(self, senses, agents):
         return senses
+    
+    def get_summed_sense_reward(self, reward):
+        return reward
 
     def move_agents(self, agents, chemical_grid):
         raise NotImplementedError
@@ -247,6 +251,7 @@ class ParticleSystem(DSCL):
         # # Sense the chemical concentration at each sensor
         # sensor_rewards = self.get_sense_reward(concentrations, agents)
         def fields_f(position, agent):
+            # TODO stack these operations for faster computation
             sensors = jnp.round((position + offsets) % self.grid_size).astype(jnp.int32)
             sensor_concentrations = chemical_grid[:, sensors[..., 0], sensors[..., 1]]
             sensor_concentrations = jnp.moveaxis(sensor_concentrations, 0, 1)
@@ -255,13 +260,14 @@ class ParticleSystem(DSCL):
             # Sense the chemical concentration at each sensor
             sensor_rewards = self.get_sense_reward(sensor_concentrations, agent)
             pos_reward = self.get_sense_reward(pos_concentration, agent)
-            slope = jnp.expand_dims(offsets, 1) * jnp.expand_dims(sensor_rewards - pos_reward, 2) / self.sensor_distance
-            reward = (slope * position).sum()
+            slope = jnp.expand_dims(jnp.linalg.norm(offsets), 1) * jnp.expand_dims(sensor_rewards - pos_reward, 2) / self.sensor_distance
+            intercept = jnp.expand_dims(pos_reward, 1) - slope * position
+            reward = (slope * position + intercept).sum()
             return reward
         
         def motion_f(points, agents):
             grad = jax.grad(lambda pos, agent : fields_f(pos, agent))
-            return -jax.vmap(grad)(points, agents)
+            return jax.vmap(grad)(points, agents)
 
         force = motion_f(positions, agents)
         # Move agents
@@ -345,66 +351,74 @@ class ParticleLife(ParticleSystem):
         species = jnp.round(agents[:, self.alookup['species']]).astype(int)
         return chemical_grid.at[species, quantized_positions[:, 0], quantized_positions[:, 1]].add(self.deposit_amount).clip(0, 1)
 
-class Lenia(DSCL):
+def peak_f(x, mu, sigma):
+    return jnp.exp(-((x-mu)/sigma)**2)
+
+def repel_f(x):
+    return x
+
+class Lenia(ParticleSystem):
     def __init__(self, *args, num_sensors=8, sensor_distance=5, **kwargs):
         
         self.num_sensors = num_sensors
         self.sensor_distance = sensor_distance
 
-        super().__init__(*args, **kwargs)
+        self.mu_k = 0.01
+        self.sigma_k = 0.1
+        self.mu_g = 0.03
+        self.sigma_g = 0.1
+        self.c_rep = 0.1
 
-    def initialize_agents(self):
-        positions = jax.random.uniform(self.random_key, (self.num_agents, 2), minval=0, maxval=self.grid_size, dtype=jnp.float32)
-        species = jax.random.randint(self.random_key, (self.num_agents,1), minval=0, maxval=self.num_species, dtype=jnp.int8)
-        max_sense = jnp.zeros((self.num_agents, 1), dtype=jnp.float32)
-        phase = jax.random.uniform(self.random_key, (self.num_agents, 1), minval=0, maxval=2*jnp.pi, dtype=jnp.float32)
-        cols = [positions, species, max_sense, phase]
-        col_names = ['positions', 'species', 'max_sense', 'phase']
-        assert len(cols) == len(col_names)
-        self.alookup = {}
-        col_idx = 0
-        for col_name, col in zip(col_names, cols):
-            col_width = col.shape[1]
-            if col_width == 1:
-                self.alookup[col_name] = col_idx
-            else:
-                self.alookup[col_name] = slice(col_idx, col_idx+col_width)
-            col_idx += col_width
-        agents = jnp.concatenate(cols, axis=1)
-        return agents
+        super().__init__(*args, **kwargs)
 
     def move_agents(self, agents, chemical_grid):
         positions = agents[:, self.alookup['positions']]
+        velocity = agents[:, self.alookup['velocity']]
         # Calculate sensor positions: around the particle
         angles = jnp.linspace(0., 2 * jnp.pi, self.num_sensors + 1)[:-1]
         offsets = self.sensor_distance * jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=-1)
+        # sensors = jnp.round((positions + jnp.expand_dims(offsets, 1)) % self.grid_size)
+        # concentrations = chemical_grid[:, sensors[..., 0].astype(jnp.int32), sensors[..., 1].astype(jnp.int32)]
+        # concentrations = jnp.moveaxis(concentrations, 0, 1)
+        # # Sense the chemical concentration at each sensor
+        # sensor_rewards = self.get_sense_reward(concentrations, agents)
+        def fields_f(position, agent):
+            # TODO stack these operations for faster computation
+            sensors = jnp.round((position + offsets) % self.grid_size).astype(jnp.int32)
+            sensor_concentrations = chemical_grid[:, sensors[..., 0], sensors[..., 1]]
+            sensor_concentrations = jnp.moveaxis(sensor_concentrations, 0, 1)
+            pos_sensor = jnp.round(position).astype(jnp.int32) % self.grid_size
+            pos_concentration = chemical_grid[:, pos_sensor[0], pos_sensor[1]]
+            # Sense the chemical concentration at each sensor
+            sensor_u = peak_f(sensor_concentrations, self.mu_k, self.sigma_k)
+            pos_u = peak_f(pos_concentration, self.mu_k, self.sigma_k)
+            slope_u = jnp.expand_dims(sensor_u - pos_u, 2) / (sensors - pos_sensor)
+            intercept_u = jnp.expand_dims(pos_u, 1) - slope_u * position
+            u = (slope_u * position + intercept_u).sum()
+            g = peak_f(u, self.mu_g, self.sigma_g)
+            sensor_r = repel_f(sensor_concentrations)
+            pos_r = repel_f(pos_concentration)
+            slope_r = jnp.expand_dims(sensor_r - pos_r, 2) / (sensors - pos_sensor)
+            intercept_r = jnp.expand_dims(pos_r, 1) - slope_r * position
+            r = self.c_rep * (slope_r * position + intercept_r).sum()
+            return r - g
+        
+        def motion_f(points, agents):
+            grad = jax.grad(lambda pos, agent : fields_f(pos, agent))
+            return -jax.vmap(grad)(points, agents)
 
-        Params = namedtuple('Params', 'mu_k sigma_k w_k mu_g sigma_g c_rep')
-        Fields = namedtuple('Fields', 'U G R E')
-
-        def peak_f(x, mu, sigma):
-            return jnp.exp(-((x-mu)/sigma)**2)
-
-        def fields_f(p: Params, x):
-            sensors = jnp.round((x + jnp.expand_dims(offsets, 1)) % self.grid_size)
-            # TODO reformulate r to be a differentiable function of x using bilinear interpolation
-            r = chemical_grid[:, sensors[..., 0].astype(jnp.int32), sensors[..., 1].astype(jnp.int32)]
-            U = peak_f(r, p.mu_k, p.sigma_k).sum()*p.w_k
-            G = peak_f(U, p.mu_g, p.sigma_g)
-            R = p.c_rep/2 * ((1.0-r).clip(0.0)**2).sum()
-            return Fields(U, G, R, E=R-G)
-
-        def motion_f(params, points):
-            grad_E = jax.grad(lambda x : fields_f(params, x).E)
-            return -jax.vmap(grad_E)(points)
-
+        force = motion_f(positions, agents)
         # Move agents
-        dt = 0.1
-        params = Params(mu_k=0.0, sigma_k=0.1, w_k=1.0, mu_g=0.5, sigma_g=0.1, c_rep=1.0)
-        force = motion_f(params, positions)
-        new_positions = (positions + dt * force) % self.grid_size
+        # compute forces along sensors and concentrations
+        # forces = jnp.expand_dims(rewards, 2) * jnp.expand_dims(jnp.expand_dims(offsets, 1), -1)
+        # # get means along forces and concentrations
+        # force = jnp.mean(jnp.mean(forces, axis=0), axis=0).T
+        # force += 0.1 * jax.random.uniform(self.random_key, force.shape, minval=-1.0, maxval=1.0, dtype=jnp.float32)
+        new_velocity = (1 - self.force_factor) * velocity + self.force_factor * force
+        new_positions = (positions + velocity) % self.grid_size
 
         agents = agents.at[:, self.alookup['positions']].set(new_positions)
+        agents = agents.at[:, self.alookup['velocity']].set(new_velocity)
 
         return agents
 
@@ -421,56 +435,16 @@ def audio_timer(get_audio, fs=44100, blocksize=16000, interval=1):
             time.sleep(max(next_call - time.time(), 0))
 
 class VisualizeSimulation:
-    def __init__(self):
-        # Initial setup
-        random_key = random.PRNGKey(1)
-
-        self.record = True
+    def __init__(self, simulation):
+        self.simulation = simulation
+        grid_size = simulation.grid_size
 
         # Audio setup
         # self.default_speaker = sc.default_speaker()
         # self.fs = 44100  # Sample rate
         # self.blocksize = 16000
         # self.num_channels = self.default_speaker.channels
-        self.phase = 0  # To keep track of phase between updates
-
-        # Initialize simulation
-        jit = True
-        num_agents = 10000
-        num_species = 1
-        num_chemicals = 1
-        grid_size = 1000
-        speed = 1.0
-        decay_rate = 0.01
-        deposit_amount = 1.0
-        sensor_angle = jnp.pi / 3
-        sensor_distance = 3
-        kwargs = {}
-        physarum_type = 'particle_life'
-        if physarum_type == 'physarum':
-            simulation_cls = Physarum
-        elif physarum_type == 'particle_life':
-            num_species = 10
-            kwargs['beta'] = 0.5
-            simulation_cls = ParticleLife
-        elif physarum_type == 'particle_system':
-            simulation_cls = ParticleSystem
-        elif physarum_type == 'lenia':
-            simulation_cls = Lenia
-        self.simulation = simulation_cls(
-            random_key,
-            jit=jit,
-            num_agents=num_agents, 
-            grid_size=grid_size, 
-            num_species=num_species, 
-            num_chemicals=num_chemicals, 
-            speed=speed, 
-            decay_rate=decay_rate, 
-            deposit_amount=deposit_amount, 
-            sensor_angle=sensor_angle, 
-            sensor_distance=sensor_distance,
-            **kwargs
-        )
+        phase = 0  # To keep track of phase between updates
 
         self.canvas = scene.SceneCanvas(keys='interactive', size=(grid_size, grid_size))
         self.canvas.show()
@@ -478,7 +452,7 @@ class VisualizeSimulation:
         view = self.canvas.central_widget.add_view()
 
         im = self.simulation.get_display()
-        self.image = scene.visuals.Image(im, parent=view.scene, clim=(0, 1))
+        self.image = scene.visuals.Image(im, parent=view.scene, clim=(0, 255))
         
         # Configure the view
         # view.camera = 'panzoom'
@@ -486,8 +460,8 @@ class VisualizeSimulation:
 
         # start audio system
         
-        if self.record:
-            self.writer = imageio.get_writer('physarum.gif', duration=0.1)
+        # if self.record:
+        #     self.writer = imageio.get_writer('physarum.gif', duration=0.1)
         self.idx = 0
 
         # Update the image data periodically
@@ -513,9 +487,8 @@ class VisualizeSimulation:
         self.canvas.update()
         # audio_data = self.generate_audio_data()
         # self.player.play(audio_data)
-        if self.record:
-            im = self.canvas.render()
-            self.writer.append_data(im)
+        # if self.record:
+        #     self.writer.append_data(im)
 
     def generate_audio_data(self, fs, num_channels):
         # Example method to generate audio data
@@ -530,21 +503,64 @@ class VisualizeSimulation:
 
 
     def close(self):
-        if self.record:
-            self.writer.close()
+        # if self.record:
+        #     self.writer.close()
         self.display_timer.stop()
         if hasattr(self, 'audio_timer'):
             self.audio_timer.close()
         self.canvas.close()
 
 def main():
+    # Initial setup
+    random_key = random.PRNGKey(3)
+
+    record = True
+
+    # Initialize simulation
+    jit = True
+    num_agents = 20000
+    num_species = 1
+    num_chemicals = 1
+    grid_size = 1000
+    speed = 1.0
+    decay_rate = 0.01
+    deposit_amount = 1.0
+    sensor_angle = jnp.pi / 3
+    sensor_distance = 5
+    kwargs = {}
+    physarum_type = 'lenia'
+    if physarum_type == 'physarum':
+        simulation_cls = Physarum
+    elif physarum_type == 'particle_life':
+        num_species = 4
+        kwargs['beta'] = 0.4
+        simulation_cls = ParticleLife
+    elif physarum_type == 'particle_system':
+        simulation_cls = ParticleSystem
+    elif physarum_type == 'lenia':
+        simulation_cls = Lenia
+    simulation = simulation_cls(
+        random_key,
+        jit=jit,
+        num_agents=num_agents, 
+        grid_size=grid_size, 
+        num_species=num_species, 
+        num_chemicals=num_chemicals, 
+        speed=speed, 
+        decay_rate=decay_rate, 
+        deposit_amount=deposit_amount, 
+        sensor_angle=sensor_angle, 
+        sensor_distance=sensor_distance,
+        **kwargs
+    )
     visual = None
     try:
-        visual = VisualizeSimulation()
+        visual = VisualizeSimulation(simulation)
         app.run()
     except:
         raise
     finally:
+        print('Closing')
         if hasattr(visual, 'close'):
             visual.close()
 

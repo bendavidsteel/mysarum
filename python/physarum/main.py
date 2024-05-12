@@ -3,7 +3,7 @@ import multiprocessing
 import threading
 import time
 
-import imageio
+import einops
 import jax
 from jax import random
 import jax.numpy as jnp
@@ -245,23 +245,22 @@ class ParticleSystem(DSCL):
         # Calculate sensor positions: around the particle
         angles = jnp.linspace(0., 2 * jnp.pi, self.num_sensors + 1)[:-1]
         offsets = self.sensor_distance * jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=-1)
-        # sensors = jnp.round((positions + jnp.expand_dims(offsets, 1)) % self.grid_size)
-        # concentrations = chemical_grid[:, sensors[..., 0].astype(jnp.int32), sensors[..., 1].astype(jnp.int32)]
-        # concentrations = jnp.moveaxis(concentrations, 0, 1)
-        # # Sense the chemical concentration at each sensor
-        # sensor_rewards = self.get_sense_reward(concentrations, agents)
+
         def fields_f(position, agent):
             # TODO stack these operations for faster computation
             sensors = jnp.round((position + offsets) % self.grid_size).astype(jnp.int32)
             sensor_concentrations = chemical_grid[:, sensors[..., 0], sensors[..., 1]]
-            sensor_concentrations = jnp.moveaxis(sensor_concentrations, 0, 1)
+            sensor_concentrations = einops.rearrange(sensor_concentrations, 'c s -> s c')
             pos_sensor = jnp.round(position).astype(jnp.int32) % self.grid_size
             pos_concentration = chemical_grid[:, pos_sensor[0], pos_sensor[1]]
+
             # Sense the chemical concentration at each sensor
             sensor_rewards = self.get_sense_reward(sensor_concentrations, agent)
             pos_reward = self.get_sense_reward(pos_concentration, agent)
-            slope = jnp.expand_dims(jnp.linalg.norm(offsets), 1) * jnp.expand_dims(sensor_rewards - pos_reward, 2) / self.sensor_distance
-            intercept = jnp.expand_dims(pos_reward, 1) - slope * position
+            slope = einops.rearrange(offsets / jnp.linalg.norm(offsets, axis=1, keepdims=True), 's d -> s 1 d') * einops.rearrange(sensor_rewards - pos_reward, 's c -> s c 1') / self.sensor_distance
+            intercept = einops.rearrange(pos_reward, 'c -> c 1') - slope * position
+            slope = jax.lax.stop_gradient(slope)
+            intercept = jax.lax.stop_gradient(intercept)
             reward = (slope * position + intercept).sum()
             return reward
         
@@ -271,11 +270,6 @@ class ParticleSystem(DSCL):
 
         force = motion_f(positions, agents)
         # Move agents
-        # compute forces along sensors and concentrations
-        # forces = jnp.expand_dims(rewards, 2) * jnp.expand_dims(jnp.expand_dims(offsets, 1), -1)
-        # # get means along forces and concentrations
-        # force = jnp.mean(jnp.mean(forces, axis=0), axis=0).T
-        # force += 0.1 * jax.random.uniform(self.random_key, force.shape, minval=-1.0, maxval=1.0, dtype=jnp.float32)
         new_velocity = (1 - self.force_factor) * velocity + self.force_factor * force
         new_positions = (positions + velocity) % self.grid_size
 
@@ -336,7 +330,7 @@ class ParticleLife(ParticleSystem):
             senses
         )
         reward = jnp.where(
-            jnp.logical_and(senses < self.beta, senses > self.beta / 2.),
+            jnp.logical_and(senses <= self.beta, senses > self.beta / 2.),
             (chemical_factors * 2.0) * (1 - senses / self.beta),
             reward
         )
@@ -364,42 +358,49 @@ class Lenia(ParticleSystem):
         self.sensor_distance = sensor_distance
 
         self.mu_k = 0.01
-        self.sigma_k = 0.1
+        self.sigma_k = 0.3
         self.mu_g = 0.03
-        self.sigma_g = 0.1
+        self.sigma_g = 0.3
         self.c_rep = 0.1
 
         super().__init__(*args, **kwargs)
-
+    
     def move_agents(self, agents, chemical_grid):
         positions = agents[:, self.alookup['positions']]
         velocity = agents[:, self.alookup['velocity']]
         # Calculate sensor positions: around the particle
         angles = jnp.linspace(0., 2 * jnp.pi, self.num_sensors + 1)[:-1]
-        offsets = self.sensor_distance * jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=-1)
-        # sensors = jnp.round((positions + jnp.expand_dims(offsets, 1)) % self.grid_size)
-        # concentrations = chemical_grid[:, sensors[..., 0].astype(jnp.int32), sensors[..., 1].astype(jnp.int32)]
-        # concentrations = jnp.moveaxis(concentrations, 0, 1)
-        # # Sense the chemical concentration at each sensor
-        # sensor_rewards = self.get_sense_reward(concentrations, agents)
+        directions = jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=-1)
+        offsets = self.sensor_distance * directions
+        epsilon = 1e-6
+
         def fields_f(position, agent):
             # TODO stack these operations for faster computation
             sensors = jnp.round((position + offsets) % self.grid_size).astype(jnp.int32)
             sensor_concentrations = chemical_grid[:, sensors[..., 0], sensors[..., 1]]
-            sensor_concentrations = jnp.moveaxis(sensor_concentrations, 0, 1)
+            sensor_concentrations = einops.rearrange(sensor_concentrations, 'c s -> s c')
             pos_sensor = jnp.round(position).astype(jnp.int32) % self.grid_size
             pos_concentration = chemical_grid[:, pos_sensor[0], pos_sensor[1]]
+
             # Sense the chemical concentration at each sensor
             sensor_u = peak_f(sensor_concentrations, self.mu_k, self.sigma_k)
             pos_u = peak_f(pos_concentration, self.mu_k, self.sigma_k)
-            slope_u = jnp.expand_dims(sensor_u - pos_u, 2) / (sensors - pos_sensor)
-            intercept_u = jnp.expand_dims(pos_u, 1) - slope_u * position
+            slope_u = offsets * (sensor_u - pos_u) / self.sensor_distance
+            intercept_u = pos_u - slope_u * position
+            slope_u = jax.lax.stop_gradient(slope_u)
+            intercept_u = jax.lax.stop_gradient(intercept_u)
             u = (slope_u * position + intercept_u).sum()
+
+            # get the growth field
             g = peak_f(u, self.mu_g, self.sigma_g)
+
+            # determine the repulsion field
             sensor_r = repel_f(sensor_concentrations)
             pos_r = repel_f(pos_concentration)
-            slope_r = jnp.expand_dims(sensor_r - pos_r, 2) / (sensors - pos_sensor)
-            intercept_r = jnp.expand_dims(pos_r, 1) - slope_r * position
+            slope_r = offsets * (sensor_r - pos_r) / self.sensor_distance
+            intercept_r = pos_r - slope_r * position
+            slope_r = jax.lax.stop_gradient(slope_r)
+            intercept_r = jax.lax.stop_gradient(intercept_r)
             r = self.c_rep * (slope_r * position + intercept_r).sum()
             return r - g
         
@@ -409,11 +410,6 @@ class Lenia(ParticleSystem):
 
         force = motion_f(positions, agents)
         # Move agents
-        # compute forces along sensors and concentrations
-        # forces = jnp.expand_dims(rewards, 2) * jnp.expand_dims(jnp.expand_dims(offsets, 1), -1)
-        # # get means along forces and concentrations
-        # force = jnp.mean(jnp.mean(forces, axis=0), axis=0).T
-        # force += 0.1 * jax.random.uniform(self.random_key, force.shape, minval=-1.0, maxval=1.0, dtype=jnp.float32)
         new_velocity = (1 - self.force_factor) * velocity + self.force_factor * force
         new_positions = (positions + velocity) % self.grid_size
 
@@ -517,13 +513,13 @@ def main():
     record = True
 
     # Initialize simulation
-    jit = True
-    num_agents = 20000
+    jit = False
+    num_agents = 1000
     num_species = 1
     num_chemicals = 1
     grid_size = 1000
     speed = 1.0
-    decay_rate = 0.01
+    decay_rate = 0.001
     deposit_amount = 1.0
     sensor_angle = jnp.pi / 3
     sensor_distance = 5
@@ -532,7 +528,7 @@ def main():
     if physarum_type == 'physarum':
         simulation_cls = Physarum
     elif physarum_type == 'particle_life':
-        num_species = 4
+        num_species = 1
         kwargs['beta'] = 0.4
         simulation_cls = ParticleLife
     elif physarum_type == 'particle_system':

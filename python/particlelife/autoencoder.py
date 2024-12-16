@@ -1,65 +1,31 @@
 import json
 import os
 
+from clu import metrics
 import flax
 from flax import linen as nn
-from flax.training import train_state
+from flax.training import checkpoints, train_state
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from ott.geometry import pointcloud
+from ott.solvers import linear
 import torch
 from torch.utils.tensorboard import SummaryWriter
 import tqdm
 
+@jax.jit
+def reg_ot_cost(x: jnp.ndarray, y: jnp.ndarray) -> float:
+    geom = pointcloud.PointCloud(x, y)
+    ot = linear.solve(geom)
+    return ot.reg_ot_cost
 
-def soft_min(x, axis, tau=1e-3):
-    """
-    Compute differentiable soft minimum using log-sum-exp trick.
-    Lower tau values make it closer to true minimum but potentially less stable.
-    """
-    return -tau * jnp.log(jnp.mean(jnp.exp(-x / tau), axis=axis))
-
-def chamfer_distance(x, y, tau=1e-3):
-    """
-    Compute differentiable Chamfer Distance between two point clouds.
-    
-    Args:
-        x: Points of shape (batch_size, num_points_x, dim)
-        y: Points of shape (batch_size, num_points_y, dim)
-        tau: Temperature parameter for soft minimum
-        
-    Returns:
-        Scalar Chamfer distance averaged over batch
-    """
-    # Compute squared norms directly
-    x_norm_sq = jnp.sum(x**2, axis=-1)  # (batch_size, num_points_x)
-    y_norm_sq = jnp.sum(y**2, axis=-1)  # (batch_size, num_points_y)
-    
-    # Compute cross terms
-    zz = jnp.matmul(x, y.transpose((0, 2, 1)))  # (batch_size, num_points_x, num_points_y)
-    
-    # Expand norms for broadcasting
-    rx = jnp.expand_dims(x_norm_sq, axis=2)  # (batch_size, num_points_x, 1)
-    ry = jnp.expand_dims(y_norm_sq, axis=1)  # (batch_size, 1, num_points_y)
-    
-    # Compute squared distances
-    P = rx + ry - 2 * zz  # (batch_size, num_points_x, num_points_y)
-    
-    # Compute soft minimum distances in both directions
-    min_dist_xy = jnp.mean(soft_min(P, axis=2, tau=tau))
-    min_dist_yx = jnp.mean(soft_min(P, axis=1, tau=tau))
-    
-    return min_dist_xy + min_dist_yx
-
-import jax
-import jax.numpy as jnp
-import flax.linen as nn
 
 class PointCloudEncoder(nn.Module):
     """
     Encoder network that takes a point cloud and outputs a latent vector.
-    Input shape: (batch_size, num_points, 3)
+    Input shape: (batch_size, seq_len, num_points, 3)
     Output shape: (batch_size, latent_dim)
     """
     latent_dim: int
@@ -67,21 +33,21 @@ class PointCloudEncoder(nn.Module):
     @nn.compact
     def __call__(self, x):
         # First pass through point-wise MLPs
-        x = nn.Dense(64)(x)  # (batch_size, num_points, 64)
+        x = nn.Dense(16)(x)  # (batch_size, seq_len, num_points, 16)
         x = nn.relu(x)
-        x = nn.Dense(128)(x)
-        x = nn.relu(x)
-        x = nn.Dense(256)(x)
+        x = nn.Dense(32)(x)
         x = nn.relu(x)
         
         # Max pooling over points to get global features
-        x = jnp.max(x, axis=1)  # (batch_size, 256)
-        
+        x = jnp.max(x, axis=-2)  # (batch_size, seq_len, 256)
+
         # Project to latent space
-        x = nn.Dense(512)(x)
+        x = nn.Dense(64)(x)
         x = nn.relu(x)
         x = nn.Dense(self.latent_dim)(x)
         
+        x = x.mean(axis=1)  # Average over sequence length
+
         return x
 
 class PointCloudDecoder(nn.Module):
@@ -90,19 +56,21 @@ class PointCloudDecoder(nn.Module):
     Input shape: (batch_size, latent_dim)
     Output shape: (batch_size, num_points, 3)
     """
+    seq_len: int
     num_points: int
+    num_dims: int
 
     @nn.compact
     def __call__(self, z):
         # Expand latent vector
-        x = nn.Dense(512)(z)
+        x = nn.Dense(64)(z)
         x = nn.relu(x)
-        x = nn.Dense(1024)(x)
+        x = nn.Dense(256)(x)
         x = nn.relu(x)
         
         # Reshape to get multiple points
-        x = nn.Dense(self.num_points * 3)(x)
-        x = jnp.reshape(x, (-1, self.num_points, 3))
+        x = nn.Dense(self.seq_len * self.num_points * self.num_dims)(x)
+        x = jnp.reshape(x, (-1, self.seq_len, self.num_points, self.num_dims))
         
         return x
 
@@ -111,11 +79,13 @@ class PointCloudAutoencoder(nn.Module):
     Complete autoencoder for point clouds.
     """
     latent_dim: int
+    seq_len: int
     num_points: int
+    num_dims: int
 
     def setup(self):
         self.encoder = PointCloudEncoder(latent_dim=self.latent_dim)
-        self.decoder = PointCloudDecoder(num_points=self.num_points)
+        self.decoder = PointCloudDecoder(seq_len=self.seq_len, num_points=self.num_points, num_dims=self.num_dims)
 
     def __call__(self, x):
         z = self.encoder(x)
@@ -151,134 +121,147 @@ class GenerateCallback:
             # grid = torchvision.utils.make_grid(imgs, nrow=2, normalize=True, value_range=(-1,1))
             # logger.add_image("Reconstructions", grid, global_step=epoch)
 
-class TrainerModule:
-    def __init__(self, num_points, latent_dim, lr=1e-3, seed=42):
-        super().__init__()
-        self.num_points = num_points
-        self.latent_dim = latent_dim
-        self.lr = lr
-        self.seed = seed
-        # Create empty model. Note: no parameters yet
-        self.model = PointCloudAutoencoder(num_points=self.num_points, latent_dim=self.latent_dim)
-        # Prepare logging
-        self.exmp_imgs = next(iter(val_loader))[0][:8]
-        self.log_dir = os.path.join(CHECKPOINT_PATH, f'cifar10_{self.latent_dim}')
-        self.generate_callback = GenerateCallback(self.exmp_imgs, every_n_epochs=50)
-        self.logger = SummaryWriter(log_dir=self.log_dir)
-        # Create jitted training and eval functions
-        self.create_functions()
-        # Initialize model
-        self.init_model()
 
-    def create_functions(self):
-        # Training step (example)
-        @jax.jit
-        def train_step(batch):
-            def loss_fn(params):
-                reconstructed = self.model.apply(params, batch)
-                # Here you could use Chamfer distance or OT-based loss
-                loss = chamfer_distance(reconstructed, batch)
-                return loss
+@flax.struct.dataclass
+class Metrics(metrics.Collection):
+    loss: metrics.Average.from_output('loss')
 
-            loss, grads = jax.value_and_grad(loss_fn)(self.state.params)
-            updates, new_optimizer_state = self.state.tx.update(grads, self.state)
-            new_params = optax.apply_updates(self.state.params, updates)
+class TrainState(train_state.TrainState):
+    metrics: Metrics
 
-            return new_params, new_optimizer_state, loss
+def create_train_state(module, rng, init_example, learning_rate, momentum):
+    """Creates an initial `TrainState`."""
+    params = module.init(rng, init_example)['params'] # initialize parameters by passing a template image
+    tx = optax.adamw(learning_rate, momentum)
+    return TrainState.create(
+        apply_fn=module.apply, params=params, tx=tx,
+        metrics=Metrics.empty())
 
-        self.train_step = jax.jit(train_step)
-        # Eval function
-        def eval_step(batch):
-            reconstructed = self.model.apply(self.state.params, batch)
-            # Here you could use Chamfer distance or OT-based loss
-            return chamfer_distance(reconstructed, batch)
-        self.eval_step = jax.jit(eval_step)
+@jax.jit
+def train_step(state, batch):
+    def loss_fn(params):
+        reconstructed = state.apply_fn({'params': params}, batch)
+        # Here you could use Chamfer distance or OT-based loss
+        loss = jax.vmap(jax.vmap(reg_ot_cost))(reconstructed, batch)
+        return jnp.mean(loss)
 
-    def init_model(self):
-        # Initialize model
-        rng = jax.random.PRNGKey(self.seed)
-        rng, init_rng = jax.random.split(rng)
-        params = self.model.init(init_rng, self.exmp_imgs)['params']
-        # Initialize learning rate schedule and optimizer
-        lr_schedule = optax.warmup_cosine_decay_schedule(
-            init_value=0.0,
-            peak_value=1e-3,
-            warmup_steps=100,
-            decay_steps=500*len(train_loader),
-            end_value=1e-5
-        )
-        optimizer = optax.chain(
-            optax.clip(1.0),  # Clip gradients at 1
-            optax.adam(lr_schedule)
-        )
-        # Initialize training state
-        self.state = train_state.TrainState.create(apply_fn=self.model.apply, params=params, tx=optimizer)
+    loss, grads = jax.value_and_grad(loss_fn)(state.params)
+    state = state.apply_gradients(grads=grads)
+    return state, loss
 
-    def train_model(self, num_epochs=500):
-        # Train model for defined number of epochs
-        best_eval = 1e6
-        for epoch_idx in tqdm.tqdm(range(1, num_epochs+1)):
-            self.train_epoch(epoch=epoch_idx)
-            if epoch_idx % 10 == 0:
-                eval_loss = self.eval_model(val_loader)
-                self.logger.add_scalar('val/loss', eval_loss, global_step=epoch_idx)
-                if eval_loss < best_eval:
-                    best_eval = eval_loss
-                    self.save_model(step=epoch_idx)
-                self.generate_callback.log_generations(self.model, self.state, logger=self.logger, epoch=epoch_idx)
-                self.logger.flush()
+# Eval function
+@jax.jit
+def eval_step(state, batch):
+    reconstructed = state.apply_fn({'params': state.params}, batch)
+    loss = jax.vmap(jax.vmap(reg_ot_cost))(reconstructed, batch)
+    loss = jnp.mean(loss)
+    metric_updates = state.metrics.single_from_model_output(loss=loss)
+    metrics = state.metrics.merge(metric_updates)
+    state = state.replace(metrics=metrics)
+    return state, loss
 
-    def train_epoch(self, epoch):
-        # Train model for one epoch, and log avg loss
-        losses = []
-        for batch in train_loader:
-            self.state, loss = self.train_step(batch)
-            losses.append(loss)
-        losses_np = np.stack(jax.device_get(losses))
-        avg_loss = losses_np.mean()
-        self.logger.add_scalar('train/loss', avg_loss, global_step=epoch)
+# class TrainerModule:
+#     def __init__(self, num_points, latent_dim, lr=1e-3, seed=42):
+#         super().__init__()
+#         self.num_points = num_points
+#         self.latent_dim = latent_dim
+#         self.lr = lr
+#         self.seed = seed
+#         # Prepare logging
+#         self.exmp_imgs = next(iter(val_loader))[0][:8]
+#         self.log_dir = os.path.join(CHECKPOINT_PATH, f'cifar10_{self.latent_dim}')
+#         self.generate_callback = GenerateCallback(self.exmp_imgs, every_n_epochs=50)
+#         self.logger = SummaryWriter(log_dir=self.log_dir)
+#         # Initialize model
+#         self.init_model()
 
-    def eval_model(self, data_loader):
-        # Test model on all images of a data loader and return avg loss
-        losses = []
-        batch_sizes = []
-        for batch in data_loader:
-            loss = self.eval_step(self.state, batch)
-            losses.append(loss)
-            batch_sizes.append(batch[0].shape[0])
-        losses_np = np.stack(jax.device_get(losses))
-        batch_sizes_np = np.stack(batch_sizes)
-        avg_loss = (losses_np * batch_sizes_np).sum() / batch_sizes_np.sum()
-        return avg_loss
 
-    def save_model(self, step=0):
-        # Save current model at certain training iteration
-        checkpoints.save_checkpoint(ckpt_dir=self.log_dir, target=self.state.params, prefix=f'cifar10_{self.latent_dim}_', step=step)
 
-    def load_model(self, pretrained=False):
-        # Load model. We use different checkpoint for pretrained models
-        if not pretrained:
-            params = checkpoints.restore_checkpoint(ckpt_dir=self.log_dir, target=self.state.params, prefix=f'cifar10_{self.latent_dim}_')
-        else:
-            params = checkpoints.restore_checkpoint(ckpt_dir=os.path.join(CHECKPOINT_PATH, f'cifar10_{self.latent_dim}.ckpt'), target=self.state.params)
-        self.state = train_state.TrainState.create(apply_fn=self.model.apply, params=params, tx=self.state.tx)
+def train_model(state, log_dir, num_epochs=500):
+    # Train model for defined number of epochs
+    best_eval = 1e6
+    for epoch_idx in range(1, num_epochs+1):
+        state = train_epoch(state, epoch=epoch_idx)
+        if epoch_idx % 10 == 0:
+            state, eval_loss = eval_model(state, val_loader)
+            print(f"Epoch {epoch_idx}, eval loss: {eval_loss:.4f}")
+            # self.logger.add_scalar('val/loss', eval_loss, global_step=epoch_idx)
+            if eval_loss < best_eval:
+                best_eval = eval_loss
+                save_model(state, log_dir, step=epoch_idx)
+            # self.generate_callback.log_generations(self.model, self.state, logger=self.logger, epoch=epoch_idx)
+            # self.logger.flush()
 
-    def checkpoint_exists(self):
-        # Check whether a pretrained model exist for this autoencoder
-        return os.path.isfile(os.path.join(CHECKPOINT_PATH, f'cifar10_{self.latent_dim}.ckpt'))
+def train_epoch(state, epoch):
+    # Train model for one epoch, and log avg loss
+    losses = []
+    pbar = tqdm.tqdm(train_loader)
+    pbar.set_description(f"Epoch {epoch}, loss: {0.0}")
+    for batch in pbar:
+        state, loss = train_step(state, batch)
+        pbar.set_description(f"Epoch {epoch}, loss: {loss:.4f}")
+        losses.append(loss)
+    losses_np = np.stack(jax.device_get(losses))
+    avg_loss = losses_np.mean()
+    # self.logger.add_scalar('train/loss', avg_loss, global_step=epoch)
+    return state
 
-def train_autoencoder(num_points, latent_dim):
-    # Create a trainer module with specified hyperparameters
-    trainer = TrainerModule(num_points=num_points, latent_dim=latent_dim)
-    if not trainer.checkpoint_exists():  # Skip training if pretrained model exists
-        trainer.train_model(num_epochs=500)
-        trainer.load_model()
+def eval_model(state, data_loader):
+    # Test model on all images of a data loader and return avg loss
+    losses = []
+    batch_sizes = []
+    for batch in data_loader:
+        state, loss = eval_step(state, batch)
+        losses.append(loss)
+        batch_sizes.append(batch[0].shape[0])
+    losses_np = np.stack(jax.device_get(losses))
+    batch_sizes_np = np.stack(batch_sizes)
+    avg_loss = (losses_np * batch_sizes_np).sum() / batch_sizes_np.sum()
+    return state, avg_loss
+
+def save_model(state, log_dir, step=0):
+    # Save current model at certain training iteration
+    checkpoints.save_checkpoint(ckpt_dir=log_dir, target=state.params, prefix=f'plenia_{latent_dim}_', step=step)
+
+def load_model(state, log_dir, pretrained=False):
+    # Load model. We use different checkpoint for pretrained models
+    if not pretrained:
+        params = checkpoints.restore_checkpoint(ckpt_dir=log_dir, target=state.params, prefix=f'plenia_{latent_dim}_')
     else:
-        trainer.load_model(pretrained=True)
-    test_loss = trainer.eval_model(test_loader)
+        params = checkpoints.restore_checkpoint(ckpt_dir=os.path.join(CHECKPOINT_PATH, f'plenia_{latent_dim}.ckpt'), target=state.params)
+    state = state.replace(params=params)
+    return state
+    
+def checkpoint_exists():
+    # Check whether a pretrained model exist for this autoencoder
+    return os.path.isfile(os.path.join(CHECKPOINT_PATH, f'plenia_{latent_dim}.ckpt'))
+
+def train_autoencoder(log_dir, seq_len, num_points, latent_dim, num_dims):
+    model = PointCloudAutoencoder(seq_len=seq_len, num_points=num_points, latent_dim=latent_dim, num_dims=num_dims)
+    learning_rate = 1e-3
+    momentum = 0.9
+    # Initialize model
+    rng = jax.random.PRNGKey(0)
+    rng, init_rng = jax.random.split(rng)
+    init_example = next(iter(val_loader))
+    state = create_train_state(model, init_rng, init_example, learning_rate, momentum)
+    # Initialize learning rate schedule and optimizer
+    lr_schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=1e-3,
+        warmup_steps=100,
+        decay_steps=500*len(train_loader),
+        end_value=1e-5
+    )
+    del init_rng  # Must not be used anymore.
+    # Create a trainer module with specified hyperparameters
+    # trainer = TrainerModule(num_points=num_points, latent_dim=latent_dim)
+    state = train_model(state, log_dir, num_epochs=500)
+    state = load_model(state, log_dir)
+    test_loss = eval_model(test_loader)
     # Bind parameters to model for easier inference
-    trainer.model_bd = trainer.model.bind({'params': trainer.state.params})
-    return trainer, test_loss
+    model_bd = model.bind({'params': state.params})
+    return model_bd, test_loss
 
 # Transformations applied on each image => bring them into a numpy array
 def image_to_numpy(img):
@@ -305,7 +288,7 @@ def numpy_collate(batch):
         return np.array(batch)
 
 class ParticleLeniaDataset(torch.utils.data.Dataset):
-    def __init__(self, root, num_points, num_dims, limit=None):
+    def __init__(self, root, num_points, num_dims, sample=8, limit=None):
         self.exs = []
         for root, dirs, files in os.walk(root, topdown=False):
             if 'params.json' not in files:
@@ -326,26 +309,33 @@ class ParticleLeniaDataset(torch.utils.data.Dataset):
             if limit is not None and len(self.exs) >= limit:
                 break
         self.len = len(self.exs)
+        self.sample = sample
 
     def __len__(self):
         return self.len
 
     def __getitem__(self, idx):
         config_path, data_path = self.exs[idx]
-        return np.load(data_path)
+        data = np.load(data_path)
+        if self.sample:
+            idx = np.linspace(0, data.shape[0]-1, self.sample).astype(int)
+            data = data[idx]
+        return data
 
 
 if __name__ == '__main__':
     # Path to the folder where the datasets are/should be downloaded (e.g. CIFAR10)
     DATASET_PATH = "./lenia_data"
     # Path to the folder where the pretrained models are saved
-    CHECKPOINT_PATH = "./saved_models/particle_lenia_autoencoder"
+    CHECKPOINT_PATH = os.path.join(os.getcwd(), "./saved_models/particle_lenia_autoencoder")
+    os.makedirs(CHECKPOINT_PATH, exist_ok=True)
 
+    seq_len = 8
     num_points = 100
     num_dims = 2
 
     # Loading the training dataset. We need to split it into a training and validation part
-    train_dataset = ParticleLeniaDataset(DATASET_PATH, num_points, num_dims, limit=100)
+    train_dataset = ParticleLeniaDataset(DATASET_PATH, num_points, num_dims, sample=seq_len, limit=100)
     train_set, val_set, test_set = torch.utils.data.random_split(train_dataset, [0.8, 0.1, 0.1], generator=torch.Generator().manual_seed(42))
 
     batch_size = 4
@@ -355,4 +345,4 @@ if __name__ == '__main__':
     test_loader = torch.utils.data.DataLoader(test_set, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=4, collate_fn=numpy_collate)
 
     latent_dim = 32
-    trainer_ld, test_loss_ld = train_autoencoder(num_points, latent_dim)
+    trainer_ld, test_loss_ld = train_autoencoder(CHECKPOINT_PATH, seq_len, num_points, latent_dim, num_dims)

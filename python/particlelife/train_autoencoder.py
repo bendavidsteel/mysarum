@@ -26,8 +26,6 @@ def reg_ot_cost(x: jnp.ndarray, y: jnp.ndarray) -> float:
     ot = linear.solve(geom)
     return ot.reg_ot_cost
 
-
-
 # Example usage
 def create_autoencoder(model_type, **kwargs):
     if model_type == 'nn':
@@ -78,7 +76,11 @@ def create_train_state(module, rng, init_example, num_steps):
         decay_steps=num_steps,
         end_value=1e-5
     )
-    tx = optax.adamw(lr_schedule, momentum)
+    max_grad_norm = 1.0  # adjust this value based on your needs
+    tx = optax.chain(
+        optax.clip_by_global_norm(max_grad_norm),
+        optax.adamw(lr_schedule, momentum)
+    )
     return TrainState.create(
         apply_fn=module.apply, params=params, tx=tx,
         metrics=Metrics.empty())
@@ -272,6 +274,12 @@ class ParticleLeniaDataset(torch.utils.data.Dataset):
                     continue
             if config['num_particles'] != num_points:
                 continue
+            if 'num_dims' not in config:
+                data = np.load(data_path)
+                num_dims = data.shape[-1]
+                config['num_dims'] = num_dims
+                with open(config_path, 'w') as f:
+                    json.dump(config, f)
             if config['num_dims'] != num_dims:
                 continue
             self.exs.append((config_path, data_path))

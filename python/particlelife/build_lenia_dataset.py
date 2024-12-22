@@ -82,6 +82,7 @@ def generate_lenia_data(key, data_dir_path, param_ranges, param_lists, max_steps
             json_params = {k: v.tolist() for k, v in params._asdict().items()}
             run_params = {
                 'num_particles': num_particles.item(),
+                'num_dims': num_dims.item(),
                 'size': size.item(),
                 'dt': dt.item(),
                 'num_species': num_species.item(),
@@ -119,13 +120,13 @@ def main():
     }
     
     param_lists = [
-        ('num_particles', jnp.array([100, 1000])),
+        ('num_particles', jnp.array([100])),
         ('num_species', jnp.array([1, 2, 4, 8])),
         ('num_kernels', jnp.array([1, 2, 4, 8])),
         ('num_growth_funcs', jnp.array([1, 2, 4, 8])),
         ('size', jnp.array([20, 100])),
         ('dt', jnp.array([0.1, 0.01, 0.001])),
-        ('num_dims', jnp.array([3, 2]))
+        ('num_dims', jnp.array([2]))
     ]
     key = jax.random.PRNGKey(8)
     

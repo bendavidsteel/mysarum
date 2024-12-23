@@ -186,7 +186,10 @@ def train_autoencoder(train_loader, val_loader, test_loader, config):
         seq_len=config.params.num_samples,
         num_points=config.params.num_points,
         latent_dim=config.params.latent_dim,
-        num_dims=config.params.num_dims
+        num_dims=config.params.num_dims,
+        encoder_dim=config.params.encoder_dim,
+        encoder_num_layers=config.params.encoder_num_layers,
+        decoder_dim=config.params.decoder_dim,
     )
     # Initialize model
     rng = jax.random.PRNGKey(0)

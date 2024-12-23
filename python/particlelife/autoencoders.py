@@ -167,7 +167,8 @@ class PointTransformerEncoder(nn.Module):
     """
     Point Transformer Encoder for processing point clouds.
     """
-    hidden_dims: Sequence[int]
+    hidden_dim: int = 64
+    num_hidden_layers: int = 3
     num_neighbors: int = 16
     num_dims: int = 3
     
@@ -178,20 +179,20 @@ class PointTransformerEncoder(nn.Module):
         x = points
         
         # Initial feature embedding
-        x = nn.Dense(self.hidden_dims[0])(x)
+        x = nn.Dense(self.hidden_dim)(x)
         
         # Stack transformer layers
-        for dim in self.hidden_dims:
+        for _ in range(self.num_hidden_layers):
             x = PointTransformerLayer(
                 num_neighbors=self.num_neighbors,
-                hidden_dim=dim
+                hidden_dim=self.hidden_dim
             )(x, pos)
             x = nn.LayerNorm()(x)
         
         # Global pooling
         x = jnp.max(x, axis=-2)
 
-        x = EncoderTransformerLayer(hidden_dim=self.hidden_dims[-1])(x)
+        x = EncoderTransformerLayer(hidden_dim=self.hidden_dim)(x)
         x = nn.LayerNorm()(x)
 
         x = jnp.max(x, axis=-2)
@@ -205,19 +206,19 @@ class PointTransformerDecoder(nn.Module):
     num_points: int
     seq_len: int
     num_dims: int = 3
-    hidden_dims: Sequence[int] = (512, 256, 128, 64)
+    hidden_dim: int = 64
     
     @nn.compact
     def __call__(self, x):
         # Initial expansion to sequence dimension
-        x = nn.Dense(self.hidden_dims[-1])(x)
+        x = nn.Dense(self.hidden_dim)(x)
         x = nn.gelu(x)
         x = x[:, jnp.newaxis, :]  # (batch, 1, hidden_dim)
         
         # Create positional encodings for maximum sequence length
         position = jnp.arange(self.seq_len + 1)[:, None]  # +1 because we include initial token
-        div_term = jnp.exp(jnp.arange(0, self.hidden_dims[-1], 2) * (-jnp.log(10000.0) / self.hidden_dims[-1]))
-        pos_enc = jnp.zeros((self.seq_len + 1, self.hidden_dims[-1]))
+        div_term = jnp.exp(jnp.arange(0, self.hidden_dim, 2) * (-jnp.log(10000.0) / self.hidden_dim))
+        pos_enc = jnp.zeros((self.seq_len + 1, self.hidden_dim))
         pos_enc = pos_enc.at[:, 0::2].set(jnp.sin(position * div_term))
         pos_enc = pos_enc.at[:, 1::2].set(jnp.cos(position * div_term))
         pos_enc = jnp.array(pos_enc)[None, :, :]  # (1, seq_len+1, hidden_dim)
@@ -227,17 +228,17 @@ class PointTransformerDecoder(nn.Module):
             x_pos = x + pos_enc[:, :x.shape[1]]
             
             # Query from last position with positional encoding
-            q = nn.Dense(self.hidden_dims[-1])(x_pos[:, -1:, :])
+            q = nn.Dense(self.hidden_dim)(x_pos[:, -1:, :])
             # Keys and values include positional encoding
-            k = nn.Dense(self.hidden_dims[-1])(x_pos)
-            v = nn.Dense(self.hidden_dims[-1])(x_pos)
+            k = nn.Dense(self.hidden_dim)(x_pos)
+            v = nn.Dense(self.hidden_dim)(x_pos)
             
             attn_weights = jnp.einsum('bth,bsh->bts', q, k)
-            attn_weights = nn.softmax(attn_weights / jnp.sqrt(self.hidden_dims[-1]))
+            attn_weights = nn.softmax(attn_weights / jnp.sqrt(self.hidden_dim))
             out = jnp.einsum('bts,bsh->bth', attn_weights, v)
             
             out = nn.gelu(out)
-            out = nn.Dense(self.hidden_dims[-1])(out)
+            out = nn.Dense(self.hidden_dim)(out)
             
             out = x[:,:1,:] + out
             x = jnp.concatenate([x, out], axis=1)
@@ -250,7 +251,7 @@ class PointTransformerDecoder(nn.Module):
         coarse_points = jnp.reshape(coarse_points, (-1, self.seq_len, self.num_points // 4, self.num_dims))
 
         # Generate features for refinement
-        features = nn.Dense(128)(coarse_points)
+        features = nn.Dense(self.hidden_dim)(coarse_points)
         features = nn.LayerNorm()(features)
         features = nn.gelu(features)
 
@@ -272,19 +273,21 @@ class PointTransformerAutoencoder(nn.Module):
     num_points: int
     seq_len: int
     num_dims: int
-    encoder_dims: Sequence[int] = (64, 64)
-    decoder_dims: Sequence[int] = (64, 64)
+    encoder_dim: int = 64
+    encoder_num_layers: int = 3
+    decoder_dim: int = 64
     latent_dim: int = 32
     num_neighbors: int = 16
     
     def setup(self):
         self.encoder = PointTransformerEncoder(
-            hidden_dims=self.encoder_dims,
+            hidden_dim=self.encoder_dim,
+            num_hidden_layers=self.encoder_num_layers,
             num_neighbors=self.num_neighbors
         )
         self.latent_proj = nn.Dense(self.latent_dim)
         self.decoder = PointTransformerDecoder(
-            hidden_dims=self.decoder_dims,
+            hidden_dim=self.decoder_dim,
             num_points=self.num_points,
             num_dims=self.num_dims,
             seq_len=self.seq_len

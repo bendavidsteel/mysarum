@@ -343,6 +343,10 @@ def main(config):
         limit=None,
         transform=transform
     )
+
+    # log dataset size
+    wandb.config.update({"dataset_size": len(train_dataset)})
+
     train_set, val_set, test_set = torch.utils.data.random_split(train_dataset, [0.8, 0.1, 0.1], generator=torch.Generator().manual_seed(42))
 
     num_workers = 1

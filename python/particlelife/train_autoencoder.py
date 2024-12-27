@@ -1,3 +1,5 @@
+import concurrent.futures
+import itertools
 import json
 import os
 
@@ -23,7 +25,11 @@ from autoencoders import PointCloudNNAutoencoder, PointTransformerAutoencoder
 @jax.jit
 def reg_ot_cost(x: jnp.ndarray, y: jnp.ndarray) -> float:
     geom = pointcloud.PointCloud(x, y)
-    ot = linear.solve(geom)
+    ot = linear.solve(
+        geom
+    )
+    # geom = pointcloud.PointCloud(x, y)
+    # ot = linear.solve(geom)
     return ot.reg_ot_cost
 
 # Example usage
@@ -36,25 +42,6 @@ def create_autoencoder(model_type, **kwargs):
         raise ValueError(f"Unknown model type: {model_type}")
     
     return model
-
-class GenerateCallback:
-
-    def __init__(self, input_imgs, every_n_epochs=1):
-        super().__init__()
-        self.input_imgs = input_imgs  # Images to reconstruct during training
-        self.every_n_epochs = every_n_epochs  # Only save those images every N epochs (otherwise tensorboard gets quite large)
-
-    def log_generations(self, model, state, logger, epoch):
-        if epoch % self.every_n_epochs == 0:
-            pass
-            # reconst_imgs = model.apply({'params': state.params}, self.input_imgs)
-            # reconst_imgs = jax.device_get(reconst_imgs)
-
-            # # Plot and add to tensorboard
-            # imgs = np.stack([self.input_imgs, reconst_imgs], axis=1).reshape(-1, *self.input_imgs.shape[1:])
-            # imgs = jax_to_torch(imgs)
-            # grid = torchvision.utils.make_grid(imgs, nrow=2, normalize=True, value_range=(-1,1))
-            # logger.add_image("Reconstructions", grid, global_step=epoch)
 
 
 @flax.struct.dataclass
@@ -72,7 +59,7 @@ def create_train_state(module, rng, init_example, num_steps):
     lr_schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=1e-3,
-        warmup_steps=100,
+        warmup_steps=int(0.05 * num_steps),
         decay_steps=num_steps,
         end_value=1e-5
     )
@@ -94,7 +81,10 @@ def train_step(state, batch):
         return jnp.mean(loss)
 
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
-    state = state.apply_gradients(grads=grads)
+    # Apply gradients if loss is not NaN
+    def apply_gradients(state):
+        return state.apply_gradients(grads=grads)
+    state = jax.lax.cond(jnp.isnan(loss), lambda s: s, apply_gradients, state)
     return state, loss
 
 # Eval function
@@ -107,23 +97,6 @@ def eval_step(state, batch):
     metrics = state.metrics.merge(metric_updates)
     state = state.replace(metrics=metrics)
     return state, loss
-
-# class TrainerModule:
-#     def __init__(self, num_points, latent_dim, lr=1e-3, seed=42):
-#         super().__init__()
-#         self.num_points = num_points
-#         self.latent_dim = latent_dim
-#         self.lr = lr
-#         self.seed = seed
-#         # Prepare logging
-#         self.exmp_imgs = next(iter(val_loader))[0][:8]
-#         self.log_dir = os.path.join(CHECKPOINT_PATH, f'cifar10_{self.latent_dim}')
-#         self.generate_callback = GenerateCallback(self.exmp_imgs, every_n_epochs=50)
-#         self.logger = SummaryWriter(log_dir=self.log_dir)
-#         # Initialize model
-#         self.init_model()
-
-
 
 def train_model(state, train_loader, val_loader, checkpoint_manager, save_args, num_epochs=500, eval_every=1):
     # Train model for defined number of epochs
@@ -149,7 +122,7 @@ def train_epoch(state, train_loader, epoch):
     losses = []
     pbar = tqdm.tqdm(train_loader)
     pbar.set_description(f"Epoch {epoch}, loss: {0.0}")
-    for batch in pbar:
+    for idx, batch in enumerate(pbar):
         state, loss = train_step(state, batch)
         wandb.log({"train_loss": loss})
         pbar.set_description(f"Epoch {epoch}, loss: {loss:.4f}")
@@ -241,56 +214,103 @@ def numpy_collate(batch):
     else:
         return np.array(batch)
     
-def train_collate(batch):
-    batch = numpy_collate(batch)
-    # TODO randomly rotate the point cloud
-    # Random rotation
-    theta = np.random.uniform(0, 2 * np.pi, size=batch.shape[0])
-    rotation_matrix = np.array([
-        [np.cos(theta), -np.sin(theta)],
-        [np.sin(theta), np.cos(theta)]
-    ]).transpose(2, 0, 1)
-    batch = batch @ rotation_matrix[:, np.newaxis, :, :]
+class DataCollator:
+    def __init__(self, sample, period):
+        self.sample = sample
+        self.period = period
 
-    # TODO data augment by changing the sampled seq points
-    return batch
+    def test_collate(self, batch):
+        batch = numpy_collate(batch)
+        idx = np.arange(0, self.sample * self.period, self.period)
+        return batch[:, idx, :]
+        
+    def train_collate(self, batch):
+        batch = numpy_collate(batch)
+        # TODO randomly rotate the point cloud
+        # Random rotation
+        theta = np.random.uniform(0, 2 * np.pi, size=batch.shape[0])
+        rotation_matrix = np.array([
+            [np.cos(theta), -np.sin(theta)],
+            [np.sin(theta), np.cos(theta)]
+        ]).transpose(2, 0, 1)
+        batch = batch @ rotation_matrix[:, np.newaxis, :, :]
+
+        # TODO data augment by changing the sampled seq points
+        max_phase = batch.shape[1] - (self.sample * self.period)
+        start = np.random.randint(0, max_phase, size=batch.shape[0])
+        idx = np.stack([np.arange(s, s + self.sample * self.period, self.period) for s in start])
+        return np.take_along_axis(batch, idx[:,:,np.newaxis, np.newaxis], 1)
+
+
 
 
 class ParticleLeniaDataset(torch.utils.data.Dataset):
-    def __init__(self, root, num_points, num_dims, sample=8, limit=None, transform=None):
+    def __init__(self, root, num_points, num_dims, tail=40, limit=None, transform=None):
+        self.num_points = num_points
+        self.num_dims = num_dims
+
+        processed = 0
         self.exs = []
-        if limit is not None:
-            total = limit
-        else:
-            total = len(list(os.listdir(root)))
-        pbar = tqdm.tqdm(total=total, desc="Loading dataset")
-        for root, dirs, files in os.walk(root, topdown=False):
-            pbar.update(1)
-            if 'params.json' not in files:
-                continue
-            config_path = os.path.join(root, 'params.json')
-            data_path = os.path.join(root, 'points_history.npy')
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {}
+            pbar = tqdm.tqdm(desc="Loading dataset")
+            
+            for root_tuple in os.walk(root, topdown=False):
+                if limit and processed >= limit:
+                    break
+                    
+                future = executor.submit(self.process_directory, root_tuple)
+                futures[future] = root_tuple
+                processed += 1
+                
+                # Process completed tasks
+                for future in list(concurrent.futures.as_completed(futures)):
+                    result = future.result()
+                    if result is not None:
+                        self.exs.append(result)
+                    futures.pop(future)
+                    pbar.update(1)
+            
+            # Process remaining tasks
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    self.exs.append(result)
+                pbar.update(1)
+        
+        self.len = len(self.exs)
+        self.tail = tail
+        self.transform = transform
+
+    def process_directory(self, root_dir_tuple):
+        root, _, files = root_dir_tuple
+        if 'params.json' not in files:
+            return None
+            
+        config_path = os.path.join(root, 'params.json')
+        data_path = os.path.join(root, 'points_history.npy')
+        
+        try:
             with open(config_path, 'r') as f:
-                try:
-                    config = json.load(f)
-                except json.JSONDecodeError:
-                    continue
-            if config['num_particles'] != num_points:
-                continue
+                config = json.load(f)
+                
+            if config['num_particles'] != self.num_points:
+                return None
+                
             if 'num_dims' not in config:
                 data = np.load(data_path)
-                num_dims = data.shape[-1]
-                config['num_dims'] = num_dims
+                config['num_dims'] = data.shape[-1]
                 with open(config_path, 'w') as f:
                     json.dump(config, f)
-            if config['num_dims'] != num_dims:
-                continue
-            self.exs.append((config_path, data_path))
-            if limit is not None and len(self.exs) >= limit:
-                break
-        self.len = len(self.exs)
-        self.sample = sample
-        self.transform = transform
+                    
+            if config['num_dims'] != self.num_dims:
+                return None
+                
+            return (config_path, data_path)
+            
+        except (json.JSONDecodeError, FileNotFoundError):
+            return None
 
     def __len__(self):
         return self.len
@@ -298,9 +318,7 @@ class ParticleLeniaDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         config_path, data_path = self.exs[idx]
         data = np.load(data_path)
-        if self.sample:
-            idx = np.linspace(0, data.shape[0]-1, self.sample).astype(int)
-            data = data[idx]
+        data = data[-self.tail:, :, :]
         if self.transform:
             data = self.transform(data)
         # TODO label as rotated point cloud
@@ -330,6 +348,10 @@ def main(config):
         config=dict(config)
     )
 
+    # set random seed
+    seed = 42
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     transform = transforms.Compose([
         transforms.Lambda(normalize),  # Center
     ])
@@ -339,7 +361,7 @@ def main(config):
         dataset_path, 
         config.params.num_points, 
         config.params.num_dims, 
-        sample=config.params.num_samples, 
+        tail=(config.params.num_samples + 1) * config.params.period,
         limit=None,
         transform=transform
     )
@@ -349,7 +371,9 @@ def main(config):
 
     train_set, val_set, test_set = torch.utils.data.random_split(train_dataset, [0.8, 0.1, 0.1], generator=torch.Generator().manual_seed(42))
 
-    num_workers = 1
+    collator = DataCollator(config.params.num_samples, config.params.period)
+
+    num_workers = 4
     # We define a set of data loaders that we can use for various purposes later.
     train_loader = torch.utils.data.DataLoader(
         train_set, 
@@ -358,7 +382,7 @@ def main(config):
         drop_last=False, 
         pin_memory=True, 
         num_workers=num_workers, 
-        collate_fn=train_collate, 
+        collate_fn=collator.train_collate, 
         persistent_workers=True
     )
     val_loader = torch.utils.data.DataLoader(
@@ -367,7 +391,7 @@ def main(config):
         shuffle=False, 
         drop_last=False, 
         num_workers=num_workers, 
-        collate_fn=numpy_collate
+        collate_fn=collator.test_collate
     )
     test_loader = torch.utils.data.DataLoader(
         test_set, 
@@ -375,9 +399,10 @@ def main(config):
         shuffle=False, 
         drop_last=False, 
         num_workers=num_workers, 
-        collate_fn=numpy_collate
+        collate_fn=collator.test_collate
     )
 
+    # jax.config.update("jax_debug_nans", True)
     trainer_ld, test_loss_ld = train_autoencoder(train_loader, val_loader, test_loader, config)
     # wandb.finish()
 

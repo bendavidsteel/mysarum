@@ -13,11 +13,10 @@ def peak_f(x, mu, sigma):
     """Compute the Gaussian peak function."""
     return jp.exp(-((x - mu) / sigma) ** 2)
 
-def fields_f(p: Params, points, species, x, s):
+def fields_f(p: Params, species, s, r):
     """Calculate the fields U, G, R, and E based on parameters and points.
     x: shape (2,) array of coordinates
     points: shape (N, 2) array of particle positions"""
-    r = jp.sqrt(jp.square(x - points).sum(-1).clip(1e-10)) # shape (num_points,)
     mu_k = p.mu_k[s, species] # shape (num_points, num_kernels)
     sigma_k = p.sigma_k[s, species] # shape (num_points, num_kernels)
     u = jax.vmap(peak_f, in_axes=(None, 1, 1))(r, mu_k, sigma_k) # shape (num_kernel, num_points)
@@ -38,10 +37,33 @@ def simple_fields_f(p: Params, points, x):
     R = p.c_rep / 2 * ((1.0 - r).clip(0.0) ** 2).sum()
     return Fields(U, G, R, E=R - G)
 
+def compute_dist_matrix(points):
+    """Compute upper triangle of distance matrix efficiently"""
+    n = points.shape[0]
+    # Get indices for upper triangle (excluding diagonal)
+    i, j = jp.triu_indices(n, k=1)
+    
+    # Compute distances only for upper triangle
+    diff = points[i] - points[j]  # shape (num_pairs, 2)
+    r = jp.sqrt(jp.square(diff).sum(-1).clip(1e-10))  # shape (num_pairs,)
+    
+    # Create full matrix using symmetry
+    dist_matrix = jp.zeros((n, n))
+    dist_matrix = dist_matrix.at[i, j].set(r)
+    dist_matrix = dist_matrix.at[j, i].set(r)  # mirror across diagonal
+    
+    return dist_matrix
+
+def all_fields_f(params, points, species):
+    """Compute the fields U, G, R, and E for all points."""
+    dist_matrix = compute_dist_matrix(points)
+    return jax.vmap(functools.partial(fields_f, params, species))(species, dist_matrix)
+
 def motion_f(params, points, species):
     """Compute the motion vector field as the negative gradient of the energy."""
-    grad_E = jax.grad(lambda x, s: fields_f(params, points, species, x, s).E)
-    return -jax.vmap(grad_E)(points, species)
+
+    grad_E = jax.grad(lambda p, s: all_fields_f(params, p, s).E)
+    return -grad_E(points, species)
 
 def step_f(params, points, species, dt):
     """Perform a single Euler integration step."""

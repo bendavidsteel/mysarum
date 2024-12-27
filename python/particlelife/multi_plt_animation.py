@@ -226,7 +226,7 @@ def main():
     ani = FuncAnimation(fig, update, interval=2, blit=True)
 
     # Show the plot with sliders
-    plt.show()
+    ani.save('animation.mp4', writer='ffmpeg')
 
 if __name__ == "__main__":
     main()

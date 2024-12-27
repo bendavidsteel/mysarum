@@ -302,3 +302,6 @@ class PointTransformerAutoencoder(nn.Module):
         reconstructed = self.decoder(latent)
         
         return reconstructed
+    
+    def embed(self, points):
+        return self.latent_proj(self.encoder(points))

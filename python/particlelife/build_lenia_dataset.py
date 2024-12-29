@@ -171,21 +171,21 @@ def generate_lenia_data(key, data_dir_path, param_ranges, param_lists, max_steps
 def main():
     # Define parameter ranges for grid search
     param_ranges = {
-        'mu_k': jnp.array([-10.0, 10.0]),
-        'sigma_k': jnp.array([-10.0, 10.0]),
+        'mu_k': jnp.array([0.1, 10.0]),
+        'sigma_k': jnp.array([0.1, 10.0]),
         'w_k': jnp.array([-0.1, 0.1]),
         'mu_g': jnp.array([-1.0, 1.0]),
-        'sigma_g': jnp.array([-1.0, 1.0]),
-        'c_rep': jnp.array([-10.0, 10.0])
+        'sigma_g': jnp.array([0.01, 1.0]),
+        'c_rep': jnp.array([0.1, 10.0])
     }
     
     param_lists = [
-        ('num_particles', jnp.array([100])),
+        ('num_particles', jnp.array([200])),
         ('num_species', jnp.array([1, 2, 4, 8])),
         ('num_kernels', jnp.array([1, 2, 4, 8])),
         ('num_growth_funcs', jnp.array([1, 2, 4, 8])),
         ('size', jnp.array([20, 100])),
-        ('dt', jnp.array([0.1, 0.01, 0.001])),
+        ('dt', jnp.array([0.1])),
         ('num_dims', jnp.array([2]))
     ]
     key = jax.random.PRNGKey(8)

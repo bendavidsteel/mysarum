@@ -37,6 +37,23 @@ def fields_f(p: Params, points, species, x, s):
     mu_k = p.mu_k[s, species] # shape (num_points, num_kernels)
     sigma_k = p.sigma_k[s, species] # shape (num_points, num_kernels)
     u = jax.vmap(peak_f, in_axes=(None, 1, 1))(r, mu_k, sigma_k) # shape (num_kernel, num_points)
+    w_k = p.w_k[s, species] # shape (num_kernel,)
+    U = (u * einops.rearrange(w_k, "s -> s 1")).sum() # shape ()
+    mu_g = p.mu_g[s]
+    sigma_g = p.sigma_g[s]
+    G = jax.vmap(peak_f, in_axes=(None, 0, 0))(U, mu_g, sigma_g).sum()
+    c_rep = p.c_rep[s, species]
+    R = (c_rep / 2 * (1.0 - r).clip(0.0) ** 2).sum()
+    return Fields(U, G, R, E=R - G)
+
+def soft_fields_f(p: Params, points, species, x, s):
+    """Calculate the fields U, G, R, and E based on parameters and points.
+    x: shape (2,) array of coordinates
+    points: shape (N, 2) array of particle positions"""
+    r = jp.sqrt(jp.square(x - points).sum(-1).clip(1e-10))  # shape (num_pairs,)
+    mu_k = p.mu_k[s, species] # shape (num_points, num_kernels)
+    sigma_k = p.sigma_k[s, species] # shape (num_points, num_kernels)
+    u = jax.vmap(peak_f, in_axes=(None, 1, 1))(r, mu_k, sigma_k) # shape (num_kernel, num_points)
     w_k = p.w_k[s] # shape (num_kernel,)
     U = (u * einops.rearrange(w_k, "s -> s 1")).sum() # shape ()
     mu_g = p.mu_g[s]
@@ -141,10 +158,10 @@ def direct_grad_U_f(params, points, species):
 
 def direct_motion_f(params, points, species):
     """Compute motion vector field using analytical gradients"""
-    diff = points[:, None] - points  # shape (N, N, 2)
+    diff = points[:, None] - points  # shape (N, N, D)
     r2 = jp.square(diff).sum(-1)  # shape (N, N)
     r = jp.sqrt(r2.clip(1e-10))  # shape (N, N)
-    r_unit = diff / r[..., None]  # shape (N, N, 2)
+    r_unit = diff / r[..., None]  # shape (N, N, D)
     
     # Compute U first
     mu_k = params.mu_k[species[:, None], species]  # shape (N, N, K)
@@ -178,10 +195,11 @@ def direct_motion_f(params, points, species):
     
     # Gradient of U wrt r (unchanged)
     dU_dr = w_k[:, None, :] * -2 * (r_expanded - mu_k) / jp.square(sigma_k) * u_kernel # shape (N, N, K)
-    grad_U = (dU_dr * r_unit).sum((-2))  # shape (N, 2)
+    grad_U = (dU_dr[..., None] * r_unit[..., None, :]).sum((-3, -2))  # shape (N, D)
+    # grad_U = (dU_dr * r_unit).sum((-2))  # shape (N, 2)
     
     # Now dG_dU is shape (N,), so expand for multiplication with grad_U
-    grad_G = dG_dU[:, None] * grad_U  # shape (N, 2)
+    grad_G = dG_dU[:, None] * grad_U  # shape (N, D)
     
     return grad_R - grad_G
 
@@ -221,11 +239,24 @@ def motion_f(params, points, species):
     grad_E = jax.grad(lambda p, s: fields_f(params, points, species, p, s).E)
     return -jax.vmap(grad_E)(points, species)
 
+def soft_motion_f(params, points, species):
+    """Compute the motion vector field as the negative gradient of the energy."""
+
+    grad_E = jax.grad(lambda p, s: soft_fields_f(params, points, species, p, s).E)
+    return -jax.vmap(grad_E)(points, species)
+
 def step_f(params, points, species, dt):
     """Perform a single Euler integration step."""
     # max_f = 20
     # return points + dt * jp.clip(motion_f(params, points, species), -max_f, max_f)
-    return points + dt * motion_f(params, points, species)
+    return points + dt * direct_motion_f(params, points, species)
+
+def soft_step_f(params, points, species, dt):
+    """Perform a single Euler integration step."""
+    # max_f = 20
+    # return points + dt * jp.clip(motion_f(params, points, species), -max_f, max_f)
+    return points + dt * soft_motion_f(params, points, species)
+
 
 def simple_motion_f(params, points):
     """Compute the motion vector field as the negative gradient of the energy."""
@@ -243,3 +274,94 @@ def point_fields_f(params, points, species):
 
 def total_energy_f(params, points, species):
     return point_fields_f(params, points, species).E.sum()
+
+
+
+def draw_multi_species_particles(trajectory, species=None, num_species=None):
+    # Create a color map for different species
+    
+    # Generate distinct colors for each species
+    angles = jp.linspace(0, 2 * jp.pi, num_species, endpoint=False)
+    colors = jp.stack([
+        jp.sin(angles) * 0.5 + 0.5,
+        jp.sin(angles + 2 * jp.pi / 3) * 0.5 + 0.5,
+        jp.sin(angles + 4 * jp.pi / 3) * 0.5 + 0.5
+    ], axis=1)
+
+    # Pre-compute particle colors based on species
+    particle_colors = colors[species]
+    _draw_particles(trajectory, particle_colors)
+
+def draw_particles(trajectory, start=-16000, offset=2000):
+    particle_colors = jp.zeros((trajectory.shape[1], 3))
+    return _draw_particles(trajectory, particle_colors, start=start, offset=offset)
+
+def _draw_particles(trajectory, particle_colors, start=-16000, offset=2000):
+    """
+    Create an animation of particle trajectories using JAX and imageio.
+    Optimized to minimize loops and leverage JAX's parallel processing.
+    
+    Args:
+        trajectory: JAX array of shape (num_frames, num_particles, num_dims)
+                   containing particle positions at each time step
+    """
+    
+    # Subsample frames - keep 1 in 20
+    subsampled_trajectory = trajectory[start::offset]
+    num_frames = subsampled_trajectory.shape[0]
+    num_particles = subsampled_trajectory.shape[1]
+    
+    # Define image dimensions and particle rendering parameters
+    img_size = 800
+    particle_radius = 3
+    
+    # Get global map_size
+    map_size = 60
+    
+    # Alternative approach: use a splatting technique
+    @jax.jit
+    def render_frame(positions):
+        """
+        Render particles using a splatting technique.
+        
+        This creates an alpha mask for each particle and composites them onto the image.
+        """
+        # Scale positions to image coordinates
+        scaled_pos = (positions / map_size) * img_size
+        scaled_pos = jp.clip(scaled_pos, 0, img_size - 1)
+        
+        # Start with a white background
+        image = jp.ones((img_size, img_size, 3))
+        
+        # Create a grid of coordinates
+        x_indices = jp.arange(img_size)
+        y_indices = jp.arange(img_size)
+        X, Y = jp.meshgrid(x_indices, y_indices)
+        coords = jp.stack([X, Y], axis=-1)  # Shape: (img_size, img_size, 2)
+        
+        # For each particle, compute influence on each pixel
+        def process_particle(image, particle_idx):
+            pos = scaled_pos[particle_idx]
+            color = particle_colors[particle_idx]
+            
+            # Calculate distance from each pixel to the particle
+            dist_squared = jp.sum((coords - pos)**2, axis=-1)
+            
+            # Create a mask for pixels affected by this particle
+            mask = dist_squared <= (particle_radius**2)
+            mask = mask[:, :, jp.newaxis]  # Add channel dimension
+            
+            # Update image: where mask is True, use particle color
+            return jp.where(mask, color, image)
+        
+        # Scan through all particles
+        image, _ = jax.lax.scan(
+            lambda img, idx: (process_particle(img, idx), None),
+            image,
+            jp.arange(num_particles)
+        )
+        
+        return (image * 255).astype(jp.uint8)
+    
+    frames = jax.vmap(render_frame)(subsampled_trajectory)
+    return frames

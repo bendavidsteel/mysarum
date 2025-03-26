@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jp
 
 # Define namedtuples for parameters and fields
-Params = collections.namedtuple('Params', 'mu_k sigma_k w_k mu_g sigma_g c_rep')
+Params = collections.namedtuple('Params', 'mu_k sigma_k w_k mu_g sigma_g c_rep map_size')
 Fields = collections.namedtuple('Fields', 'U G R E')
 
 def peak_f(x, mu, sigma):
@@ -159,6 +159,8 @@ def direct_grad_U_f(params, points, species):
 def direct_motion_f(params, points, species):
     """Compute motion vector field using analytical gradients"""
     diff = points[:, None] - points  # shape (N, N, D)
+    map_size = params.map_size
+    diff -= jp.round(diff / map_size) * map_size # periodic boundary
     r2 = jp.square(diff).sum(-1)  # shape (N, N)
     r = jp.sqrt(r2.clip(1e-10))  # shape (N, N)
     r_unit = diff / r[..., None]  # shape (N, N, D)
@@ -166,11 +168,11 @@ def direct_motion_f(params, points, species):
     # Compute U first
     mu_k = params.mu_k[species[:, None], species]  # shape (N, N, K)
     sigma_k = params.sigma_k[species[:, None], species]  # shape (N, N, K)
-    w_k = params.w_k[species]  # shape (N, K)
+    w_k = params.w_k[species[:, None], species]  # shape (N, N, K)
     
     r_expanded = r[..., None]  # shape (N, N, 1)
     u_kernel = jp.exp(-jp.square((r_expanded - mu_k) / sigma_k))  # shape (N, N, K)
-    U = (u_kernel * w_k[:, None, :]).sum((-1, -2))  # shape (N,)
+    U = (u_kernel * w_k).sum((-1, -2))  # shape (N,)
     
     # Now compute gradients
     # First R gradient
@@ -194,7 +196,7 @@ def direct_motion_f(params, points, species):
     dG_dU = dG_dU.sum((1, 2))  # shape (N,)
     
     # Gradient of U wrt r (unchanged)
-    dU_dr = w_k[:, None, :] * -2 * (r_expanded - mu_k) / jp.square(sigma_k) * u_kernel # shape (N, N, K)
+    dU_dr = w_k * -2 * (r_expanded - mu_k) / jp.square(sigma_k) * u_kernel # shape (N, N, K)
     grad_U = (dU_dr[..., None] * r_unit[..., None, :]).sum((-3, -2))  # shape (N, D)
     # grad_U = (dU_dr * r_unit).sum((-2))  # shape (N, 2)
     
@@ -247,14 +249,12 @@ def soft_motion_f(params, points, species):
 
 def step_f(params, points, species, dt):
     """Perform a single Euler integration step."""
-    # max_f = 20
-    # return points + dt * jp.clip(motion_f(params, points, species), -max_f, max_f)
-    return points + dt * direct_motion_f(params, points, species)
+    points += dt * direct_motion_f(params, points, species)
+    points -= jp.floor(points/params.map_size) * params.map_size  # periodic boundary
+    return points
 
 def soft_step_f(params, points, species, dt):
     """Perform a single Euler integration step."""
-    # max_f = 20
-    # return points + dt * jp.clip(motion_f(params, points, species), -max_f, max_f)
     return points + dt * soft_motion_f(params, points, species)
 
 
@@ -277,7 +277,7 @@ def total_energy_f(params, points, species):
 
 
 
-def draw_multi_species_particles(trajectory, species=None, num_species=None):
+def draw_multi_species_particles(trajectory, map_size, species=None, num_species=None, start=-16000, offset=2000):
     # Create a color map for different species
     
     # Generate distinct colors for each species
@@ -290,13 +290,13 @@ def draw_multi_species_particles(trajectory, species=None, num_species=None):
 
     # Pre-compute particle colors based on species
     particle_colors = colors[species]
-    _draw_particles(trajectory, particle_colors)
+    return _draw_particles(trajectory, map_size, particle_colors, start=start, offset=offset)
 
-def draw_particles(trajectory, start=-16000, offset=2000):
+def draw_particles(trajectory, map_size, start=-16000, offset=2000):
     particle_colors = jp.zeros((trajectory.shape[1], 3))
-    return _draw_particles(trajectory, particle_colors, start=start, offset=offset)
+    return _draw_particles(trajectory, map_size, particle_colors, start=start, offset=offset)
 
-def _draw_particles(trajectory, particle_colors, start=-16000, offset=2000):
+def _draw_particles(trajectory, map_size, particle_colors, start=-16000, offset=2000):
     """
     Create an animation of particle trajectories using JAX and imageio.
     Optimized to minimize loops and leverage JAX's parallel processing.
@@ -314,9 +314,6 @@ def _draw_particles(trajectory, particle_colors, start=-16000, offset=2000):
     # Define image dimensions and particle rendering parameters
     img_size = 800
     particle_radius = 3
-    
-    # Get global map_size
-    map_size = 60
     
     # Alternative approach: use a splatting technique
     @jax.jit
@@ -365,3 +362,19 @@ def _draw_particles(trajectory, particle_colors, start=-16000, offset=2000):
     
     frames = jax.vmap(render_frame)(subsampled_trajectory)
     return frames
+
+@functools.partial(jax.jit, static_argnames=('num_steps', 'dt'))
+def multi_step_scan(params, initial_points, species, dt, num_steps):
+    def scan_step(carry, _):
+        points = carry
+        points = step_f(params, points, species, dt)
+        return points, points
+
+    final_points, trajectory = jax.lax.scan(
+        scan_step,
+        initial_points,
+        xs=None,
+        length=num_steps
+    )
+
+    return final_points, trajectory

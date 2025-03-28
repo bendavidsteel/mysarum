@@ -24,19 +24,19 @@ class Embedder:
         self.model = transformers.AutoModel.from_pretrained("microsoft/xclip-base-patch32")
 
     def get_embeddings(self, videos):
-        inputs = self.vision_processor(videos=videos, return_tensors="pt")
+        inputs = self.processor(videos=videos, return_tensors="pt")
         inputs = inputs.to(self.model.device)
 
         # Use X_CLIP model's config for some fields (if specified) instead of those of vision & text components.
         pixel_values = inputs["pixel_values"]
-        output_attentions = self.vision_model.config.output_attentions
-        output_hidden_states = self.vision_model.config.output_hidden_states
-        return_dict = self.vision_model.config.use_return_dict
+        output_attentions = self.model.config.output_attentions
+        output_hidden_states = self.model.config.output_hidden_states
+        return_dict = self.model.config.use_return_dict
 
         batch_size, num_frames, num_channels, height, width = pixel_values.shape
         pixel_values = pixel_values.reshape(-1, num_channels, height, width)
 
-        vision_outputs = self.vision_model.vision_model(
+        vision_outputs = self.model.vision_model(
             pixel_values=pixel_values,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -45,11 +45,11 @@ class Embedder:
         )
 
         video_embeds = vision_outputs[1]
-        video_embeds = self.vision_model.visual_projection(video_embeds)
+        video_embeds = self.model.visual_projection(video_embeds)
 
         cls_features = video_embeds.view(batch_size, num_frames, -1)
 
-        mit_outputs = self.vision_model.mit(
+        mit_outputs = self.model.mit(
             cls_features,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -58,8 +58,8 @@ class Embedder:
         video_embeds = mit_outputs[1]
 
         img_features = vision_outputs[0][:, 1:, :]
-        img_features = self.vision_model.prompts_visual_layernorm(img_features)
-        img_features = img_features @ self.vision_model.prompts_visual_projection
+        img_features = self.model.prompts_visual_layernorm(img_features)
+        img_features = img_features @ self.model.prompts_visual_projection
         img_features = img_features.view(batch_size, num_frames, -1, video_embeds.shape[-1])
         img_features = img_features.mean(dim=1, keepdim=False)
 

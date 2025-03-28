@@ -18,6 +18,55 @@ import transformers
 
 from particle_lenia import step_f, Params, multi_step_scan, draw_particles, draw_multi_species_particles
 
+class Embedder:
+    def __init__(self):
+        self.processor = transformers.AutoProcessor.from_pretrained("microsoft/xclip-base-patch32")
+        self.model = transformers.AutoModel.from_pretrained("microsoft/xclip-base-patch32")
+
+    def get_embeddings(self, videos):
+        inputs = self.vision_processor(videos=videos, return_tensors="pt")
+        inputs = inputs.to(self.model.device)
+
+        # Use X_CLIP model's config for some fields (if specified) instead of those of vision & text components.
+        pixel_values = inputs["pixel_values"]
+        output_attentions = self.vision_model.config.output_attentions
+        output_hidden_states = self.vision_model.config.output_hidden_states
+        return_dict = self.vision_model.config.use_return_dict
+
+        batch_size, num_frames, num_channels, height, width = pixel_values.shape
+        pixel_values = pixel_values.reshape(-1, num_channels, height, width)
+
+        vision_outputs = self.vision_model.vision_model(
+            pixel_values=pixel_values,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            interpolate_pos_encoding=False,
+            return_dict=return_dict,
+        )
+
+        video_embeds = vision_outputs[1]
+        video_embeds = self.vision_model.visual_projection(video_embeds)
+
+        cls_features = video_embeds.view(batch_size, num_frames, -1)
+
+        mit_outputs = self.vision_model.mit(
+            cls_features,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        video_embeds = mit_outputs[1]
+
+        img_features = vision_outputs[0][:, 1:, :]
+        img_features = self.vision_model.prompts_visual_layernorm(img_features)
+        img_features = img_features @ self.vision_model.prompts_visual_projection
+        img_features = img_features.view(batch_size, num_frames, -1, video_embeds.shape[-1])
+        img_features = img_features.mean(dim=1, keepdim=False)
+
+        video_embeds = video_embeds.cpu().detach().numpy()
+        img_features = img_features.cpu().detach().numpy()
+
+        return video_embeds, img_features
 
 def to_storable(n_t):
     d = n_t._asdict()
@@ -67,11 +116,11 @@ def main():
 
     key = jax.random.PRNGKey(7)
 
-    processor = transformers.AutoProcessor.from_pretrained("microsoft/xclip-base-patch32")
-    model = transformers.AutoModel.from_pretrained("microsoft/xclip-base-patch32")
-
+    embeddr = Embedder()
+    
     batch_params = []
     batch_embeddings = []
+    batch_img_features = []
     embed_path = './data/particle_lenia_embeddings.parquet.zstd'
     embed_backup_path = './data/particle_lenia_embeddings_backup.parquet.zstd'
     if not os.path.exists(embed_path):
@@ -119,20 +168,25 @@ def main():
                 torch_video.append(torch.tensor(np.array(image)))
             torch_videos.append(torch_video)
 
-        inputs = processor(videos=torch_videos, return_tensors="pt")
 
-        video_features = model.get_video_features(**inputs)
+        video_features, img_features = embeddr.get_embeddings(torch_videos)
 
         batch_params.extend(to_storable(all_params))
-        video_features = video_features.detach().numpy()
         batch_embeddings.extend(list(video_features))
+        batch_img_features.extend(list(img_features))
 
         pbar.update(1)
 
         if len(batch_params) == 10:
-            df = pl.concat([df, pl.from_dict({'params': batch_params, 'embedding': batch_embeddings})], how='diagonal_relaxed')
+            df = pl.concat([df, pl.from_dict({
+                'params': batch_params, 
+                'video_embedding': batch_embeddings, 
+                'img_features': batch_img_features,
+                'num_particles': [num_particles] * batch_size
+            })], how='diagonal_relaxed')
             batch_params = []
             batch_embeddings = []
+            batch_img_features = []
 
         df.write_parquet(embed_path)
         if len(df) % 100 == 0:

@@ -183,7 +183,7 @@ def main():
                 'video_embedding': batch_embeddings, 
                 'img_features': batch_img_features,
                 'num_particles': [num_particles] * batch_size
-            })], how='diagonal_relaxed')
+            }, schema_overrides={'img_features': pl.Array(pl.Float32, (49, 512))})], how='diagonal_relaxed')
             batch_params = []
             batch_embeddings = []
             batch_img_features = []

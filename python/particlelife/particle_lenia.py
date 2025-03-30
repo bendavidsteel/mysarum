@@ -363,6 +363,123 @@ def _draw_particles(trajectory, map_size, particle_colors, start=-16000, offset=
     frames = jax.vmap(render_frame)(subsampled_trajectory)
     return frames
 
+@functools.partial(jax.jit, static_argnames=('map_size', 'img_size', 'particle_radius', 'start', 'offset'))
+def draw_particles_3d_views(trajectory, map_size, particle_colors, img_size=800, 
+                            particle_radius=3, start=-16000, offset=2000):
+    """
+    Create three animations of 3D particle trajectories from orthogonal viewing angles.
+    
+    Args:
+        trajectory: JAX array of shape (num_frames, num_particles, 3)
+                   containing 3D particle positions at each time step
+        map_size: Size of the simulation space (assumed cubic)
+        particle_colors: Colors for each particle of shape (num_particles, 3)
+        img_size: Size of the output images (square)
+        particle_radius: Radius of particles in pixels
+        start: Starting frame index
+        offset: Frame sampling interval
+        
+    Returns:
+        Tuple of three video arrays (xy_view, xz_view, yz_view)
+    """
+    # Subsample frames
+    subsampled_trajectory = trajectory[start::offset]
+    num_frames = subsampled_trajectory.shape[0]
+    num_particles = subsampled_trajectory.shape[1]
+    
+    # Create three trajectory sets for different orthogonal projections
+    # XY projection (top view)
+    xy_view_traj = subsampled_trajectory[:, :, :2]  # Take just X and Y coordinates
+    
+    # XZ projection (side view)
+    xz_view_traj = jp.stack([
+        subsampled_trajectory[:, :, 0],  # X coordinate
+        subsampled_trajectory[:, :, 2],  # Z coordinate
+    ], axis=-1)
+    
+    # YZ projection (front view)
+    yz_view_traj = jp.stack([
+        subsampled_trajectory[:, :, 1],  # Y coordinate
+        subsampled_trajectory[:, :, 2],  # Z coordinate
+    ], axis=-1)
+    
+    # Define the rendering function
+    @jax.jit
+    def render_frame(positions):
+        """
+        Render particles using a splatting technique.
+        """
+        # Scale positions to image coordinates
+        scaled_pos = (positions / map_size) * img_size
+        scaled_pos = jp.clip(scaled_pos, 0, img_size - 1)
+        
+        # Start with a white background
+        image = jp.ones((img_size, img_size, 3))
+        
+        # Create a grid of coordinates
+        x_indices = jp.arange(img_size)
+        y_indices = jp.arange(img_size)
+        X, Y = jp.meshgrid(x_indices, y_indices)
+        coords = jp.stack([X, Y], axis=-1)  # Shape: (img_size, img_size, 2)
+        
+        # For each particle, compute influence on each pixel
+        def process_particle(image, particle_idx):
+            pos = scaled_pos[particle_idx]
+            color = particle_colors[particle_idx]
+            
+            # Calculate distance from each pixel to the particle
+            dist_squared = jp.sum((coords - pos)**2, axis=-1)
+            
+            # Create a mask for pixels affected by this particle
+            mask = dist_squared <= (particle_radius**2)
+            mask = mask[:, :, jp.newaxis]  # Add channel dimension
+            
+            # Update image: where mask is True, use particle color
+            return jp.where(mask, color, image)
+        
+        # Scan through all particles
+        image, _ = jax.lax.scan(
+            lambda img, idx: (process_particle(img, idx), None),
+            image,
+            jp.arange(num_particles)
+        )
+        
+        return (image * 255).astype(jp.uint8)
+    
+    # Render all frames for each view using vmap
+    xy_frames = jax.vmap(render_frame)(xy_view_traj)
+    xz_frames = jax.vmap(render_frame)(xz_view_traj)
+    yz_frames = jax.vmap(render_frame)(yz_view_traj)
+    
+    return xy_frames, xz_frames, yz_frames
+
+def draw_multi_species_particles_3d(trajectory, map_size, species=None, num_species=None, 
+                                   start=-16000, offset=2000):
+    """
+    Wrapper to create three orthogonal view animations with colored species for 3D particles.
+    """
+    # Create a color map for different species
+    angles = jp.linspace(0, 2 * jp.pi, num_species, endpoint=False)
+    colors = jp.stack([
+        jp.sin(angles) * 0.5 + 0.5,
+        jp.sin(angles + 2 * jp.pi / 3) * 0.5 + 0.5,
+        jp.sin(angles + 4 * jp.pi / 3) * 0.5 + 0.5
+    ], axis=1)
+    
+    # Pre-compute particle colors based on species
+    particle_colors = colors[species]
+    
+    return draw_particles_3d_views(trajectory, map_size, particle_colors, 
+                                  start=start, offset=offset)
+
+def draw_particles_3d(trajectory, map_size, start=-16000, offset=2000):
+    """
+    Wrapper to create three orthogonal view animations with default particle colors for 3D particles.
+    """
+    particle_colors = jp.zeros((trajectory.shape[1], 3))
+    return draw_particles_3d_views(trajectory, map_size, particle_colors, 
+                                  start=start, offset=offset)
+
 @functools.partial(jax.jit, static_argnames=('num_steps', 'dt'))
 def multi_step_scan(params, initial_points, species, dt, num_steps):
     def scan_step(carry, _):

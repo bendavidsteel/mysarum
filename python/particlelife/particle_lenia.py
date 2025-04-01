@@ -495,3 +495,21 @@ def multi_step_scan(params, initial_points, species, dt, num_steps):
     )
 
     return final_points, trajectory
+
+@functools.partial(jax.jit, static_argnames=('num_steps', 'dt'))
+def multi_step_scan_with_force(params, initial_points, species, dt, num_steps):
+    def scan_step(carry, _):
+        points = carry
+        f = direct_motion_f(params, points, species)
+        points += dt * f
+        points -= jp.floor(points/params.map_size) * params.map_size  # periodic boundary
+        return points, (points, f)
+
+    final_points, (trajectory, force) = jax.lax.scan(
+        scan_step,
+        initial_points,
+        xs=None,
+        length=num_steps
+    )
+
+    return final_points, (trajectory, force)

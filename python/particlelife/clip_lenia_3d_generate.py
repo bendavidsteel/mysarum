@@ -16,7 +16,7 @@ import torch
 from tqdm import tqdm
 import transformers
 
-from particle_lenia import step_f, Params, multi_step_scan, draw_particles, draw_multi_species_particles_3d
+from particle_lenia import step_f, Params, multi_step_scan_with_force, draw_particles, draw_multi_species_particles_3d
 
 class Embedder:
     def __init__(self):
@@ -64,12 +64,12 @@ def generate_lenia_video(key, num_particles, map_size, num_species, num_kernels,
     x = jax.random.uniform(subkeys[0], [num_particles, num_dims], minval=0, maxval=map_size)
     species = jax.random.randint(subkeys[1], [num_particles], 0, num_species)
 
-    carry, trajectory = multi_step_scan(params, x, species, dt, 20000)
-
+    carry, (trajectory, force) = multi_step_scan_with_force(params, x, species, dt, 20000)
+    max_force = jp.max(jp.linalg.norm(force, axis=-1))
     # draw trajectory
 
     videos = draw_multi_species_particles_3d(trajectory, map_size, species, num_species, start=-3000, offset=1000)
-    return params, videos
+    return params, videos, max_force
 
 def main():
     write_video = False
@@ -79,6 +79,7 @@ def main():
     embeddr = Embedder()
     
     batch_params = []
+    batch_max_force = []
     batch_img_features = []
     embed_path = './data/particle_lenia_3d_clip_embeddings.parquet.zstd'
     embed_backup_path = './data/particle_lenia_3d_clip_embeddings_backup.parquet.zstd'
@@ -91,7 +92,7 @@ def main():
             df = pl.read_parquet(embed_backup_path)
     pbar = tqdm()
 
-    batch_size = 8
+    batch_size = 4
 
     while True:
         key, *subkeys = jax.random.split(key, 6)
@@ -101,7 +102,7 @@ def main():
         num_particles = int(jax.random.choice(subkeys[3], jp.array([100, 200, 400]), ()))
         map_size = 20
 
-        all_params, videos = jax.vmap(generate_lenia_video, in_axes=(0, None, None, None, None, None))(jax.random.split(key, batch_size), num_particles, map_size, num_species, num_kernels, num_growth_funcs)
+        all_params, videos, max_force = jax.vmap(generate_lenia_video, in_axes=(0, None, None, None, None, None))(jax.random.split(key, batch_size), num_particles, map_size, num_species, num_kernels, num_growth_funcs)
 
         if write_video:
             # Choose which rendering method to use
@@ -130,21 +131,24 @@ def main():
 
         batch_params.extend(to_storable(all_params))
         batch_img_features.extend([img_features[i:i+3*3] for i in range(batch_size)])
+        batch_max_force.extend(max_force.tolist())
 
         pbar.update(1)
 
-        if len(batch_params) == 10:
+        if len(batch_params) == batch_size * 2:
             df = pl.concat([df, pl.from_dict({
                 'params': batch_params, 
-                'img_embedding': batch_img_features,
-                'num_particles': [num_particles] * batch_size
+                'img_features': batch_img_features,
+                'num_particles': [num_particles] * len(batch_params),
+                'max_force': batch_max_force
             }, schema_overrides={'img_features': pl.Array(pl.Float32, (9, 512))})], how='diagonal_relaxed')
             batch_params = []
             batch_img_features = []
+            batch_max_force = []
 
-        if len(df) % 100 == 0:
+        if len(df) % (batch_size * 8) == 0:
             df.write_parquet(embed_path)
-        if len(df) % 1000 == 0:
+        if len(df) % (batch_size * 32) == 0:
             df.write_parquet(embed_backup_path)
 
 if __name__ == '__main__':

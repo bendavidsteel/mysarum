@@ -91,12 +91,12 @@ def main():
         except:
             df = pl.read_parquet(embed_backup_path)
 
-    max_force = 20
-    df = df.filter(pl.col('max_force') < max_force)
+    df_max_force = 20.0
+    df = df.filter(pl.col('max_force') < df_max_force)
 
     pbar = tqdm()
 
-    batch_size = 4
+    batch_size = 2
 
     while True:
         key, *subkeys = jax.random.split(key, 6)
@@ -146,7 +146,7 @@ def main():
                 'num_particles': [num_particles] * len(batch_params),
                 'max_force': batch_max_force
             }, schema_overrides={'img_features': pl.Array(pl.Float32, (9, 512))})
-            new_df = new_df.filter(pl.col('max_force') < max_force)
+            new_df = new_df.filter(pl.col('max_force') < df_max_force)
             if len(df) > 0:
                 df = pl.concat([df, new_df], how='diagonal_relaxed')
                 batch_params = []

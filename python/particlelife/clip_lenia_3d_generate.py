@@ -42,10 +42,10 @@ def generate_lenia_video(key, num_particles, map_size, num_species, num_kernels,
     sigma_k = jax.random.uniform(subkeys[1], (num_species, num_species, num_kernels), minval=0.5, maxval=3.0)
 
     mu_g = jax.random.uniform(subkeys[3], (num_species, num_growth_funcs), minval=-2.0, maxval=2.0)
-    sigma_g = jax.random.uniform(subkeys[4], (num_species, num_growth_funcs), minval=0.05, maxval=1.0)
+    sigma_g = jax.random.uniform(subkeys[4], (num_species, num_growth_funcs), minval=0.1, maxval=1.0)
 
-    w_k = jax.random.uniform(subkeys[6], (num_species, num_species, num_kernels), minval=-0.1, maxval=0.1)
-    c_rep = jax.random.uniform(subkeys[7], (num_species, num_species), minval=0.1, maxval=2.0)
+    w_k = jax.random.uniform(subkeys[6], (num_species, num_species, num_kernels), minval=-0.05, maxval=0.05)
+    c_rep = jax.random.uniform(subkeys[7], (num_species, num_species), minval=0.5, maxval=2.0)
 
     dt = 0.1
     
@@ -90,6 +90,10 @@ def main():
             df = pl.read_parquet(embed_path)
         except:
             df = pl.read_parquet(embed_backup_path)
+
+    max_force = 20
+    df = df.filter(pl.col('max_force') < max_force)
+
     pbar = tqdm()
 
     batch_size = 4
@@ -136,15 +140,18 @@ def main():
         pbar.update(1)
 
         if len(batch_params) == batch_size * 2:
-            df = pl.concat([df, pl.from_dict({
+            new_df = pl.from_dict({
                 'params': batch_params, 
                 'img_features': batch_img_features,
                 'num_particles': [num_particles] * len(batch_params),
                 'max_force': batch_max_force
-            }, schema_overrides={'img_features': pl.Array(pl.Float32, (9, 512))})], how='diagonal_relaxed')
-            batch_params = []
-            batch_img_features = []
-            batch_max_force = []
+            }, schema_overrides={'img_features': pl.Array(pl.Float32, (9, 512))})
+            new_df = new_df.filter(pl.col('max_force') < max_force)
+            if len(df) > 0:
+                df = pl.concat([df, new_df], how='diagonal_relaxed')
+                batch_params = []
+                batch_img_features = []
+                batch_max_force = []
 
         if len(df) % (batch_size * 8) == 0:
             df.write_parquet(embed_path)

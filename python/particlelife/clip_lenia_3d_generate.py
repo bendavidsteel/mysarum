@@ -74,8 +74,6 @@ def generate_lenia_video(key, num_particles, map_size, num_species, num_kernels,
 def main():
     write_video = False
 
-    key = jax.random.PRNGKey(7)
-
     embeddr = Embedder()
     
     batch_params = []
@@ -94,6 +92,8 @@ def main():
     df_max_force = 20.0
     df = df.filter(pl.col('max_force') < df_max_force)
 
+    key = jax.random.PRNGKey(len(df))
+
     pbar = tqdm()
 
     batch_size = 2
@@ -107,6 +107,9 @@ def main():
         map_size = 20
 
         all_params, videos, max_force = jax.vmap(generate_lenia_video, in_axes=(0, None, None, None, None, None))(jax.random.split(key, batch_size), num_particles, map_size, num_species, num_kernels, num_growth_funcs)
+
+        if max_force.min() > df_max_force:
+            continue
 
         if write_video:
             # Choose which rendering method to use

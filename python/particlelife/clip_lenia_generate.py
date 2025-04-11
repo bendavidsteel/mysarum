@@ -109,7 +109,7 @@ def main():
 
         all_params = to_storable(all_params)
         all_params = [all_params[i] for i in range(batch_size) if max_force[i] < df_max_force]
-        videos = tuple(v[max_force < df_max_force] for v in videos)
+        videos = videos[max_force < df_max_force]
         max_force = max_force[max_force < df_max_force]
 
         if len(all_params) == 0:

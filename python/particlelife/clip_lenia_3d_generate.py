@@ -7,9 +7,6 @@ import einops
 import imageio.v2 as iio
 import jax
 import jax.numpy as jp
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-from matplotlib.widgets import Slider, Button
 import numpy as np
 import polars as pl
 import torch
@@ -108,7 +105,12 @@ def main():
 
         all_params, videos, max_force = jax.vmap(generate_lenia_video, in_axes=(0, None, None, None, None, None))(jax.random.split(key, batch_size), num_particles, map_size, num_species, num_kernels, num_growth_funcs)
 
-        if max_force.min() > df_max_force:
+        all_params = to_storable(all_params)
+        all_params = [all_params[i] for i in range(batch_size) if max_force[i] < df_max_force]
+        videos = tuple(v[max_force < df_max_force] for v in videos)
+        max_force = max_force[max_force < df_max_force]
+
+        if len(all_params) == 0:
             continue
 
         if write_video:
@@ -129,20 +131,20 @@ def main():
                 w.close()
 
         np_images = []
-        for i in range(batch_size):
+        for i in range(len(all_params)):
             for pers_i in range(3):
                 for image_i in range(3):
                     np_images.append(np.array(videos[pers_i][i, image_i]))
 
         img_features = embeddr.get_embeddings(np_images)
 
-        batch_params.extend(to_storable(all_params))
-        batch_img_features.extend([img_features[i:i+3*3] for i in range(batch_size)])
+        batch_params.extend(all_params)
+        batch_img_features.extend([img_features[i:i+3*3] for i in range(len(all_params))])
         batch_max_force.extend(max_force.tolist())
 
         pbar.update(1)
 
-        if len(batch_params) == batch_size * 2:
+        if len(batch_params) > batch_size * 2:
             new_df = pl.from_dict({
                 'params': batch_params, 
                 'img_features': batch_img_features,

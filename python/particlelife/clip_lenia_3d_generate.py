@@ -69,7 +69,7 @@ def generate_lenia_video(key, num_particles, map_size, num_species, num_kernels,
     return params, videos, max_force
 
 def main():
-    write_video = False
+    write_video = True
 
     embeddr = Embedder()
     
@@ -117,18 +117,20 @@ def main():
             # Choose which rendering method to use
             # Process frames and save to video
             print("Rendering frames...")
-            for video in videos:
-                file_path = './outputs/particle_lenia.mp4'
-                w = iio.get_writer(file_path, format='FFMPEG', mode='I', fps=30)#,
-                                #    codec='h264_vaapi',
-                                #    output_params=['-vaapi_device',
-                                #                   '/dev/dri/renderD128',
-                                #                   '-vf',
-                                #                   'format=gray|nv12,hwupload'],
-                                #    pixelformat='vaapi_vld')
-                for frame in np.array(video):
-                    w.append_data(frame)
-                w.close()
+            for i in range(len(all_params)):
+                for pers_i in range(3):
+                    video = videos[pers_i][i]
+                    file_path = f'./outputs/particle_lenia_pers_{pers_i}.mp4'
+                    w = iio.get_writer(file_path, format='FFMPEG', mode='I', fps=30)#,
+                                    #    codec='h264_vaapi',
+                                    #    output_params=['-vaapi_device',
+                                    #                   '/dev/dri/renderD128',
+                                    #                   '-vf',
+                                    #                   'format=gray|nv12,hwupload'],
+                                    #    pixelformat='vaapi_vld')
+                    for frame in np.array(video):
+                        w.append_data(frame)
+                    w.close()
 
         np_images = []
         for i in range(len(all_params)):
@@ -152,7 +154,7 @@ def main():
                 'max_force': batch_max_force
             }, schema_overrides={'img_features': pl.Array(pl.Float32, (9, 512))})
             new_df = new_df.filter(pl.col('max_force') < df_max_force)
-            if len(df) > 0:
+            if len(new_df) > 0:
                 df = pl.concat([df, new_df], how='diagonal_relaxed')
                 batch_params = []
                 batch_img_features = []

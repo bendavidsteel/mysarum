@@ -14,26 +14,9 @@ from tqdm import tqdm
 import transformers
 
 from particle_lenia import step_f, Params, multi_step_scan_with_force, draw_particles, draw_multi_species_particles_3d
+from clip_lenia_generate import Embedder, to_storable
 
-class Embedder:
-    def __init__(self):
-        self.processor = transformers.AutoProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        self.model = transformers.FlaxCLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-
-    def get_embeddings(self, images):
-        inputs = self.processor(images=images, return_tensors="np")
-        image_features = self.model.get_image_features(**inputs)
-        return image_features
-
-def to_storable(n_t):
-    d = n_t._asdict()
-    d = [{k: np.array(v[i]).tolist() for k, v in d.items()} for i in range(n_t.map_size.shape[0])]
-    return d
-
-@functools.partial(jax.jit, static_argnames=('num_particles', 'map_size', 'num_species', 'num_kernels', 'num_growth_funcs'))
-def generate_lenia_video(key, num_particles, map_size, num_species, num_kernels, num_growth_funcs):
-    # Initial parameters
-    
+def generate_params(key, num_species, num_kernels, num_growth_funcs, map_size):
     key, *subkeys = jax.random.split(key, 12)
     mu_k = jax.random.uniform(subkeys[0], (num_species, num_species, num_kernels), minval=2.0, maxval=5.0)
     sigma_k = jax.random.uniform(subkeys[1], (num_species, num_species, num_kernels), minval=0.5, maxval=3.0)
@@ -44,8 +27,6 @@ def generate_lenia_video(key, num_particles, map_size, num_species, num_kernels,
     w_k = jax.random.uniform(subkeys[6], (num_species, num_species, num_kernels), minval=-0.05, maxval=0.05)
     c_rep = jax.random.uniform(subkeys[7], (num_species, num_species), minval=0.5, maxval=2.0)
 
-    dt = 0.1
-    
     params = Params(
         mu_k=mu_k, 
         sigma_k=sigma_k, 
@@ -55,6 +36,15 @@ def generate_lenia_video(key, num_particles, map_size, num_species, num_kernels,
         c_rep=c_rep,
         map_size=map_size
     )
+    return params
+
+@functools.partial(jax.jit, static_argnames=('num_particles', 'map_size', 'num_species', 'num_kernels', 'num_growth_funcs'))
+def generate_lenia_video(key, num_particles, map_size, num_species, num_kernels, num_growth_funcs):
+    # Initial parameters
+    
+    params = generate_params(key, num_species, num_kernels, num_growth_funcs, map_size)
+
+    dt = 0.1
     
     num_dims = 3
     key, *subkeys = jax.random.split(key, 3)
@@ -69,7 +59,7 @@ def generate_lenia_video(key, num_particles, map_size, num_species, num_kernels,
     return params, videos, max_force
 
 def main():
-    write_video = True
+    write_video = False
 
     embeddr = Embedder()
     
@@ -103,11 +93,14 @@ def main():
         num_particles = int(jax.random.choice(subkeys[3], jp.array([100, 200, 400]), ()))
         map_size = 20
 
-        all_params, videos, max_force = jax.vmap(generate_lenia_video, in_axes=(0, None, None, None, None, None))(jax.random.split(key, batch_size), num_particles, map_size, num_species, num_kernels, num_growth_funcs)
+        key, *subkeys = jax.random.split(key, batch_size + 1)
+        subkeys = jp.stack(subkeys)
+
+        all_params, videos, max_force = jax.vmap(generate_lenia_video, in_axes=(0, None, None, None, None, None))(subkeys, num_particles, map_size, num_species, num_kernels, num_growth_funcs)
 
         all_params = to_storable(all_params)
         all_params = [all_params[i] for i in range(batch_size) if max_force[i] < df_max_force]
-        videos = tuple(v[max_force < df_max_force] for v in videos)
+        videos = videos[max_force < df_max_force]
         max_force = max_force[max_force < df_max_force]
 
         if len(all_params) == 0:
@@ -119,7 +112,7 @@ def main():
             print("Rendering frames...")
             for i in range(len(all_params)):
                 for pers_i in range(3):
-                    video = videos[pers_i][i]
+                    video = videos[i, pers_i]
                     file_path = f'./outputs/particle_lenia_pers_{pers_i}.mp4'
                     w = iio.get_writer(file_path, format='FFMPEG', mode='I', fps=30)#,
                                     #    codec='h264_vaapi',
@@ -136,7 +129,7 @@ def main():
         for i in range(len(all_params)):
             for pers_i in range(3):
                 for image_i in range(3):
-                    np_images.append(np.array(videos[pers_i][i, image_i]))
+                    np_images.append(np.array(videos[i, pers_i, image_i]))
 
         img_features = embeddr.get_embeddings(np_images)
 

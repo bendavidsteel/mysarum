@@ -365,7 +365,7 @@ def _draw_particles(trajectory, map_size, particle_colors, start=-16000, offset=
 
 @functools.partial(jax.jit, static_argnames=('map_size', 'img_size', 'particle_radius', 'start', 'offset'))
 def draw_particles_3d_views(trajectory, map_size, particle_colors, img_size=800, 
-                            particle_radius=3, start=-16000, offset=2000):
+                            particle_radius=5, start=-16000, offset=2000):
     """
     Create three animations of 3D particle trajectories from orthogonal viewing angles.
     
@@ -389,18 +389,20 @@ def draw_particles_3d_views(trajectory, map_size, particle_colors, img_size=800,
     
     # Create three trajectory sets for different orthogonal projections
     # XY projection (top view)
-    xy_view_traj = subsampled_trajectory[:, :, :2]  # Take just X and Y coordinates
+    xy_view_traj = subsampled_trajectory  # Take just X and Y coordinates
     
     # XZ projection (side view)
     xz_view_traj = jp.stack([
         subsampled_trajectory[:, :, 0],  # X coordinate
         subsampled_trajectory[:, :, 2],  # Z coordinate
+        subsampled_trajectory[:, :, 1]
     ], axis=-1)
     
     # YZ projection (front view)
     yz_view_traj = jp.stack([
         subsampled_trajectory[:, :, 1],  # Y coordinate
         subsampled_trajectory[:, :, 2],  # Z coordinate
+        subsampled_trajectory[:, :, 0]
     ], axis=-1)
     
     # Define the rendering function
@@ -410,11 +412,14 @@ def draw_particles_3d_views(trajectory, map_size, particle_colors, img_size=800,
         Render particles using a splatting technique.
         """
         # Scale positions to image coordinates
+        positions, depth = positions[..., :2], positions[..., 2]
+        idx_order = jp.argsort(depth, descending=True)
+        positions, depth = positions[idx_order, :], depth[idx_order]
         scaled_pos = (positions / map_size) * img_size
         scaled_pos = jp.clip(scaled_pos, 0, img_size - 1)
         
         # Start with a white background
-        image = jp.ones((img_size, img_size, 3))
+        image = jp.zeros((img_size, img_size, 3))
         
         # Create a grid of coordinates
         x_indices = jp.arange(img_size)
@@ -425,17 +430,21 @@ def draw_particles_3d_views(trajectory, map_size, particle_colors, img_size=800,
         # For each particle, compute influence on each pixel
         def process_particle(image, particle_idx):
             pos = scaled_pos[particle_idx]
+            this_depth = depth[particle_idx]
             color = particle_colors[particle_idx]
             
             # Calculate distance from each pixel to the particle
             dist_squared = jp.sum((coords - pos)**2, axis=-1)
-            
+            this_particle_radius = particle_radius * (1 - 0.5 * this_depth / map_size)
+
             # Create a mask for pixels affected by this particle
-            mask = dist_squared <= (particle_radius**2)
+            mask = dist_squared <= (this_particle_radius**2)
             mask = mask[:, :, jp.newaxis]  # Add channel dimension
+
+            this_color = (1 - 0.5 * this_depth / map_size) * color + (0.5 * this_depth / map_size) * jp.zeros((3,))
             
             # Update image: where mask is True, use particle color
-            return jp.where(mask, color, image)
+            return jp.where(mask, this_color, image)
         
         # Scan through all particles
         image, _ = jax.lax.scan(
@@ -451,7 +460,7 @@ def draw_particles_3d_views(trajectory, map_size, particle_colors, img_size=800,
     xz_frames = jax.vmap(render_frame)(xz_view_traj)
     yz_frames = jax.vmap(render_frame)(yz_view_traj)
     
-    return xy_frames, xz_frames, yz_frames
+    return jp.stack([xy_frames, xz_frames, yz_frames])
 
 def draw_multi_species_particles_3d(trajectory, map_size, species=None, num_species=None, 
                                    start=-16000, offset=2000):

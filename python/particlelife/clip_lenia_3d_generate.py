@@ -62,6 +62,8 @@ def main():
     write_video = False
 
     embeddr = Embedder()
+
+    df_max_force = 20.0
     
     batch_params = []
     batch_max_force = []
@@ -76,8 +78,7 @@ def main():
         except:
             df = pl.read_parquet(embed_backup_path)
 
-    df_max_force = 20.0
-    df = df.filter(pl.col('max_force') < df_max_force)
+        df = df.filter(pl.col('max_force') < df_max_force)
 
     key = jax.random.PRNGKey(len(df))
 

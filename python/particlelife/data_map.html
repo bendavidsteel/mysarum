@@ -54,10 +54,65 @@
 
   <script type="text/javascript">
 
+const EMBEDDED_PARQUET_DATA = "";
+
 // Global tooltip simulation management
 let tooltipSimulation = null;
 let tooltipCanvas = null;
 let currentTooltipParams = null;
+
+// Global compose variables
+let blueNoiseTexture = null;
+let blueNoiseTextureView = null;
+let composeBindGroupLayout = null;
+let composeBindGroup = null;
+let composePipeline = null;
+
+// Utility function to load images
+async function loadImage(url) {
+    const res = await fetch(url);
+    const blob = await res.blob();
+    return await createImageBitmap(blob, { colorSpaceConversion: 'none' });
+}
+
+// Function to decode base64 parquet data
+async function loadParquetData() {
+
+  // Initialize parquet-wasm
+  await wasm_bindgen();
+  
+  // Decode base64 to Uint8Array
+  const binaryString = atob(EMBEDDED_PARQUET_DATA);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  
+  // Parse parquet file
+  const parquetFile = new wasm_bindgen.ParquetFile(bytes);
+  const table = parquetFile.intoTable();
+  
+  // Convert to JavaScript array
+  const data = [];
+  const numRows = table.numRows();
+  
+  for (let i = 0; i < numRows; i++) {
+    const row = {
+      position: [
+        table.getColumn('longitude').getFloat64(i),
+        table.getColumn('latitude').getFloat64(i)
+      ],
+      speciesCount: table.getColumn('speciesCount').getInt32(i),
+      particleCount: table.getColumn('particleCount').getInt32(i),
+      kernelsCount: table.getColumn('kernelsCount').getInt32(i),
+      growthFuncsCount: table.getColumn('growthFuncsCount').getInt32(i),
+      seed: table.getColumn('seed').getInt32(i)
+    };
+    data.push(row);
+  }
+  
+  return data;
+}
 
 // Shader code from the original simulation
 const particleDescription = 
@@ -517,6 +572,114 @@ fn fragmentPoint(in : CircleVertexOut) -> @location(0) vec4f
 }
 `;
 
+const composeShader =
+`
+@group(0) @binding(0) var hdrTexture : texture_2d<f32>;
+@group(0) @binding(1) var blueNoiseTexture : texture_2d<f32>;
+
+const vertices = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0),
+);
+
+struct VertexOut
+{
+    @builtin(position) position : vec4f,
+    @location(0) texcoord : vec2f,
+}
+
+@vertex
+fn vertexMain(@builtin(vertex_index) id : u32) -> VertexOut
+{
+    let vertex = vertices[id];
+    return VertexOut(
+        vec4f(vertex, 0.0, 1.0),
+        vertex * 0.5 + vec2f(0.5)
+    );
+}
+
+fn acesTonemap(x : vec3f) -> vec3f
+{
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return clamp((x*(a*x+b))/(x*(c*x+d)+e), vec3f(0.0), vec3f(1.0));
+}
+
+fn maxTonemap(x : vec3f) -> vec3f
+{
+    let m = max(1.0, max(x.r, max(x.g, x.b)));
+    return x / m;
+}
+
+fn uncharted2TonemapImpl(x : vec3f) -> vec3f
+{
+    let A = 0.15;
+    let B = 0.50;
+    let C = 0.10;
+    let D = 0.20;
+    let E = 0.02;
+    let F = 0.30;
+
+    return ((x*(A*x+C*B)+D*E)/(x*(A*x+B)+D*F))-E/F;
+}
+
+fn uncharted2Tonemap(x : vec3f) -> vec3f
+{
+    let exposure = 5.0;
+    let white = 10.0;
+    return uncharted2TonemapImpl(x * exposure) / uncharted2TonemapImpl(vec3f(white));
+}
+
+fn agxTonemap(x : vec3f) -> vec3f
+{
+    const M1 = mat3x3f(0.842, 0.0423, 0.0424, 0.0784, 0.878, 0.0784, 0.0792, 0.0792, 0.879);
+    const M2 = mat3x3f(1.2, -0.053, -0.053, -0.1, 1.15, -0.1, -0.1, -0.1, 1.15);
+    const c1 = 12.47393;
+    const c2 = 16.5;
+
+    var result = x * 0.5;
+    result = M1 * result;
+    result = clamp((log2(result) + c1) / c2, vec3f(0.0), vec3f(1.0));
+    result = 0.5 + 0.5 * sin(((-3.11 * result + 6.42) * result - 0.378) * result - 1.44);
+    result = M2 * result;
+
+    return result;
+}
+
+fn dither(x : vec3f, n : f32) -> vec3f
+{
+    let c = x * 255.0;
+    let c0 = floor(c);
+    let c1 = c0 + vec3f(1.0);
+    let dc = c - c0;
+
+    var r = c0;
+    if (dc.r > n) { r.r = c1.r; }
+    if (dc.g > n) { r.g = c1.g; }
+    if (dc.b > n) { r.b = c1.b; }
+
+    return r / 255.0;
+}
+
+@fragment
+fn fragmentMain(in : VertexOut) -> @location(0) vec4f
+{
+    var sample = textureLoad(hdrTexture, vec2i(in.position.xy), 0); 
+    let noise = textureLoad(blueNoiseTexture, vec2u(in.position.xy) % textureDimensions(blueNoiseTexture), 0).r;
+
+    var color = sample.rgb;
+    color = acesTonemap(color);
+    color = pow(color, vec3f(1.0 / 2.2));
+    color = dither(color, noise);
+
+    return vec4f(color, 1.0);
+}
+`;
+
 // Random number generator
 function splitmix32(a) {
     return function() {
@@ -536,10 +699,8 @@ function randomSeed() {
 
 // Complete TooltipLeniaSimulation class
 class TooltipLeniaSimulation {
-  constructor(device, context, canvas) {
+  constructor(device) {
     this.device = device;
-    this.context = context;
-    this.canvas = canvas;
     this.running = false;
     this.animationId = null;
     this.initialized = false;
@@ -547,19 +708,18 @@ class TooltipLeniaSimulation {
     // Simulation parameters
     this.maxForceRadius = 32.0;
     this.speciesCount = 3;
-    this.particleCount = 1024;
+    this.particleCount = 256;
     this.kernelsCount = 1;
     this.growthFuncsCount = 1;
-    this.simulationBox = [[-4, 4], [-4, 4]];
+    this.simulationBox = [[-80, 80], [-80, 80]];
     this.loopingBorders = false;
-    this.gridSize = [Math.ceil(8 / this.maxForceRadius), Math.ceil(8 / this.maxForceRadius)];
+    this.gridSize = [Math.ceil(this.simulationBox[0][1] / this.maxForceRadius), Math.ceil(this.simulationBox[1][1] / this.maxForceRadius)];
     this.binCount = this.gridSize[0] * this.gridSize[1];
     this.prefixSumIterations = Math.ceil(Math.ceil(Math.log2(this.binCount + 1)) / 2) * 2;
     
     // Camera
     this.cameraCenter = [0.0, 0.0];
-    this.cameraExtentX = 4.0;
-    this.cameraExtentY = 4.0;
+    this.cameraExtentX = 80.0;
     
     // HDR format
     this.hdrFormat = 'rgba16float';
@@ -589,12 +749,12 @@ class TooltipLeniaSimulation {
     this.bindGroupLayouts = {};
   }
   
-  async initialize() {
+  async initialize(canvas) {
     try {
       await this.createBindGroupLayouts();
       await this.createPipelines();
       await this.createBuffers();
-      await this.createTextures();
+      await this.createTextures(canvas);
       await this.createBindGroups();
       
       // Initialize with a default system
@@ -742,6 +902,36 @@ class TooltipLeniaSimulation {
         }
       ],
     });
+
+    this.bindGroupLayouts.compose = this.device.createBindGroupLayout({
+      entries: [
+            {
+                binding: 0,
+                visibility: GPUShaderStage.FRAGMENT,
+                texture: {},
+            },
+            {
+                binding: 1,
+                visibility: GPUShaderStage.FRAGMENT,
+                texture: {},
+            },
+        ],
+    });
+
+    this.bindGroupLayouts.compose = this.device.createBindGroupLayout({
+      entries: [
+            {
+                binding: 0,
+                visibility: GPUShaderStage.FRAGMENT,
+                texture: {},
+            },
+            {
+                binding: 1,
+                visibility: GPUShaderStage.FRAGMENT,
+                texture: {},
+            },
+        ],
+    });
   }
   
   async createPipelines() {
@@ -767,6 +957,10 @@ class TooltipLeniaSimulation {
 
     const particleRenderShaderModule = this.device.createShaderModule({
       code: particleRenderShader,
+    });
+
+    const composeShaderModule = this.device.createShaderModule({
+      code: composeShader,
     });
 
     this.pipelines.binClearSize = this.device.createComputePipeline({
@@ -963,6 +1157,30 @@ class TooltipLeniaSimulation {
         ],
       }
     });
+
+    this.pipelines.compose = this.device.createRenderPipeline({
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [
+          this.bindGroupLayouts.compose,
+        ],
+      }),
+      vertex: {
+        module: composeShaderModule,
+        entryPoint: 'vertexMain',
+      },
+      primitive: {
+        topology: 'triangle-list',
+      },
+      fragment: {
+        module: composeShaderModule,
+        entryPoint: 'fragmentMain',
+        targets: [
+          {
+            format: this.surfaceFormat,
+          },
+        ],
+      }
+    });
   }
   
   async createBuffers() {
@@ -977,14 +1195,46 @@ class TooltipLeniaSimulation {
     });
   }
   
-  async createTextures() {
+  async createTextures(canvas) {
     this.hdrTexture = this.device.createTexture({
       format: this.hdrFormat,
-      size: [this.canvas.width, this.canvas.height, 1],
+      size: [canvas.width, canvas.height, 1],
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
 
     this.hdrTextureView = this.hdrTexture.createView({});
+
+    // Create blue noise texture for dithering
+    try {
+      const blueNoiseImage = await loadImage("/webgpu/blue-noise.png");
+      blueNoiseTexture = this.device.createTexture({
+        format: 'rgba8unorm-srgb',
+        size: [blueNoiseImage.width, blueNoiseImage.height],
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+      this.device.queue.copyExternalImageToTexture(
+        {source: blueNoiseImage},
+        {texture: blueNoiseTexture},
+        {width: blueNoiseImage.width, height: blueNoiseImage.height},
+      );
+      blueNoiseTextureView = blueNoiseTexture.createView({});
+    } catch (error) {
+      console.warn('Failed to load blue noise texture, using fallback:', error);
+      // Create a simple 1x1 texture as fallback
+      blueNoiseTexture = this.device.createTexture({
+        format: 'rgba8unorm-srgb',
+        size: [1, 1],
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      });
+      const fallbackData = new Uint8Array([128, 128, 128, 255]);
+      this.device.queue.writeTexture(
+        {texture: blueNoiseTexture},
+        fallbackData,
+        {bytesPerRow: 4},
+        {width: 1, height: 1}
+      );
+      blueNoiseTextureView = blueNoiseTexture.createView({});
+    }
   }
   
   async createBindGroups() {
@@ -1007,15 +1257,29 @@ class TooltipLeniaSimulation {
         },
       ],
     });
+
+    this.bindGroups.compose = this.device.createBindGroup({
+      layout: this.bindGroupLayouts.compose,
+      entries: [
+        {
+          binding: 0,
+          resource: this.hdrTextureView,
+        },
+        {
+          binding: 1,
+          resource: blueNoiseTextureView,
+        },
+      ],
+    });
   }
   
   async loadDefaultSystem() {
     const systemDescription = {
-      particleCount: 1024,
+      particleCount: 256,
       species: new Array(3),
       kernelsCount: 1,
       growthFuncsCount: 1,
-      simulationSize: [8, 8],
+      simulationSize: [80, 80],
       loopingBorders: false,
       seed: randomSeed(),
     };
@@ -1082,9 +1346,9 @@ class TooltipLeniaSimulation {
     this.kernelsCount = systemDescription.kernelsCount;
     this.growthFuncsCount = systemDescription.growthFuncsCount;
     this.loopingBorders = systemDescription.loopingBorders || false;
-
-    const W = Math.round(systemDescription.simulationSize[0] / 64) * 32;
-    const H = Math.round(systemDescription.simulationSize[1] / 64) * 32;
+    
+    const W = systemDescription.simulationSize[0];
+    const H = systemDescription.simulationSize[1];
 
     this.simulationBox = [[-W, W], [-H, H]];
 
@@ -1369,11 +1633,11 @@ class TooltipLeniaSimulation {
     
     // Create a new system based on the provided parameters
     const systemDescription = {
-      particleCount: params.particleCount || 1024,
+      particleCount: params.particleCount || 256,
       species: new Array(params.speciesCount || 3),
       kernelsCount: params.kernelsCount || 1,
       growthFuncsCount: params.growthFuncsCount || 1,
-      simulationSize: [8, 8],
+      simulationSize: [80, 80],
       loopingBorders: false,
       seed: params.seed || randomSeed(),
     };
@@ -1381,14 +1645,14 @@ class TooltipLeniaSimulation {
     await this.loadSystem(this.generateSystem(systemDescription));
   }
   
-  resume() {
+  resume(context, canvas) {
     if (this.running) return;
     
     this.running = true;
     const animate = () => {
       if (!this.running) return;
       
-      this.stepAndRender();
+      this.stepAndRender(context, canvas);
       this.animationId = requestAnimationFrame(animate);
     };
     animate();
@@ -1402,12 +1666,12 @@ class TooltipLeniaSimulation {
     }
   }
   
-  stepAndRender() {
+  stepAndRender(context, canvas) {
     if (!this.initialized) return;
-    
-    const aspectRatio = this.canvas.width / this.canvas.height;
+
+    const aspectRatio = canvas.width / canvas.height;
     this.cameraExtentY = this.cameraExtentX / aspectRatio;
-    const pixelsPerUnit = this.canvas.width / (2.0 * this.cameraExtentX);
+    const pixelsPerUnit = canvas.width / (2.0 * this.cameraExtentX);
 
     const simDt = 0.1;
     const actionX = 0.0;
@@ -1504,29 +1768,23 @@ class TooltipLeniaSimulation {
     }
     hdrRenderPass.end();
 
+    const composeRenderPass = encoder.beginRenderPass({
+        colorAttachments: [
+            {
+                view: context.getCurrentTexture().createView(),
+                clearValue: [0, 0, 0, 0],
+                loadOp: 'clear',
+                storeOp: 'store',
+            },
+        ],
+    });
+    composeRenderPass.setBindGroup(0, this.bindGroups.compose);
+    composeRenderPass.setPipeline(this.pipelines.compose);
+    composeRenderPass.draw(3);
+    composeRenderPass.end();
+
     const commandBuffer = encoder.finish();
     this.device.queue.submit([commandBuffer]);
-  }
-  
-  copyToCanvas(targetCanvas) {
-    if (!this.initialized) return;
-    
-    const targetCtx = targetCanvas.getContext('2d');
-    targetCtx.clearRect(0, 0, targetCanvas.width, targetCanvas.height);
-    
-    // Create a simple tone mapping from HDR to canvas
-    // This is a simplified version - the original uses a full tone mapping shader
-    try {
-      targetCtx.drawImage(this.canvas, 0, 0, targetCanvas.width, targetCanvas.height);
-    } catch (error) {
-      // Fallback - draw a simple pattern
-      targetCtx.fillStyle = '#333';
-      targetCtx.fillRect(0, 0, targetCanvas.width, targetCanvas.height);
-      targetCtx.fillStyle = '#666';
-      targetCtx.beginPath();
-      targetCtx.arc(targetCanvas.width/2, targetCanvas.height/2, 20, 0, 2 * Math.PI);
-      targetCtx.fill();
-    }
   }
 }
 
@@ -1541,19 +1799,9 @@ async function initializeGlobalTooltipSimulation() {
     if (!device) {
       throw new Error('WebGPU not supported');
     }
-    
-    // Create a hidden canvas that we'll clone into tooltips
-    tooltipCanvas = document.createElement('canvas');
-    tooltipCanvas.width = 240;
-    tooltipCanvas.height = 240;
-    
-    const context = tooltipCanvas.getContext('webgpu');
-    const surfaceFormat = navigator.gpu.getPreferredCanvasFormat();
-    context.configure({ device, format: surfaceFormat });
-    
+
     // Initialize your WebGPU simulation (adapted from your code)
-    tooltipSimulation = new TooltipLeniaSimulation(device, context, tooltipCanvas);
-    await tooltipSimulation.initialize();
+    tooltipSimulation = new TooltipLeniaSimulation(device);
     
     return tooltipSimulation;
   } catch (error) {
@@ -1582,9 +1830,6 @@ function getTooltip(info) {
   return {
     html: `
       <div class="lenia-tooltip" id="${tooltipId}">
-        <div class="tooltip-header">
-          <h4>Particle Lenia Configuration</h4>
-        </div>
         <div class="simulation-container">
           <canvas 
             id="tooltip-canvas-${tooltipId}" 
@@ -1642,6 +1887,22 @@ async function updateTooltipSimulation(params, tooltipId) {
   if (!tooltipElement || !targetCanvas) return;
   
   try {
+
+    const context = targetCanvas.getContext('webgpu');
+    const surfaceFormat = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({ device: tooltipSimulation.device, format: surfaceFormat });
+
+    // Only initialize once when simulation is first created
+    // Always reinitialize for each new canvas to avoid context sharing issues
+    if (!tooltipSimulation.initialized || tooltipSimulation.lastCanvasId !== tooltipId) {
+      tooltipSimulation.lastCanvasId = tooltipId;
+      if (tooltipSimulation.initialized) {
+        // Clean up previous state
+        tooltipSimulation.pause();
+      }
+      await tooltipSimulation.initialize(targetCanvas);
+    }
+
     // Check if we need to update parameters
     if (!paramsEqual(currentTooltipParams, params)) {
       loadingElement.style.display = 'flex';
@@ -1649,24 +1910,12 @@ async function updateTooltipSimulation(params, tooltipId) {
       // Update simulation with new parameters
       await tooltipSimulation.updateParameters(params);
       currentTooltipParams = { ...params };
-      
-      // Start/resume simulation
-      tooltipSimulation.resume();
-      
-      loadingElement.style.display = 'none';
     }
+
+    // Start/resume simulation
+    tooltipSimulation.resume(context, targetCanvas);
     
-    // Copy current frame to tooltip canvas
-    tooltipSimulation.copyToCanvas(targetCanvas);
-    
-    // Continue copying frames while tooltip is visible
-    const copyFrames = () => {
-      if (document.getElementById(tooltipId)) {
-        tooltipSimulation.copyToCanvas(targetCanvas);
-        requestAnimationFrame(copyFrames);
-      }
-    };
-    requestAnimationFrame(copyFrames);
+    loadingElement.style.display = 'none';
     
   } catch (error) {
     console.error('Error updating tooltip simulation:', error);
@@ -1690,32 +1939,39 @@ function paramsEqual(a, b) {
 
 const {DeckGL, ScatterplotLayer} = deck;
 
-const deckgl = new DeckGL({
-  container: 'container',
+// Load data and initialize deck.gl
+loadParquetData().then(data => {
+  const deckgl = new DeckGL({
+    container: 'container',
 
-  initialViewState: {
-    longitude: -122.45,
-    latitude: 37.78,
-    zoom: 12
-  },
-  controller: true,
+    initialViewState: {
+      longitude: -122.45,
+      latitude: 37.78,
+      zoom: 12
+    },
+    controller: true,
 
-  layers: [
-    new ScatterplotLayer({
-      data: [
-        {position: [-122.45, 37.78], speciesCount: 3, particleCount: 1024, kernelsCount: 1, growthFuncsCount: 1, seed: 12345}
-      ],
-      getPosition: d => d.position,
-      getRadius: 1000,
-      getFillColor: [255, 255, 0],
-      // Required to enable picking
-      pickable: true,
-      // Update tooltip position and content
-      // onHover: updateTooltip
-    }),
-  ],
+    layers: [
+      new ScatterplotLayer({
+        id: 'lenia-points',
+        data: data,
+        getPosition: d => d.position,
+        getRadius: 1000,
+        getFillColor: d => [
+          Math.min(255, d.speciesCount * 50),
+          Math.min(255, d.particleCount / 2),
+          Math.min(255, d.kernelsCount * 80),
+          200
+        ],
+        pickable: true,
+        radiusMinPixels: 5,
+        radiusMaxPixels: 50
+      }),
+    ],
 
-  getTooltip
+    getTooltip
+  });
 });
+
   </script>
 </html>

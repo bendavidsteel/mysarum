@@ -623,8 +623,8 @@ var timestampQuerySupported = true;
 // TODO make sure this lines up with max interaction distance 
 const maxForceRadius = 32.0;
 
-var speciesCount = 1;
-var particleCount = 1024;
+var speciesCount = 3;
+var particleCount = 16 * 1024;
 var simulationBox = [[-4, 4], [-4, 4]];
 var loopingBorders = false;
 var gridSize = [Math.ceil((simulationBox[0][1] - simulationBox[0][0]) / maxForceRadius), Math.ceil((simulationBox[1][1] - simulationBox[1][0]) / maxForceRadius)];
@@ -750,7 +750,7 @@ function formatExecutionTime(x) {
 
 function redraw()
 {
-    if (framesInFlight > 3) {
+    if (framesInFlight > 2) {
         requestAnimationFrame(redraw);
         return;
     }
@@ -935,6 +935,12 @@ function redraw()
             document.getElementById("debugInfo").innerText = debugText;
             queryHelper.readBuffer.unmap();
             freeQueryHelpers.push(queryHelper);
+        }).catch((error) => {
+            console.error("Failed to map query buffer:", error);
+            // Clean up the failed QueryHelper
+            queryHelper.querySet.destroy();
+            queryHelper.resolveBuffer.destroy();
+            queryHelper.readBuffer.destroy();
         });
     }
 
@@ -992,8 +998,37 @@ function reloadParameters(systemDescription)
     device.queue.writeBuffer(c_rep_Buffer, 0, c_rep);
 }
 
+function cleanupQueryHelpers() {
+    // Clean up all free query helpers
+    while (freeQueryHelpers.length > 0) {
+        const helper = freeQueryHelpers.pop();
+        helper.querySet.destroy();
+        helper.resolveBuffer.destroy();
+        helper.readBuffer.destroy();
+    }
+}
+
+
+function cleanupBuffers() {
+    cleanupQueryHelpers();
+
+    // Destroy all existing buffers
+    if (speciesBuffer) speciesBuffer.destroy();
+    if (params_k_Buffer) params_k_Buffer.destroy();
+    if (params_g_Buffer) params_g_Buffer.destroy();
+    if (c_rep_Buffer) c_rep_Buffer.destroy();
+    if (particleBuffer) particleBuffer.destroy();
+    if (particleTempBuffer) particleTempBuffer.destroy();
+    if (binOffsetBuffer) binOffsetBuffer.destroy();
+    if (binOffsetTempBuffer) binOffsetTempBuffer.destroy();
+    if (binPrefixSumStepSizeBuffer) binPrefixSumStepSizeBuffer.destroy();
+}
+
+
 function loadSystem(systemDescription)
 {
+    cleanupBuffers();
+
     currentSystemDescription = systemDescription;
 
     particleCount = systemDescription.particleCount;
@@ -1328,11 +1363,11 @@ function generateSystem(systemDescription)
         var w_k = [];
         var c_rep = [];
         for (var j = 0; j < speciesCount; ++j) {
-            c_rep.push(0.5 + 2.5 * rng());
+            c_rep.push(1.0 + 1.0 * rng());
             for (var k = 0; k < kernelsCount; ++k) {
                 mu_k.push(1.0 + 4.0 * rng());
-                sigma_k.push(0.5 + 2.5 * rng());
-                w_k.push(-0.05 + 0.1 * rng());
+                sigma_k.push(0.2 + 1.3 * rng());
+                w_k.push(-0.1 + 0.2 * rng());
             }
         }
 
@@ -1340,7 +1375,7 @@ function generateSystem(systemDescription)
         var sigma_g = [];
         for (var j = 0; j < growthFuncsCount; ++j) {
             mu_g.push(-2.0 + 4.0 * rng());
-            sigma_g.push(0.1 + 0.9 * rng());
+            sigma_g.push(0.8 + 0.2 * rng());
         }
 
         systemDescription.species.push({
@@ -1667,6 +1702,30 @@ async function init()
         alert("Your browser doesn't support WebGPU (failed to create device)");
         return;
     }
+
+    device.lost.then((info) => {
+        console.error(`WebGPU device was lost: ${info.message}`);
+    });
+
+    // Add more aggressive error handling
+    device.pushErrorScope('validation');
+    device.pushErrorScope('out-of-memory');
+    device.pushErrorScope('internal');
+
+    setInterval(async () => {
+        const validationError = await device.popErrorScope();
+        const oomError = await device.popErrorScope();
+        const internalError = await device.popErrorScope();
+        
+        if (validationError || oomError || internalError) {
+            console.error('GPU Errors detected:', { validationError, oomError, internalError });
+        }
+        
+        // Re-push scopes
+        device.pushErrorScope('validation');
+        device.pushErrorScope('out-of-memory');
+        device.pushErrorScope('internal');
+    }, 1000);
 
     context = canvas.getContext('webgpu');
     surfaceFormat = navigator.gpu.getPreferredCanvasFormat();
@@ -2480,7 +2539,6 @@ async function fullscreen()
     </head>
     <body>
         <canvas id="mainCanvas"></canvas>
-        <div id="copyright"><a href="/blog/posts/particle-life-simulation-in-browser-using-webgpu.html">About</a><br>by <a href="https://lisyarus.github.io/blog">@lisyarus</a></div>
         <div id="toolsPanel" class="panel">
             <div class="sliderContainer">
                 <input type="range" min="10" max="20" value="16" class="slider" id="particleCountSlider" oninput="updateParticleCount();">

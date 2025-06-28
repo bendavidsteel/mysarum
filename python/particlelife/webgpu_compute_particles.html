@@ -42,6 +42,8 @@ struct Particle
     x : f32,
     y : f32,
     species : f32,
+    energy : f32,
+    force_magnitude : f32,
 }
 `;
 
@@ -50,6 +52,16 @@ const speciesDescription =
 struct Species
 {
     color : vec4f,
+}
+`;
+
+const cameraDescription =
+`
+struct Camera
+{
+    center : vec2f,
+    extent : vec2f,
+    pixelsPerUnit : f32,
 }
 `;
 
@@ -281,9 +293,6 @@ fn computeForces(@builtin(global_invocation_id) id : vec3u)
                 let r = length(diff) / scale;
 				let r_unit = diff / r;
 				
-                // let mu_k = 4.0;
-                // let sigma_k = 1.0;
-                // let w_k = 0.022;
 				for (var k = 0u; k < kernelsCount; k += 1) {
 					let mu_k = params_k[species * speciesCount * kernelsCount * 3 + otherSpecies * kernelsCount * 3 + k];
                     let sigma_k = params_k[species * speciesCount * kernelsCount * 3 + otherSpecies * kernelsCount * 3 + k + 1];
@@ -325,6 +334,8 @@ fn computeForces(@builtin(global_invocation_id) id : vec3u)
     // Assume mass = 1
     particle.x += force.x * simulationOptions.dt;
     particle.y += force.y * simulationOptions.dt;
+    particle.force_magnitude = length(force);
+    particle.energy = U;
 
     particlesDestination[id.x] = particle;
 }
@@ -409,13 +420,7 @@ const particleRenderShader =
 `
 ${particleDescription}
 ${speciesDescription}
-
-struct Camera
-{
-    center : vec2f,
-    extent : vec2f,
-    pixelsPerUnit : f32,
-}
+${cameraDescription}
 
 @group(0) @binding(0) var<storage, read> particles : array<Particle>;
 @group(0) @binding(1) var<storage, read> species : array<Species>;
@@ -611,6 +616,115 @@ fn fragmentMain(in : VertexOut) -> @location(0) vec4f
 }
 `;
 
+const audioShader = `
+${particleDescription}
+${speciesDescription}
+${cameraDescription}
+${simulationOptionsDescription}
+
+override WORKGROUP_SIZE: u32 = 256;
+override SAMPLING_RATE: f32 = 44100.0;
+struct TimeInfo {
+    // time since song start in seconds
+    offset: f32,
+}
+@group(0) @binding(0) var<uniform> time_info: TimeInfo;
+@group(0) @binding(1) var<storage, read_write> song_chunk: array<vec2<f32>>; // 2 channel pcm data
+
+@group(1) @binding(0) var<storage, read> particlesSource : array<Particle>;
+@group(1) @binding(2) var<storage, read> binOffset : array<u32>;
+
+@group(2) @binding(0) var<uniform> simulationOptions : SimulationOptions;
+
+@group(3) @binding(0) var<uniform> camera : Camera;
+
+@compute
+@workgroup_size(WORKGROUP_SIZE)
+fn synthezise(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let sample = global_id.x;
+    if sample >= arrayLength(&song_chunk) {
+        return;
+    }
+    let t = f32(sample) / SAMPLING_RATE;
+    song_chunk[sample] = song(time_info.offset + t);
+}
+
+const PI: f32 = 3.141592654;
+const TAU: f32 = 6.283185307179586476925286766559;
+
+fn song(time: f32) -> vec2<f32> {
+
+    let binInfo = getBinInfo(camera.center, simulationOptions);
+
+    let loopingBorders = simulationOptions.loopingBorders == 1.0;
+
+    var binXMin = binInfo.binId.x - 1;
+    var binYMin = binInfo.binId.y - 1;
+
+    var binXMax = binInfo.binId.x + 1;
+    var binYMax = binInfo.binId.y + 1;
+
+    if (!loopingBorders) {
+        binXMin = max(0, binXMin);
+        binYMin = max(0, binYMin);
+        binXMax = min(binInfo.gridSize.x - 1, binXMax);
+        binYMax = min(binInfo.gridSize.y - 1, binYMax);
+    }
+
+    let width = simulationOptions.right - simulationOptions.left;
+    let height = simulationOptions.top - simulationOptions.bottom;
+
+	let speciesCount = u32(simulationOptions.speciesCount);
+
+    let c_freq = 440.0;
+    let m_freq = 0.1;
+
+    var sig = vec2f(0.0, 0.0);
+    for (var binX = binXMin; binX <= binXMax; binX += 1) {
+        for (var binY = binYMin; binY <= binYMax; binY += 1) {
+            var realBinX = (binX + binInfo.gridSize.x) % binInfo.gridSize.x;
+            var realBinY = (binY + binInfo.gridSize.y) % binInfo.gridSize.y;
+
+            let binIndex = realBinY * binInfo.gridSize.x + realBinX;
+            let binStart = binOffset[binIndex];
+            let binEnd = binOffset[binIndex + 1];
+
+            for (var j = binStart; j < binEnd; j += 1) {
+
+                let other = particlesSource[j];
+                let otherSpecies = u32(other.species);
+
+                let leftEar = camera.center - vec2f(camera.extent.x / 2, 0.0);
+                let rightEar = camera.center + vec2f(camera.extent.x / 2, 0.0);
+                var leftDist = length(vec2f(other.x, other.y) - leftEar) / camera.extent.x;
+                var rightDist = length(vec2f(other.x, other.y) - rightEar) / camera.extent.x;
+
+                // TODO skip for particles over maxForceRadius to ensure audio isn't biased by binning
+
+                // particles that are closer are louder
+                // particles that are further away get lowpassed
+                // particles moving faster are louder and have more high frequencies
+                // particles with more energy have a different timbre
+                var p_sig = 0.0;
+                // for (var k = 1u; k < 6u; k++) {
+                //     p_sig += other.force_magnitude * sin(TAU * time * f32(k) * c_freq + other.energy * sin(TAU * time * (other.species + 1) * m_freq));
+                // }
+                p_sig = 0.01 * other.force_magnitude * sin(TAU * time * other.energy * 1000.0);
+
+                // pan the signal based on the particle's position wrt the camera center
+                sig += vec2f(
+                    p_sig / leftDist,
+                    p_sig / rightDist
+                );
+            }
+        }
+    }
+
+    // x = left channel, y = right channel
+    return sig;
+}
+`;
+
 var canvas;
 var context;
 var surfaceFormat;
@@ -710,6 +824,31 @@ var debugPanelShown = false;
 
 var freeQueryHelpers = [];
 
+const chunkDurationSeconds = 0.1;
+const numChannels = 2;
+const workGroupSize = 256;
+const maxBufferedChunks = 2;
+
+var timeInfoBuffer;
+var songChunkBuffer;
+
+var audioPipeline;
+var audioBindGroup;
+var audioBindGroupLayout;
+var audioRingBuffer;
+
+var chunkNumSamplesPerChannel;
+var chunkNumSamples;
+var chunkBufferSize;
+var chunkBuffer;
+
+var audioCtx;
+var audioPaused;
+
+// state tracking
+const startTime = performance.now() / 1000.0;
+let nextChunkOffset = 0.0;
+
 function QueryHelper()
 {
     this.querySet = device.createQuerySet({
@@ -738,6 +877,43 @@ function QueryHelper()
         this.currentIndex += 2;
         return result;
     };
+}
+
+class AudioRingBuffer {
+    constructor(bufferCount = 4) {
+        this.storageBuffers = [];  // GPU storage buffers
+        this.mapBuffers = [];      // CPU-readable buffers
+        this.writeIndex = 0;
+        this.readIndex = 0;
+        this.size = bufferCount;
+        
+        // Pre-create ALL buffers upfront
+        for (let i = 0; i < bufferCount; i++) {
+            this.storageBuffers.push(device.createBuffer({
+                size: chunkBufferSize,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+            }));
+            
+            this.mapBuffers.push(device.createBuffer({
+                size: chunkBufferSize,
+                usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+            }));
+        }
+    }
+    
+    // Get next buffer for GPU writing
+    getCurrentWriteBuffers() {
+        const index = this.writeIndex % this.size;
+        return {
+            storage: this.storageBuffers[index],
+            map: this.mapBuffers[index]
+        };
+    }
+    
+    // Move to next buffer set
+    advanceWrite() {
+        this.writeIndex++;
+    }
 }
 
 function formatExecutionTime(x) {
@@ -953,6 +1129,94 @@ function redraw()
     requestAnimationFrame(redraw);
 }
 
+// create sound data on the GPU, read back to CPU and schedule for playback
+async function createAudioChunk() {
+    if (paused || audioPaused || !audioCtx || audioCtx.state !== 'running') {
+        console.log('paused, not creating song chunk');
+        setTimeout(createAudioChunk, 100); // Check again in 100ms
+        return;
+    }
+
+    // if we've already scheduled `maxBufferedChunks` of sound data for playback, reschedule sound data creation for later
+    const bufferedSeconds = (startTime + nextChunkOffset) - (performance.now() / 1000.0);
+    const numBufferedChunks = Math.floor(bufferedSeconds / chunkDurationSeconds);
+    if (numBufferedChunks > maxBufferedChunks) {
+        const timeout = chunkDurationSeconds * 0.9;
+        setTimeout(createAudioChunk, timeout * 1000.0);
+        console.log(`buffered chunks ${numBufferedChunks} (${bufferedSeconds} seconds), next chunk creation starts in ${timeout} seconds`);
+        return;
+    }
+
+    // update uniform buffer: set the new chunk's offset in seconds from t = 0
+    console.log('writing nextChunkOffset', nextChunkOffset);
+    device.queue.writeBuffer(timeInfoBuffer, 0, new Float32Array([nextChunkOffset]));
+
+    const commandEncoder = device.createCommandEncoder();
+
+    // encode compute pass, i.e., sound chunk creation
+    const pass = commandEncoder.beginComputePass();
+    pass.setPipeline(audioPipeline);
+    pass.setBindGroup(0, audioBindGroup);
+    pass.setBindGroup(1, particleComputeForcesBindGroup);
+    pass.setBindGroup(2, simulationOptionsBindGroup);
+    pass.setBindGroup(3, cameraBindGroup);
+    pass.dispatchWorkgroups(
+        Math.ceil(chunkNumSamplesPerChannel / workGroupSize)
+    );
+    pass.end();
+
+    // copy sound chunk to map buffer
+    commandEncoder.copyBufferToBuffer(chunkBuffer, 0, chunkMapBuffer, 0, chunkBufferSize);
+
+    device.queue.submit([commandEncoder.finish()]);
+
+    // after submitting(!) chunk creation & copy commands, map chunkMapBuffer's memory to CPU memory for reading
+    // Note: a mapped buffer is not allowed to be used in a command encoder.
+    // To avoid an illegal use of the map buffer in a command encoder (i.e., when copying the data from the storage buffer),
+    // we wait for the buffer's memory to be mapped.
+    // In this case, this is okay, because we have a couple of seconds of sound data cached in the audio context's destination,
+    // so we can easily afford to wait for the GPU commands to finish and the buffer to be mapped.
+    // However, doing this within the render loop of a real-time renderer is usually a bad idea, since it forces a CPU-GPU sync.
+    // In such cases, it might be a good idea to have a ring buffer of map-buffers to not use the same map buffer in each frame.
+    await chunkMapBuffer.mapAsync(GPUMapMode.READ, 0, chunkBufferSize);
+
+    // when the buffer's memory is mapped, copy it to a JavaScript array and unmap the buffer
+    const chunkData = new Float32Array(chunkNumSamples);
+    chunkData.set(new Float32Array(chunkMapBuffer.getMappedRange()));
+    chunkMapBuffer.unmap();
+
+    // copy chunk data to audio buffer
+    const audioBuffer = audioCtx.createBuffer(
+        numChannels,
+        chunkNumSamplesPerChannel,
+        audioCtx.sampleRate
+    );
+    
+    const channels = [];
+    for (let i = 0; i < numChannels; ++i) {
+        channels.push(audioBuffer.getChannelData(i));
+    }
+
+    for (let i = 0; i < audioBuffer.length; ++i) {
+        for (const [offset, channel] of channels.entries()) {
+            channel[i] = chunkData[i * numChannels + offset];
+        }
+    }
+
+    // create new audio source from audio buffer and schedule for execution
+    const audioSource = audioCtx.createBufferSource();
+    audioSource.buffer = audioBuffer;
+    audioSource.connect(audioCtx.destination);
+    // (there is some issue with the second chunk's offset - no idea why, music's hard I guess)
+    audioSource.start(nextChunkOffset);
+
+    console.log(`created new chunk, starts at ${startTime + nextChunkOffset}`);
+
+    // schedule next chunk creation
+    nextChunkOffset += audioSource.buffer.duration;
+    await createAudioChunk();
+}
+
 function centerView()
 {
     cameraCenter = [0.0, 0.0];
@@ -1103,7 +1367,8 @@ function loadSystem(systemDescription)
 
     reloadParameters(systemDescription);
 
-    const initialParticles = new Float32Array(particleCount * 3);
+    let numParticleAttributes = 5; // x, y, species, force_magnitude, energy
+    const initialParticles = new Float32Array(particleCount * numParticleAttributes);
 
     for (var i = 0; i < speciesCount; ++i)
         if (systemDescription.species[i].spawnWeight == undefined)
@@ -1126,13 +1391,13 @@ function loadSystem(systemDescription)
             speciesPick -= systemDescription.species[j].spawnWeight;
         }
 
-        initialParticles[3 * i + 0] = simulationBox[0][0] + Math.random() * (simulationBox[0][1] - simulationBox[0][0]);
-        initialParticles[3 * i + 1] = simulationBox[1][0] + Math.random() * (simulationBox[1][1] - simulationBox[1][0]);
-        initialParticles[3 * i + 2] = speciesId;
+        initialParticles[numParticleAttributes * i + 0] = simulationBox[0][0] + Math.random() * (simulationBox[0][1] - simulationBox[0][0]);
+        initialParticles[numParticleAttributes * i + 1] = simulationBox[1][0] + Math.random() * (simulationBox[1][1] - simulationBox[1][0]);
+        initialParticles[numParticleAttributes * i + 2] = speciesId;
     }
 
     particleBuffer = device.createBuffer({
-        size: particleCount * 3 * 4,
+        size: particleCount * numParticleAttributes * 4, // 5 floats per particle: x, y, species, force_magnitude, energy
         usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC | GPUBufferUsage.STORAGE,
         label: "particleBuffer",
     });
@@ -1807,7 +2072,7 @@ async function init()
         entries: [
             {
                 binding: 0,
-                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
                 buffer: {
                     type: 'uniform',
                 },
@@ -1992,11 +2257,13 @@ async function init()
                 simulationOptionsBindGroupLayout,
                 binFillSizeBindGroupLayout,
             ],
+            label: "binClearSizePipelineLayout",
         }),
         compute: {
             module: binFillSizeShaderModule,
             entryPoint: 'clearBinSize',
         },
+        label: "binClearSizePipeline",
     });
 
     binFillSizePipeline = device.createComputePipeline({
@@ -2006,11 +2273,13 @@ async function init()
                 simulationOptionsBindGroupLayout,
                 binFillSizeBindGroupLayout,
             ],
+            label: "binFillSizePipelineLayout",
         }),
         compute: {
             module: binFillSizeShaderModule,
             entryPoint: 'fillBinSize',
         },
+        label: "binFillSizePipeline",
     });
 
     binPrefixSumPipeline = device.createComputePipeline({
@@ -2018,11 +2287,13 @@ async function init()
             bindGroupLayouts: [
                 binPrefixSumBindGroupLayout,
             ],
+            label: "binPrefixSumPipelineLayout",
         }),
         compute: {
             module: binPrefixSumShaderModule,
             entryPoint: 'prefixSumStep',
         },
+        label: "binPrefixSumPipeline",
     });
 
     particleSortClearSizePipeline = device.createComputePipeline({
@@ -2031,11 +2302,13 @@ async function init()
                 particleSortBindGroupLayout,
                 simulationOptionsBindGroupLayout,
             ],
+            label: "particleSortClearSizePipelineLayout",
         }),
         compute: {
             module: particleSortShaderModule,
             entryPoint: 'clearBinSize',
         },
+        label: "particleSortClearSizePipeline",
     });
 
     particleSortPipeline = device.createComputePipeline({
@@ -2044,11 +2317,13 @@ async function init()
                 particleSortBindGroupLayout,
                 simulationOptionsBindGroupLayout,
             ],
+            label: "particleSortPipelineLayout",
         }),
         compute: {
             module: particleSortShaderModule,
             entryPoint: 'sortParticles',
         },
+        label: "particleSortPipeline",
     });
 
     particleComputeForcesPipeline = device.createComputePipeline({
@@ -2057,11 +2332,13 @@ async function init()
                 particleComputeForcesBindGroupLayout,
                 simulationOptionsBindGroupLayout,
             ],
+            label: "particleComputeForcesPipelineLayout",
         }),
         compute: {
             module: particleComputeForcesShaderModule,
             entryPoint: 'computeForces',
         },
+        label: "particleComputeForcesPipeline",
     });
 
     particleAdvancePipeline = device.createComputePipeline({
@@ -2070,11 +2347,13 @@ async function init()
                 particleBufferBindGroupLayout,
                 simulationOptionsBindGroupLayout,
             ],
+            label: "particleAdvancePipelineLayout",
         }),
         compute: {
             module: particleAdvanceShaderModule,
             entryPoint: 'particleAdvance',
         },
+        label: "particleAdvancePipeline",
     });
 
     particleRenderGlowPipeline = device.createRenderPipeline({
@@ -2083,6 +2362,7 @@ async function init()
                 particleBufferReadOnlyBindGroupLayout,
                 cameraBindGroupLayout,
             ],
+            label: "particleRenderGlowPipelineLayout",
         }),
         vertex: {
             module: particleRenderShaderModule,
@@ -2118,6 +2398,7 @@ async function init()
                 particleBufferReadOnlyBindGroupLayout,
                 cameraBindGroupLayout,
             ],
+            label: "particleRenderPipelineLayout",
         }),
         vertex: {
             module: particleRenderShaderModule,
@@ -2153,6 +2434,7 @@ async function init()
                 particleBufferReadOnlyBindGroupLayout,
                 cameraBindGroupLayout,
             ],
+            label: "particleRenderPointPipelineLayout",
         }),
         vertex: {
             module: particleRenderShaderModule,
@@ -2187,6 +2469,7 @@ async function init()
             bindGroupLayouts: [
                 composeBindGroupLayout,
             ],
+            label: "composePipelineLayout",
         }),
         vertex: {
             module: composeShaderModule,
@@ -2226,6 +2509,89 @@ async function init()
     centerView();
 
     redraw();
+    createAudioChunk();
+}
+
+function initAudio()
+{
+    // audio setup
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+    chunkNumSamplesPerChannel = audioCtx.sampleRate * chunkDurationSeconds;
+    chunkNumSamples = numChannels * chunkNumSamplesPerChannel;
+    chunkBufferSize = Float32Array.BYTES_PER_ELEMENT * chunkNumSamples;
+    chunkBuffer = device.createBuffer({
+        size: chunkBufferSize,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+
+    // We did not cover this in the workshop: storage & uniform buffers can't be read back to the CPU directly.
+    // Instead, we need to copy the data to an extra buffer with the MAP_READ & COPY_DST usages.
+    // To get the data to the CPU, we need to map the buffer to CPU memory and then copy the mapped memory to a JavaScript ArrayBuffer.
+    // Note that a mapped buffer must not be used in a command encoder.
+    chunkMapBuffer = device.createBuffer({
+        size: chunkBufferSize,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+
+    timeInfoBuffer = device.createBuffer({
+        size: Float32Array.BYTES_PER_ELEMENT * 1,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+
+    audioRingBuffer = new AudioRingBuffer(4);
+
+    const audioShaderModule = device.createShaderModule({
+        code: audioShader
+    });
+
+    audioBindGroupLayout = device.createBindGroupLayout({
+        entries: [
+            {
+                binding: 0,
+                visibility: GPUShaderStage.COMPUTE,
+                buffer: {
+                    type: 'uniform',
+                },
+            },
+            {
+                binding: 1,
+                visibility: GPUShaderStage.COMPUTE,
+                buffer: {
+                    type: 'storage',
+                },
+            },
+        ],
+    });
+
+    audioPipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({
+            bindGroupLayouts: [
+                audioBindGroupLayout,
+                particleComputeForcesBindGroupLayout,
+                simulationOptionsBindGroupLayout,
+                cameraBindGroupLayout,
+            ],
+            label: "audioPipelineLayout",
+        }),
+        compute: {
+            module: audioShaderModule,
+            entryPoint: 'synthezise',
+            constants: {
+                SAMPLING_RATE: audioCtx.sampleRate,
+                WORKGROUP_SIZE: workGroupSize,
+            }
+        },
+        label: "audioPipeline",
+    });
+
+    audioBindGroup = device.createBindGroup({
+        layout: audioBindGroupLayout,
+        entries: [
+            {binding: 0, resource: {buffer: timeInfoBuffer}},
+            {binding: 1, resource: {buffer: chunkBuffer}},
+        ]
+    });
 }
 
 window.onload = init;
@@ -2292,6 +2658,24 @@ function updateLoopingBorders()
 
     currentSystemDescription.loopingBorders = newLoopingBorders;
     loopingBorders = newLoopingBorders;
+}
+
+function updatePlayAudio()
+{
+    const newPlayAudio = document.getElementById("playAudio").checked;
+
+    if (newPlayAudio) {
+        if (!audioCtx) {
+            initAudio();
+        }
+
+        audioCtx.resume();
+        audioPaused = false;
+
+    } else {
+        audioCtx.suspend();
+        audioPaused = true;
+    }
 }
 
 async function saveSettings()
@@ -2594,6 +2978,11 @@ async function fullscreen()
                     <td><div class="button" id="fullscreenButton" onclick="fullscreen();">Fullscreen</div></td>
                 </tr>
             </table>
+            <label class="checkboxContainer">
+                Play audio
+                <input type="checkbox" id="playAudio" onclick="updatePlayAudio();" />
+                <span class="customCheckbox"></span>
+            </label>
             
             <div class="rowBreak"></div>
             <div><center>[S] or three-tap to hide this menu</center></div>

@@ -1,0 +1,1825 @@
+
+// Shader code from the original simulation
+const particleDescription = 
+`
+struct Particle
+{
+    x : f32,
+    y : f32,
+    species : f32,
+}
+`;
+
+const speciesDescription =
+`
+struct Species
+{
+    color : vec4f,
+}
+`;
+
+const simulationOptionsDescription =
+`
+struct SimulationOptions
+{
+    left : f32,
+    right : f32,
+    bottom : f32,
+    top : f32,
+    dt : f32,
+    binSize : f32,
+    speciesCount : f32,
+	kernelsCount : f32,
+	growthFuncsCount : f32,
+    loopingBorders : f32,
+    actionX : f32,
+    actionY : f32,
+    actionVX : f32,
+    actionVY : f32,
+    actionForce : f32,
+    actionRadius : f32,
+}
+
+struct BinInfo
+{
+    gridSize : vec2i,
+    binId : vec2i,
+    binIndex : i32,
+}
+
+fn getBinInfo(position : vec2f, simulationOptions : SimulationOptions) -> BinInfo
+{
+    let gridSize = vec2i(
+        i32(ceil((simulationOptions.right - simulationOptions.left) / simulationOptions.binSize)),
+        i32(ceil((simulationOptions.top - simulationOptions.bottom) / simulationOptions.binSize)),
+    );
+
+    let binId = vec2i(
+        clamp(i32(floor((position.x - simulationOptions.left) / simulationOptions.binSize)), 0, gridSize.x - 1),
+        clamp(i32(floor((position.y - simulationOptions.bottom) / simulationOptions.binSize)), 0, gridSize.y - 1)
+    );
+
+    let binIndex = binId.y * gridSize.x + binId.x;
+
+    return BinInfo(gridSize, binId, binIndex);
+}
+`;
+
+const binFillSizeShader = 
+`
+${particleDescription}
+${simulationOptionsDescription}
+
+@group(0) @binding(0) var<storage, read> particles : array<Particle>;
+@group(1) @binding(0) var<uniform> simulationOptions : SimulationOptions;
+@group(2) @binding(0) var<storage, read_write> binSize : array<atomic<u32>>;
+
+@compute @workgroup_size(64)
+fn clearBinSize(@builtin(global_invocation_id) id : vec3u)
+{
+    if (id.x >= arrayLength(&binSize)) {
+        return;
+    }
+
+    atomicStore(&binSize[id.x], 0u);
+}
+
+@compute @workgroup_size(64)
+fn fillBinSize(@builtin(global_invocation_id) id : vec3u)
+{
+    if (id.x >= arrayLength(&particles)) {
+        return;
+    }
+
+    let particle = particles[id.x];
+
+    let binIndex = getBinInfo(vec2f(particle.x, particle.y), simulationOptions).binIndex;
+
+    atomicAdd(&binSize[binIndex + 1], 1u);
+}
+`;
+
+const binPrefixSumShader = 
+`
+@group(0) @binding(0) var<storage, read> source : array<u32>;
+@group(0) @binding(1) var<storage, read_write> destination : array<u32>;
+@group(0) @binding(2) var<uniform> stepSize : u32;
+
+@compute @workgroup_size(64)
+fn prefixSumStep(@builtin(global_invocation_id) id : vec3u)
+{
+    if (id.x >= arrayLength(&source)) {
+        return;
+    }
+
+    if (id.x < stepSize) {
+        destination[id.x] = source[id.x];
+    } else {
+        destination[id.x] = source[id.x - stepSize] + source[id.x];
+    }
+}
+`;
+
+const particleSortShader = 
+`
+${particleDescription}
+${simulationOptionsDescription}
+
+@group(0) @binding(0) var<storage, read> source : array<Particle>;
+@group(0) @binding(1) var<storage, read_write> destination : array<Particle>;
+@group(0) @binding(2) var<storage, read> binOffset : array<u32>;
+@group(0) @binding(3) var<storage, read_write> binSize : array<atomic<u32>>;
+
+@group(1) @binding(0) var<uniform> simulationOptions : SimulationOptions;
+
+@compute @workgroup_size(64)
+fn clearBinSize(@builtin(global_invocation_id) id : vec3u)
+{
+    if (id.x >= arrayLength(&binSize)) {
+        return;
+    }
+
+    atomicStore(&binSize[id.x], 0u);
+}
+
+@compute @workgroup_size(64)
+fn sortParticles(@builtin(global_invocation_id) id : vec3u)
+{
+    if (id.x >= arrayLength(&source)) {
+        return;
+    }
+
+    let particle = source[id.x];
+
+    let binIndex = getBinInfo(vec2f(particle.x, particle.y), simulationOptions).binIndex;
+
+    let newParticleIndex = binOffset[binIndex] + atomicAdd(&binSize[binIndex], 1);
+    destination[newParticleIndex] = particle;
+}
+`;
+
+const particleComputeForcesShader = 
+`
+${particleDescription}
+${simulationOptionsDescription}
+
+@group(0) @binding(0) var<storage, read> particlesSource : array<Particle>;
+@group(0) @binding(1) var<storage, read_write> particlesDestination : array<Particle>;
+@group(0) @binding(2) var<storage, read> binOffset : array<u32>;
+@group(0) @binding(3) var<storage, read> params_k : array<f32>;
+@group(0) @binding(4) var<storage, read> params_g : array<f32>;
+@group(0) @binding(5) var<storage, read> c_rep : array<f32>;
+
+@group(1) @binding(0) var<uniform> simulationOptions : SimulationOptions;
+
+@compute @workgroup_size(64)
+fn computeForces(@builtin(global_invocation_id) id : vec3u)
+{
+    if (id.x >= arrayLength(&particlesSource)) {
+        return;
+    }
+
+    var particle = particlesSource[id.x];
+    let species = u32(particle.species);
+
+    let binInfo = getBinInfo(vec2f(particle.x, particle.y), simulationOptions);
+
+    let loopingBorders = simulationOptions.loopingBorders == 1.0;
+
+    var binXMin = binInfo.binId.x - 1;
+    var binYMin = binInfo.binId.y - 1;
+
+    var binXMax = binInfo.binId.x + 1;
+    var binYMax = binInfo.binId.y + 1;
+
+    if (!loopingBorders) {
+        binXMin = max(0, binXMin);
+        binYMin = max(0, binYMin);
+        binXMax = min(binInfo.gridSize.x - 1, binXMax);
+        binYMax = min(binInfo.gridSize.y - 1, binYMax);
+    }
+
+    let width = simulationOptions.right - simulationOptions.left;
+    let height = simulationOptions.top - simulationOptions.bottom;
+
+    let particlePosition = vec2f(particle.x, particle.y);
+
+	let speciesCount = u32(simulationOptions.speciesCount);
+	let kernelsCount = u32(simulationOptions.kernelsCount);
+	let growthFuncsCount = u32(simulationOptions.growthFuncsCount);
+    var U = 0.0;
+    var grad_U = vec2f(0.0, 0.0);
+    var grad_R = vec2f(0.0, 0.0);
+    let scale = 4.0;
+
+    for (var binX = binXMin; binX <= binXMax; binX += 1) {
+        for (var binY = binYMin; binY <= binYMax; binY += 1) {
+            var realBinX = (binX + binInfo.gridSize.x) % binInfo.gridSize.x;
+            var realBinY = (binY + binInfo.gridSize.y) % binInfo.gridSize.y;
+
+            let binIndex = realBinY * binInfo.gridSize.x + realBinX;
+            let binStart = binOffset[binIndex];
+            let binEnd = binOffset[binIndex + 1];
+
+            for (var j = binStart; j < binEnd; j += 1) {
+                if (j == id.x) {
+                    continue;
+                }
+
+                let other = particlesSource[j];
+                let otherSpecies = u32(other.species);
+
+                var diff = vec2f(other.x, other.y) - particlePosition;
+
+                if (loopingBorders) {
+                    if (abs(diff.x) >= width * 0.5) {
+                        diff.x -= sign(diff.x) * width;
+                    }
+
+                    if (abs(diff.y) >= height * 0.5) {
+                        diff.y -= sign(diff.y) * height;
+                    }
+                }
+
+                let r = length(diff) / scale;
+				let r_unit = diff / r;
+				
+				for (var k = 0u; k < kernelsCount; k += 1) {
+					let mu_k = params_k[species * speciesCount * kernelsCount * 3 + otherSpecies * kernelsCount * 3 + k];
+                    let sigma_k = params_k[species * speciesCount * kernelsCount * 3 + otherSpecies * kernelsCount * 3 + k + 1];
+                    let w_k = params_k[species * speciesCount * kernelsCount * 3 + otherSpecies * kernelsCount * 3 + k + 2];
+                    let r_mu_k = r - mu_k;
+                    let sigma2_k = sigma_k * sigma_k;
+                    let u_kernel = w_k * exp(-r_mu_k * r_mu_k / sigma2_k);
+                    U += u_kernel;
+
+                    let dU_dr = -2.0 * u_kernel * r_mu_k / sigma2_k;
+                    grad_U += dU_dr * r_unit;
+				}
+
+                let this_c_rep = c_rep[species * speciesCount + otherSpecies];
+                let d_rep = 1.0;
+                let d_R = this_c_rep * max((d_rep - r) / d_rep, 0.0);
+                grad_R += d_R * r_unit;
+            }
+        }
+    }
+    
+    var dG_dU = 0.0;
+    for (var k = 0u; k < growthFuncsCount; k += 1) {
+        let mu_g = params_g[species * growthFuncsCount * 2 + k];
+        let sigma_g = params_g[species * growthFuncsCount * 2 + k + 1];
+        let sigma2_g = sigma_g * sigma_g;
+        let U_mu_g = U - mu_g;
+        dG_dU += 2 * U_mu_g / sigma2_g * exp(-U_mu_g * U_mu_g / sigma2_g);
+    }
+
+    let grad_G = dG_dU * grad_U;
+
+    let force = grad_G - grad_R;
+
+    particle.x += force.x * simulationOptions.dt;
+    particle.y += force.y * simulationOptions.dt;
+
+    particlesDestination[id.x] = particle;
+}
+`;
+
+const particleAdvanceShader =
+`
+${particleDescription}
+${simulationOptionsDescription}
+
+@group(0) @binding(0) var<storage, read_write> particles : array<Particle>;
+@group(1) @binding(0) var<uniform> simulationOptions : SimulationOptions;
+
+@compute @workgroup_size(64)
+fn particleAdvance(@builtin(global_invocation_id) id : vec3u)
+{
+    if (id.x >= arrayLength(&particles)) {
+        return;
+    }
+
+    let width = simulationOptions.right - simulationOptions.left;
+    let height = simulationOptions.top - simulationOptions.bottom;
+
+    var particle = particles[id.x];
+
+    var actionR = vec2f(particle.x, particle.y) - vec2f(simulationOptions.actionX, simulationOptions.actionY);
+    if (simulationOptions.loopingBorders == 1.0) {
+        if (abs(actionR.x) >= width * 0.5) {
+            actionR.x -= sign(actionR.x) * width;
+        }
+
+        if (abs(actionR.y) >= height * 0.5) {
+            actionR.y -= sign(actionR.y) * height;
+        }
+    }
+    let actionFactor = simulationOptions.actionForce * exp(- dot(actionR, actionR) / (simulationOptions.actionRadius * simulationOptions.actionRadius));
+    particle.x += simulationOptions.actionVX * actionFactor;
+    particle.y += simulationOptions.actionVY * actionFactor;
+
+    let loopingBorders = simulationOptions.loopingBorders == 1.0;
+
+    if (loopingBorders) {
+        if (particle.x < simulationOptions.left) {
+            particle.x += width;
+        }
+    
+        if (particle.x > simulationOptions.right) {
+            particle.x -= width;
+        }
+
+        if (particle.y < simulationOptions.bottom) {
+            particle.y += height;
+        }
+    
+        if (particle.y > simulationOptions.top) {
+            particle.y -= height;
+        }
+    } else {
+        if (particle.x < simulationOptions.left) {
+            particle.x = simulationOptions.left;
+        }
+
+        if (particle.x > simulationOptions.right) {
+            particle.x = simulationOptions.right;
+        }
+
+        if (particle.y < simulationOptions.bottom) {
+            particle.y = simulationOptions.bottom;
+        }
+
+        if (particle.y > simulationOptions.top) {
+            particle.y = simulationOptions.top;
+        }
+    }
+
+    particles[id.x] = particle;
+}
+`;
+
+const particleRenderShader =
+`
+${particleDescription}
+${speciesDescription}
+
+struct Camera
+{
+    center : vec2f,
+    extent : vec2f,
+    pixelsPerUnit : f32,
+}
+
+@group(0) @binding(0) var<storage, read> particles : array<Particle>;
+@group(0) @binding(1) var<storage, read> species : array<Species>;
+
+@group(1) @binding(0) var<uniform> camera : Camera;
+
+struct CircleVertexOut
+{
+    @builtin(position) position : vec4f,
+    @location(0) offset : vec2f,
+    @location(1) color : vec4f,
+}
+
+const offsets = array<vec2f, 6>(
+    vec2f(-1.0, -1.0),
+    vec2f( 1.0, -1.0),
+    vec2f(-1.0,  1.0),
+    vec2f(-1.0,  1.0),
+    vec2f( 1.0, -1.0),
+    vec2f( 1.0,  1.0),
+);
+
+@vertex
+fn vertexGlow(@builtin(vertex_index) id : u32) -> CircleVertexOut
+{
+    let particle = particles[id / 6u];
+    let offset = offsets[id % 6u];
+    let position = vec2f(particle.x, particle.y) + 12.0 * offset;
+    return CircleVertexOut(
+        vec4f((position - camera.center) / camera.extent, 0.0, 1.0),
+        offset,
+        species[u32(particle.species)].color
+    );
+}
+
+@fragment
+fn fragmentGlow(in : CircleVertexOut) -> @location(0) vec4f
+{
+    let l = length(in.offset);
+    let alpha = exp(- 6.0 * l * l) / 64.0;
+    return in.color * vec4f(1.0, 1.0, 1.0, alpha);
+}
+
+@vertex
+fn vertexCircle(@builtin(vertex_index) id : u32) -> CircleVertexOut
+{
+    let particle = particles[id / 6u];
+    let offset = offsets[id % 6u] * 1.5;
+    let position = vec2f(particle.x, particle.y) + offset;
+    return CircleVertexOut(
+        vec4f((position - camera.center) / camera.extent, 0.0, 1.0),
+        offset,
+        species[u32(particle.species)].color
+    );
+}
+
+@fragment
+fn fragmentCircle(in : CircleVertexOut) -> @location(0) vec4f
+{
+    let alpha = clamp(camera.pixelsPerUnit - length(in.offset) * camera.pixelsPerUnit + 0.5, 0.0, 1.0);
+    return in.color * vec4f(1.0, 1.0, 1.0, alpha);
+}
+
+@vertex
+fn vertexPoint(@builtin(vertex_index) id : u32) -> CircleVertexOut
+{
+    let particle = particles[id / 6u];
+    let offset = 2.0 * offsets[id % 6u] / camera.pixelsPerUnit;
+    let position = vec2f(particle.x, particle.y) + offset;
+    return CircleVertexOut(
+        vec4f((position - camera.center) / camera.extent, 0.0, 1.0),
+        offset,
+        species[u32(particle.species)].color
+    );
+}
+
+const PI = 3.1415926535;
+
+@fragment
+fn fragmentPoint(in : CircleVertexOut) -> @location(0) vec4f
+{
+    let d = max(vec2(0.0), min(in.offset * camera.pixelsPerUnit + 0.5, vec2(camera.pixelsPerUnit)) - max(in.offset * camera.pixelsPerUnit - 0.5, - vec2(camera.pixelsPerUnit)));
+    let alpha = (PI / 4.0) * d.x * d.y;
+    return vec4f(in.color.rgb, in.color.a * alpha);
+}
+`;
+
+const composeShader =
+`
+@group(0) @binding(0) var hdrTexture : texture_2d<f32>;
+@group(0) @binding(1) var blueNoiseTexture : texture_2d<f32>;
+
+const vertices = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0),
+);
+
+struct VertexOut
+{
+    @builtin(position) position : vec4f,
+    @location(0) texcoord : vec2f,
+}
+
+@vertex
+fn vertexMain(@builtin(vertex_index) id : u32) -> VertexOut
+{
+    let vertex = vertices[id];
+    return VertexOut(
+        vec4f(vertex, 0.0, 1.0),
+        vertex * 0.5 + vec2f(0.5)
+    );
+}
+
+fn acesTonemap(x : vec3f) -> vec3f
+{
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return clamp((x*(a*x+b))/(x*(c*x+d)+e), vec3f(0.0), vec3f(1.0));
+}
+
+fn maxTonemap(x : vec3f) -> vec3f
+{
+    let m = max(1.0, max(x.r, max(x.g, x.b)));
+    return x / m;
+}
+
+fn uncharted2TonemapImpl(x : vec3f) -> vec3f
+{
+    let A = 0.15;
+    let B = 0.50;
+    let C = 0.10;
+    let D = 0.20;
+    let E = 0.02;
+    let F = 0.30;
+
+    return ((x*(A*x+C*B)+D*E)/(x*(A*x+B)+D*F))-E/F;
+}
+
+fn uncharted2Tonemap(x : vec3f) -> vec3f
+{
+    let exposure = 5.0;
+    let white = 10.0;
+    return uncharted2TonemapImpl(x * exposure) / uncharted2TonemapImpl(vec3f(white));
+}
+
+fn agxTonemap(x : vec3f) -> vec3f
+{
+    const M1 = mat3x3f(0.842, 0.0423, 0.0424, 0.0784, 0.878, 0.0784, 0.0792, 0.0792, 0.879);
+    const M2 = mat3x3f(1.2, -0.053, -0.053, -0.1, 1.15, -0.1, -0.1, -0.1, 1.15);
+    const c1 = 12.47393;
+    const c2 = 16.5;
+
+    var result = x * 0.5;
+    result = M1 * result;
+    result = clamp((log2(result) + c1) / c2, vec3f(0.0), vec3f(1.0));
+    result = 0.5 + 0.5 * sin(((-3.11 * result + 6.42) * result - 0.378) * result - 1.44);
+    result = M2 * result;
+
+    return result;
+}
+
+fn dither(x : vec3f, n : f32) -> vec3f
+{
+    let c = x * 255.0;
+    let c0 = floor(c);
+    let c1 = c0 + vec3f(1.0);
+    let dc = c - c0;
+
+    var r = c0;
+    if (dc.r > n) { r.r = c1.r; }
+    if (dc.g > n) { r.g = c1.g; }
+    if (dc.b > n) { r.b = c1.b; }
+
+    return r / 255.0;
+}
+
+@fragment
+fn fragmentMain(in : VertexOut) -> @location(0) vec4f
+{
+    var sample = textureLoad(hdrTexture, vec2i(in.position.xy), 0); 
+    let noise = textureLoad(blueNoiseTexture, vec2u(in.position.xy) % textureDimensions(blueNoiseTexture), 0).r;
+
+    var color = sample.rgb;
+    color = acesTonemap(color);
+    color = pow(color, vec3f(1.0 / 2.2));
+    color = dither(color, noise);
+
+    return vec4f(color, 1.0);
+}
+`;
+
+let tooltipSimulation = null;
+let currentTooltipParams = null;
+
+// Global compose variables
+let blueNoiseTexture = null;
+let blueNoiseTextureView = null;
+let composeBindGroupLayout = null;
+let composeBindGroup = null;
+let composePipeline = null;
+
+// Image loading utility
+async function loadImage(url) {
+    const res = await fetch(url);
+    const blob = await res.blob();
+    return await createImageBitmap(blob, { colorSpaceConversion: 'none' });
+}
+
+// Random number generator
+function splitmix32(a) {
+    return function() {
+        a |= 0;
+        a = a + 0x9e3779b9 | 0;
+        let t = a ^ a >>> 16;
+        t = Math.imul(t, 0x21f0aaad);
+        t = t ^ t >>> 15;
+        t = Math.imul(t, 0x735a2d97);
+        return ((t = t ^ t >>> 15) >>> 0) / 4294967296;
+    }
+}
+
+function randomSeed() {
+    return (Math.random() * (2 ** 32)) >>> 0;
+}
+
+// Complete TooltipLeniaSimulation class
+class TooltipLeniaSimulation {
+  constructor(device) {
+    this.device = device;
+    this.running = false;
+    this.animationId = null;
+    this.initialized = false;
+    
+    // Simulation parameters
+    this.maxForceRadius = 32.0;
+    this.speciesCount = 3;
+    this.particleCount = 256;
+    this.kernelsCount = 1;
+    this.growthFuncsCount = 1;
+    this.simulationBox = [[-80, 80], [-80, 80]];
+    this.loopingBorders = false;
+    this.defineGrid();
+
+    // Camera
+    this.cameraCenter = [0.0, 0.0];
+    this.cameraExtentX = 80.0;
+    
+    // HDR format
+    this.hdrFormat = 'rgba16float';
+    this.surfaceFormat = navigator.gpu.getPreferredCanvasFormat();
+    
+    // Current system description
+    this.currentSystemDescription = null;
+    
+    // All buffers and resources will be initialized in initialize()
+    this.speciesBuffer = null;
+    this.params_k_Buffer = null;
+    this.params_g_Buffer = null;
+    this.c_rep_Buffer = null;
+    this.particleBuffer = null;
+    this.particleTempBuffer = null;
+    this.binOffsetBuffer = null;
+    this.binOffsetTempBuffer = null;
+    this.binPrefixSumStepSizeBuffer = null;
+    this.cameraBuffer = null;
+    this.simulationOptionsBuffer = null;
+    this.hdrTexture = null;
+    this.hdrTextureView = null;
+    
+    // Pipelines and bind groups
+    this.pipelines = {};
+    this.bindGroups = {};
+    this.bindGroupLayouts = {};
+  }
+
+  defineGrid() {
+    this.gridSize = [
+        Math.ceil((this.simulationBox[0][1] - this.simulationBox[0][0]) / this.maxForceRadius),
+        Math.ceil((this.simulationBox[1][1] - this.simulationBox[1][0]) / this.maxForceRadius)
+    ];
+    this.binCount = this.gridSize[0] * this.gridSize[1];
+    this.prefixSumIterations = Math.ceil(Math.ceil(Math.log2(this.binCount + 1)) / 2) * 2;
+  }
+  
+  async initialize(canvas) {
+    try {
+      await this.createBindGroupLayouts();
+      await this.createPipelines();
+      await this.createBuffers();
+      await this.createTextures(canvas);
+      await this.createBindGroups();
+      
+      // Initialize with a default system
+      await this.loadDefaultSystem();
+      
+      this.initialized = true;
+    } catch (error) {
+      console.error('Failed to initialize TooltipLeniaSimulation:', error);
+      throw error;
+    }
+  }
+  
+  async createBindGroupLayouts() {
+    this.bindGroupLayouts.particleBuffer = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'storage' },
+        },
+      ],
+    });
+
+    this.bindGroupLayouts.particleBufferReadOnly = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE,
+          buffer: { type: 'read-only-storage' },
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE,
+          buffer: { type: 'read-only-storage' },
+        },
+      ],
+    });
+
+    this.bindGroupLayouts.camera = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+          buffer: { type: 'uniform' },
+        },
+      ],
+    });
+
+    this.bindGroupLayouts.simulationOptions = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'uniform' },
+        },
+      ],
+    });
+
+    this.bindGroupLayouts.binFillSize = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'storage' },
+        },
+      ],
+    });
+
+    this.bindGroupLayouts.binPrefixSum = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'read-only-storage' },
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'storage' },
+        },
+        {
+          binding: 2,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'uniform', hasDynamicOffset: true },
+        },
+      ],
+    });
+
+    this.bindGroupLayouts.particleSort = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'read-only-storage' },
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'storage' },
+        },
+        {
+          binding: 2,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'read-only-storage' },
+        },
+        {
+          binding: 3,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'storage' },
+        },
+      ],
+    });
+
+    this.bindGroupLayouts.particleComputeForces = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'read-only-storage' },
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'storage' },
+        },
+        {
+          binding: 2,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'read-only-storage' },
+        },
+        {
+          binding: 3,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'read-only-storage' },
+        },
+        {
+          binding: 4,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'read-only-storage' },
+        },
+        {
+          binding: 5,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'read-only-storage' },
+        }
+      ],
+    });
+
+    this.bindGroupLayouts.compose = this.device.createBindGroupLayout({
+      entries: [
+            {
+                binding: 0,
+                visibility: GPUShaderStage.FRAGMENT,
+                texture: {},
+            },
+            {
+                binding: 1,
+                visibility: GPUShaderStage.FRAGMENT,
+                texture: {},
+            },
+        ],
+    });
+
+    this.bindGroupLayouts.compose = this.device.createBindGroupLayout({
+      entries: [
+            {
+                binding: 0,
+                visibility: GPUShaderStage.FRAGMENT,
+                texture: {},
+            },
+            {
+                binding: 1,
+                visibility: GPUShaderStage.FRAGMENT,
+                texture: {},
+            },
+        ],
+    });
+  }
+  
+  async createPipelines() {
+    const binFillSizeShaderModule = this.device.createShaderModule({
+      code: binFillSizeShader,
+    });
+
+    const binPrefixSumShaderModule = this.device.createShaderModule({
+      code: binPrefixSumShader,
+    });
+
+    const particleSortShaderModule = this.device.createShaderModule({
+      code: particleSortShader,
+    });
+
+    const particleComputeForcesShaderModule = this.device.createShaderModule({
+      code: particleComputeForcesShader,
+    });
+
+    const particleAdvanceShaderModule = this.device.createShaderModule({
+      code: particleAdvanceShader,
+    });
+
+    const particleRenderShaderModule = this.device.createShaderModule({
+      code: particleRenderShader,
+    });
+
+    const composeShaderModule = this.device.createShaderModule({
+      code: composeShader,
+    });
+
+    this.pipelines.binClearSize = this.device.createComputePipeline({
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [
+          this.bindGroupLayouts.particleBufferReadOnly,
+          this.bindGroupLayouts.simulationOptions,
+          this.bindGroupLayouts.binFillSize,
+        ],
+      }),
+      compute: {
+        module: binFillSizeShaderModule,
+        entryPoint: 'clearBinSize',
+      },
+    });
+
+    this.pipelines.binFillSize = this.device.createComputePipeline({
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [
+          this.bindGroupLayouts.particleBufferReadOnly,
+          this.bindGroupLayouts.simulationOptions,
+          this.bindGroupLayouts.binFillSize,
+        ],
+      }),
+      compute: {
+        module: binFillSizeShaderModule,
+        entryPoint: 'fillBinSize',
+      },
+    });
+
+    this.pipelines.binPrefixSum = this.device.createComputePipeline({
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [this.bindGroupLayouts.binPrefixSum],
+      }),
+      compute: {
+        module: binPrefixSumShaderModule,
+        entryPoint: 'prefixSumStep',
+      },
+    });
+
+    this.pipelines.particleSortClearSize = this.device.createComputePipeline({
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [
+          this.bindGroupLayouts.particleSort,
+          this.bindGroupLayouts.simulationOptions,
+        ],
+      }),
+      compute: {
+        module: particleSortShaderModule,
+        entryPoint: 'clearBinSize',
+      },
+    });
+
+    this.pipelines.particleSort = this.device.createComputePipeline({
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [
+          this.bindGroupLayouts.particleSort,
+          this.bindGroupLayouts.simulationOptions,
+        ],
+      }),
+      compute: {
+        module: particleSortShaderModule,
+        entryPoint: 'sortParticles',
+      },
+    });
+
+    this.pipelines.particleComputeForces = this.device.createComputePipeline({
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [
+          this.bindGroupLayouts.particleComputeForces,
+          this.bindGroupLayouts.simulationOptions,
+        ],
+      }),
+      compute: {
+        module: particleComputeForcesShaderModule,
+        entryPoint: 'computeForces',
+      },
+    });
+
+    this.pipelines.particleAdvance = this.device.createComputePipeline({
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [
+          this.bindGroupLayouts.particleBuffer,
+          this.bindGroupLayouts.simulationOptions,
+        ],
+      }),
+      compute: {
+        module: particleAdvanceShaderModule,
+        entryPoint: 'particleAdvance',
+      },
+    });
+
+    this.pipelines.particleRenderGlow = this.device.createRenderPipeline({
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [
+          this.bindGroupLayouts.particleBufferReadOnly,
+          this.bindGroupLayouts.camera,
+        ],
+      }),
+      vertex: {
+        module: particleRenderShaderModule,
+        entryPoint: 'vertexGlow',
+      },
+      primitive: {
+        topology: 'triangle-list',
+      },
+      fragment: {
+        module: particleRenderShaderModule,
+        entryPoint: 'fragmentGlow',
+        targets: [
+          {
+            format: this.hdrFormat,
+            blend: {
+              color: {
+                srcFactor: 'src-alpha',
+                dstFactor: 'one',
+              },
+              alpha: {
+                srcFactor: 'one',
+                dstFactor: 'one',
+              },
+            },
+          },
+        ],
+      }
+    });
+
+    this.pipelines.particleRender = this.device.createRenderPipeline({
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [
+          this.bindGroupLayouts.particleBufferReadOnly,
+          this.bindGroupLayouts.camera,
+        ],
+      }),
+      vertex: {
+        module: particleRenderShaderModule,
+        entryPoint: 'vertexCircle',
+      },
+      primitive: {
+        topology: 'triangle-list',
+      },
+      fragment: {
+        module: particleRenderShaderModule,
+        entryPoint: 'fragmentCircle',
+        targets: [
+          {
+            format: this.hdrFormat,
+            blend: {
+              color: {
+                srcFactor: 'src-alpha',
+                dstFactor: 'one',
+              },
+              alpha: {
+                srcFactor: 'one',
+                dstFactor: 'one',
+              },
+            },
+          },
+        ],
+      }
+    });
+
+    this.pipelines.particleRenderPoint = this.device.createRenderPipeline({
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [
+          this.bindGroupLayouts.particleBufferReadOnly,
+          this.bindGroupLayouts.camera,
+        ],
+      }),
+      vertex: {
+        module: particleRenderShaderModule,
+        entryPoint: 'vertexPoint',
+      },
+      primitive: {
+        topology: 'triangle-list',
+      },
+      fragment: {
+        module: particleRenderShaderModule,
+        entryPoint: 'fragmentPoint',
+        targets: [
+          {
+            format: this.hdrFormat,
+            blend: {
+              color: {
+                srcFactor: 'src-alpha',
+                dstFactor: 'one',
+              },
+              alpha: {
+                srcFactor: 'one',
+                dstFactor: 'one',
+              },
+            },
+          },
+        ],
+      }
+    });
+
+    this.pipelines.compose = this.device.createRenderPipeline({
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [
+          this.bindGroupLayouts.compose,
+        ],
+      }),
+      vertex: {
+        module: composeShaderModule,
+        entryPoint: 'vertexMain',
+      },
+      primitive: {
+        topology: 'triangle-list',
+      },
+      fragment: {
+        module: composeShaderModule,
+        entryPoint: 'fragmentMain',
+        targets: [
+          {
+            format: this.surfaceFormat,
+          },
+        ],
+      }
+    });
+  }
+  
+  async createBuffers() {
+    this.cameraBuffer = this.device.createBuffer({
+      size: 24,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM,
+    });
+
+    this.simulationOptionsBuffer = this.device.createBuffer({
+      size: 64,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM,
+    });
+  }
+  
+  async createTextures(canvas) {
+    this.hdrTexture = this.device.createTexture({
+      format: this.hdrFormat,
+      size: [canvas.width, canvas.height, 1],
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+
+    this.hdrTextureView = this.hdrTexture.createView({});
+
+    // Create blue noise texture for dithering
+    try {
+      const blueNoiseImage = await loadImage("/webgpu/blue-noise.png");
+      blueNoiseTexture = this.device.createTexture({
+        format: 'rgba8unorm-srgb',
+        size: [blueNoiseImage.width, blueNoiseImage.height],
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+      this.device.queue.copyExternalImageToTexture(
+        {source: blueNoiseImage},
+        {texture: blueNoiseTexture},
+        {width: blueNoiseImage.width, height: blueNoiseImage.height},
+      );
+      blueNoiseTextureView = blueNoiseTexture.createView({});
+    } catch (error) {
+      console.warn('Failed to load blue noise texture, using fallback:', error);
+      // Create a simple 1x1 texture as fallback
+      blueNoiseTexture = this.device.createTexture({
+        format: 'rgba8unorm-srgb',
+        size: [1, 1],
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      });
+      const fallbackData = new Uint8Array([128, 128, 128, 255]);
+      this.device.queue.writeTexture(
+        {texture: blueNoiseTexture},
+        fallbackData,
+        {bytesPerRow: 4},
+        {width: 1, height: 1}
+      );
+      blueNoiseTextureView = blueNoiseTexture.createView({});
+    }
+  }
+  
+  async createBindGroups() {
+    this.bindGroups.camera = this.device.createBindGroup({
+      layout: this.bindGroupLayouts.camera,
+      entries: [
+        {
+          binding: 0,
+          resource: { buffer: this.cameraBuffer },
+        },
+      ],
+    });
+
+    this.bindGroups.simulationOptions = this.device.createBindGroup({
+      layout: this.bindGroupLayouts.simulationOptions,
+      entries: [
+        {
+          binding: 0,
+          resource: { buffer: this.simulationOptionsBuffer },
+        },
+      ],
+    });
+
+    this.bindGroups.compose = this.device.createBindGroup({
+      layout: this.bindGroupLayouts.compose,
+      entries: [
+        {
+          binding: 0,
+          resource: this.hdrTextureView,
+        },
+        {
+          binding: 1,
+          resource: blueNoiseTextureView,
+        },
+      ],
+    });
+  }
+  
+  async loadDefaultSystem() {
+    const systemDescription = {
+      particleCount: 256,
+      species: new Array(3),
+      kernelsCount: 1,
+      growthFuncsCount: 1,
+      simulationSize: [80, 80],
+      loopingBorders: false,
+      seed: randomSeed(),
+    };
+    
+    await this.loadSystem(this.generateSystem(systemDescription));
+  }
+  
+  generateSystem(systemDescription) {
+    const speciesCount = systemDescription.species.length;
+    const kernelsCount = systemDescription.kernelsCount;
+    const growthFuncsCount = systemDescription.growthFuncsCount;
+    systemDescription.species = [];
+
+    const rng = splitmix32(systemDescription.seed);
+
+    for (var i = 0; i < speciesCount; ++i) {
+      const color = [
+        Math.pow(0.25 + rng() * 0.75, 2.2),
+        Math.pow(0.25 + rng() * 0.75, 2.2),
+        Math.pow(0.25 + rng() * 0.75, 2.2),
+        1.0,
+      ];
+
+      var mu_k = [];
+      var sigma_k = [];
+      var w_k = [];
+      var c_rep = [];
+      for (var j = 0; j < speciesCount; ++j) {
+        c_rep.push(1.0 + 1.0 * rng());
+        for (var k = 0; k < kernelsCount; ++k) {
+          mu_k.push(1.0 + 4.0 * rng());
+          sigma_k.push(0.2 + 1.3 * rng());
+          w_k.push(-0.1 + 0.2 * rng());
+        }
+      }
+
+      var mu_g = [];
+      var sigma_g = [];
+      for (var j = 0; j < growthFuncsCount; ++j) {
+        mu_g.push(-2.0 + 4.0 * rng());
+        sigma_g.push(0.8 + 0.2 * rng());
+      }
+
+      systemDescription.species.push({
+        color: color,
+        mu_k: mu_k,
+        sigma_k: sigma_k,
+        w_k: w_k,
+        mu_g: mu_g,
+        sigma_g: sigma_g,
+        c_rep: c_rep,
+        spawnWeight: rng(),
+      });
+    }
+
+    return systemDescription;
+  }
+  
+  async loadSystem(systemDescription) {
+    this.currentSystemDescription = systemDescription;
+
+    this.particleCount = systemDescription.particleCount;
+    this.speciesCount = systemDescription.species.length;
+    this.kernelsCount = systemDescription.kernelsCount;
+    this.growthFuncsCount = systemDescription.growthFuncsCount;
+    this.loopingBorders = systemDescription.loopingBorders || false;
+    
+    const W = systemDescription.simulationSize[0];
+    const H = systemDescription.simulationSize[1];
+
+    this.simulationBox = [[-W, W], [-H, H]];
+
+    // Update camera extent to match simulation size with some padding
+    this.cameraExtentX = W * 1.1;  // 10% padding
+
+    this.defineGrid();
+
+    // Clean up old buffers
+    this.cleanupSystemBuffers();
+
+    // Create species buffer
+    const species = new Float32Array(this.speciesCount * 4);
+    for (var i = 0; i < this.speciesCount; ++i) {
+      species[4 * i + 0] = systemDescription.species[i].color[0];
+      species[4 * i + 1] = systemDescription.species[i].color[1];
+      species[4 * i + 2] = systemDescription.species[i].color[2];
+      species[4 * i + 3] = 1.0;
+    }
+
+    this.speciesBuffer = this.device.createBuffer({
+      size: this.speciesCount * 16,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
+    });
+    
+    this.device.queue.writeBuffer(this.speciesBuffer, 0, species);
+
+    // Create parameter buffers
+    this.params_k_Buffer = this.device.createBuffer({
+      size: this.speciesCount * this.speciesCount * this.kernelsCount * 3 * 4,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
+    });
+
+    this.params_g_Buffer = this.device.createBuffer({
+      size: this.speciesCount * this.growthFuncsCount * 2 * 4,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
+    });
+
+    this.c_rep_Buffer = this.device.createBuffer({
+      size: this.speciesCount * this.speciesCount * 4,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
+    });
+
+    this.reloadParameters(systemDescription);
+
+    // Create particle buffers
+    const initialParticles = new Float32Array(this.particleCount * 3);
+
+    for (var i = 0; i < this.speciesCount; ++i) {
+      if (systemDescription.species[i].spawnWeight == undefined) {
+        systemDescription.species[i].spawnWeight = 1.0;
+      }
+    }
+
+    var speciesWeightSum = 0.0;
+    for (var i = 0; i < this.speciesCount; ++i) {
+      speciesWeightSum += systemDescription.species[i].spawnWeight;
+    }
+
+    for (var i = 0; i < this.particleCount; ++i) {
+      var speciesPick = Math.random() * speciesWeightSum;
+
+      var speciesId = this.speciesCount - 1;
+      for (var j = 0; j < this.speciesCount; ++j) {
+        if (speciesPick < systemDescription.species[j].spawnWeight) {
+          speciesId = j;
+          break;
+        }
+        speciesPick -= systemDescription.species[j].spawnWeight;
+      }
+
+      initialParticles[3 * i + 0] = this.simulationBox[0][0] + Math.random() * (this.simulationBox[0][1] - this.simulationBox[0][0]);
+      initialParticles[3 * i + 1] = this.simulationBox[1][0] + Math.random() * (this.simulationBox[1][1] - this.simulationBox[1][0]);
+      initialParticles[3 * i + 2] = speciesId;
+    }
+
+    this.particleBuffer = this.device.createBuffer({
+      size: this.particleCount * 3 * 4,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC | GPUBufferUsage.STORAGE,
+    });
+
+    this.device.queue.writeBuffer(this.particleBuffer, 0, initialParticles);
+
+    this.particleTempBuffer = this.device.createBuffer({
+      size: this.particleBuffer.size,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    this.binOffsetBuffer = this.device.createBuffer({
+      size: (this.binCount + 1) * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+
+    this.binOffsetTempBuffer = this.device.createBuffer({
+      size: (this.binCount + 1) * 4,
+      usage: GPUBufferUsage.STORAGE,
+    });
+
+    const binPrefixSumStepSize = new Uint32Array(this.prefixSumIterations * 64);
+    for (var i = 0; i < this.prefixSumIterations; ++i) {
+      binPrefixSumStepSize[i * 64] = Math.pow(2, i);
+    }
+
+    this.binPrefixSumStepSizeBuffer = this.device.createBuffer({
+      size: this.prefixSumIterations * 256,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM,
+    });
+
+    this.device.queue.writeBuffer(this.binPrefixSumStepSizeBuffer, 0, binPrefixSumStepSize);
+
+    // Create bind groups for this system
+    await this.createSystemBindGroups();
+  }
+  
+  async createSystemBindGroups() {
+    this.bindGroups.particleBuffer = this.device.createBindGroup({
+      layout: this.bindGroupLayouts.particleBuffer,
+      entries: [
+        {
+          binding: 0,
+          resource: { buffer: this.particleBuffer },
+        }
+      ],
+    });
+
+    this.bindGroups.particleBufferReadOnly = this.device.createBindGroup({
+      layout: this.bindGroupLayouts.particleBufferReadOnly,
+      entries: [
+        {
+          binding: 0,
+          resource: { buffer: this.particleBuffer },
+        },
+        {
+          binding: 1,
+          resource: { buffer: this.speciesBuffer },
+        },
+      ],
+    });
+
+    this.bindGroups.binFillSize = this.device.createBindGroup({
+      layout: this.bindGroupLayouts.binFillSize,
+      entries: [
+        {
+          binding: 0,
+          resource: { buffer: this.binOffsetBuffer },
+        },
+      ],
+    });
+
+    this.bindGroups.binPrefixSum = [
+      this.device.createBindGroup({
+        layout: this.bindGroupLayouts.binPrefixSum,
+        entries: [
+          {
+            binding: 0,
+            resource: { buffer: this.binOffsetBuffer },
+          },
+          {
+            binding: 1,
+            resource: { buffer: this.binOffsetTempBuffer },
+          },
+          {
+            binding: 2,
+            resource: { buffer: this.binPrefixSumStepSizeBuffer, size: 4 },
+          },
+        ],
+      }),
+      this.device.createBindGroup({
+        layout: this.bindGroupLayouts.binPrefixSum,
+        entries: [
+          {
+            binding: 0,
+            resource: { buffer: this.binOffsetTempBuffer },
+          },
+          {
+            binding: 1,
+            resource: { buffer: this.binOffsetBuffer },
+          },
+          {
+            binding: 2,
+            resource: { buffer: this.binPrefixSumStepSizeBuffer, size: 4 },
+          },
+        ],
+      })
+    ];
+
+    this.bindGroups.particleSort = this.device.createBindGroup({
+      layout: this.bindGroupLayouts.particleSort,
+      entries: [
+        {
+          binding: 0,
+          resource: { buffer: this.particleBuffer },
+        },
+        {
+          binding: 1,
+          resource: { buffer: this.particleTempBuffer },
+        },
+        {
+          binding: 2,
+          resource: { buffer: this.binOffsetBuffer },
+        },
+        {
+          binding: 3,
+          resource: { buffer: this.binOffsetTempBuffer },
+        },
+      ],
+    });
+
+    this.bindGroups.particleComputeForces = this.device.createBindGroup({
+      layout: this.bindGroupLayouts.particleComputeForces,
+      entries: [
+        {
+          binding: 0,
+          resource: { buffer: this.particleTempBuffer },
+        },
+        {
+          binding: 1,
+          resource: { buffer: this.particleBuffer },
+        },
+        {
+          binding: 2,
+          resource: { buffer: this.binOffsetBuffer },
+        },
+        {
+          binding: 3,
+          resource: { buffer: this.params_k_Buffer },
+        },
+        {
+          binding: 4,
+          resource: { buffer: this.params_g_Buffer },
+        },
+        {
+          binding: 5,
+          resource: { buffer: this.c_rep_Buffer },
+        }
+      ],
+    });
+  }
+  
+  reloadParameters(systemDescription) {
+    const speciesCount = systemDescription.species.length;
+    const kernelsCount = systemDescription.kernelsCount;
+    const growthFuncsCount = systemDescription.growthFuncsCount;
+    const params_k = new Float32Array(speciesCount * speciesCount * kernelsCount * 3);
+    const params_g = new Float32Array(speciesCount * growthFuncsCount * 2);
+    const c_rep = new Float32Array(speciesCount * speciesCount);
+    
+    for (var i = 0; i < speciesCount; ++i) {
+      for (var j = 0; j < speciesCount; ++j) {
+        c_rep[i * speciesCount + j] = systemDescription.species[i].c_rep[j];
+        for (var k = 0; k < kernelsCount; ++k) {
+          params_k[i * speciesCount * kernelsCount * 3 + j * kernelsCount * 3 + k] = systemDescription.species[i].mu_k[j * kernelsCount + k];
+          params_k[i * speciesCount * kernelsCount * 3 + j * kernelsCount * 3 + k + 1] = systemDescription.species[i].sigma_k[j * kernelsCount + k];
+          params_k[i * speciesCount * kernelsCount * 3 + j * kernelsCount * 3 + k + 2] = systemDescription.species[i].w_k[j * kernelsCount + k];
+        }
+      }
+      for (var k = 0; k < growthFuncsCount; ++k) {
+        params_g[i * growthFuncsCount * 2 + k] = systemDescription.species[i].mu_g[k];
+        params_g[i * growthFuncsCount * 2 + k + 1] = systemDescription.species[i].sigma_g[k];
+      }
+    }
+    
+    this.device.queue.writeBuffer(this.params_k_Buffer, 0, params_k);
+    this.device.queue.writeBuffer(this.params_g_Buffer, 0, params_g);
+    this.device.queue.writeBuffer(this.c_rep_Buffer, 0, c_rep);
+  }
+  
+  cleanupSystemBuffers() {
+    if (this.speciesBuffer) this.speciesBuffer.destroy();
+    if (this.params_k_Buffer) this.params_k_Buffer.destroy();
+    if (this.params_g_Buffer) this.params_g_Buffer.destroy();
+    if (this.c_rep_Buffer) this.c_rep_Buffer.destroy();
+    if (this.particleBuffer) this.particleBuffer.destroy();
+    if (this.particleTempBuffer) this.particleTempBuffer.destroy();
+    if (this.binOffsetBuffer) this.binOffsetBuffer.destroy();
+    if (this.binOffsetTempBuffer) this.binOffsetTempBuffer.destroy();
+    if (this.binPrefixSumStepSizeBuffer) this.binPrefixSumStepSizeBuffer.destroy();
+  }
+  
+  async updateParameters(params) {
+    if (!this.initialized) return;
+    
+    if (params.params) {
+      // Use actual parameters from the data
+      const actualParams = params.params;
+      const systemDescription = {
+        particleCount: params.particleCount || 256,
+        species: [],
+        kernelsCount: params.kernelsCount || 1,
+        growthFuncsCount: params.growthFuncsCount || 1,
+        simulationSize: [params.mapSize || 80, params.mapSize || 80],
+        loopingBorders: false,
+      };
+      
+      // Convert the actual parameters to the expected format
+      for (let i = 0; i < params.speciesCount; i++) {
+        const species = {
+          color: [
+            Math.pow(0.25 + Math.random() * 0.75, 2.2),
+            Math.pow(0.25 + Math.random() * 0.75, 2.2),
+            Math.pow(0.25 + Math.random() * 0.75, 2.2),
+            1.0,
+          ],
+          mu_k: actualParams.mu_k[i] ? actualParams.mu_k[i].flat() : [],
+          sigma_k: actualParams.sigma_k[i] ? actualParams.sigma_k[i].flat() : [],
+          w_k: actualParams.w_k[i] ? actualParams.w_k[i].flat() : [],
+          mu_g: actualParams.mu_g[i] || [],
+          sigma_g: actualParams.sigma_g[i] || [],
+          c_rep: actualParams.c_rep[i] || [],
+          spawnWeight: 1.0,
+        };
+        systemDescription.species.push(species);
+      }
+      
+      await this.loadSystem(systemDescription);
+    } else {
+      // Fallback to generating random parameters
+      const systemDescription = {
+        particleCount: params.particleCount || 256,
+        species: new Array(params.speciesCount || 3),
+        kernelsCount: params.kernelsCount || 1,
+        growthFuncsCount: params.growthFuncsCount || 1,
+        simulationSize: [80, 80],
+        loopingBorders: false,
+        seed: randomSeed(),
+      };
+      
+      await this.loadSystem(this.generateSystem(systemDescription));
+    }
+  }
+  
+  resume(context, canvas) {
+    if (this.running) return;
+    
+    this.running = true;
+    const animate = () => {
+      if (!this.running) return;
+      
+      this.stepAndRender(context, canvas);
+      this.animationId = requestAnimationFrame(animate);
+    };
+    animate();
+  }
+  
+  pause() {
+    this.running = false;
+    if (this.animationId) {
+      cancelAnimationFrame(this.animationId);
+      this.animationId = null;
+    }
+  }
+  
+  stepAndRender(context, canvas) {
+    if (!this.initialized) return;
+
+    const aspectRatio = canvas.width / canvas.height;
+    this.cameraExtentY = this.cameraExtentX / aspectRatio;
+    const pixelsPerUnit = canvas.width / (2.0 * this.cameraExtentX);
+
+    const simDt = 0.1;
+    const actionX = 0.0;
+    const actionY = 0.0;
+    const actionVX = 0.0;
+    const actionVY = 0.0;
+    const actionForce = 0.0;
+    const actionRadius = this.cameraExtentX / 16.0;
+
+    this.device.queue.writeBuffer(this.simulationOptionsBuffer, 0, new Float32Array([
+      this.simulationBox[0][0], this.simulationBox[0][1], 
+      this.simulationBox[1][0], this.simulationBox[1][1], 
+      simDt, this.maxForceRadius, this.speciesCount, this.kernelsCount, this.growthFuncsCount, 
+      this.loopingBorders ? 1.0 : 0.0, actionX, actionY, actionVX, actionVY, actionForce, actionRadius
+    ]));
+    
+    this.device.queue.writeBuffer(this.cameraBuffer, 0, new Float32Array([
+      this.cameraCenter[0], this.cameraCenter[1], this.cameraExtentX, this.cameraExtentY, pixelsPerUnit
+    ]));
+
+    const encoder = this.device.createCommandEncoder({});
+
+    // Copy particles for processing
+    encoder.copyBufferToBuffer(this.particleBuffer, 0, this.particleTempBuffer, 0, this.particleBuffer.size);
+
+    // Binning compute pass
+    const binningComputePass = encoder.beginComputePass({});
+
+    binningComputePass.setBindGroup(0, this.bindGroups.particleBufferReadOnly);
+    binningComputePass.setBindGroup(1, this.bindGroups.simulationOptions);
+    binningComputePass.setBindGroup(2, this.bindGroups.binFillSize);
+    binningComputePass.setPipeline(this.pipelines.binClearSize);
+    binningComputePass.dispatchWorkgroups(Math.ceil((this.binCount + 1) / 64));
+    binningComputePass.setPipeline(this.pipelines.binFillSize);
+    binningComputePass.dispatchWorkgroups(Math.ceil(this.particleCount / 64));
+
+    binningComputePass.setPipeline(this.pipelines.binPrefixSum);
+    for (var i = 0; i < this.prefixSumIterations; ++i) {
+      binningComputePass.setBindGroup(0, this.bindGroups.binPrefixSum[i % 2], [i * 256]);
+      binningComputePass.dispatchWorkgroups(Math.ceil((this.binCount + 1) / 64));
+    }
+
+    binningComputePass.setBindGroup(0, this.bindGroups.particleSort);
+    binningComputePass.setPipeline(this.pipelines.particleSortClearSize);
+    binningComputePass.dispatchWorkgroups(Math.ceil((this.binCount + 1) / 64));
+    binningComputePass.setPipeline(this.pipelines.particleSort);
+    binningComputePass.dispatchWorkgroups(Math.ceil(this.particleCount / 64));
+
+    binningComputePass.end();
+
+    // Forces compute pass
+    const forcesComputePass = encoder.beginComputePass({});
+
+    forcesComputePass.setBindGroup(0, this.bindGroups.particleComputeForces);
+    forcesComputePass.setBindGroup(1, this.bindGroups.simulationOptions);
+    forcesComputePass.setPipeline(this.pipelines.particleComputeForces);
+    forcesComputePass.dispatchWorkgroups(Math.ceil(this.particleCount / 64));
+
+    forcesComputePass.end();
+
+    // Advance compute pass
+    const advanceComputePass = encoder.beginComputePass({});
+
+    advanceComputePass.setBindGroup(0, this.bindGroups.particleBuffer);
+    advanceComputePass.setBindGroup(1, this.bindGroups.simulationOptions);
+    advanceComputePass.setPipeline(this.pipelines.particleAdvance);
+    advanceComputePass.dispatchWorkgroups(Math.ceil(this.particleCount / 64));
+
+    advanceComputePass.end();
+
+    // Render pass
+    const hdrRenderPass = encoder.beginRenderPass({
+      colorAttachments: [
+        {
+          view: this.hdrTextureView,
+          clearValue: [0.001, 0.001, 0.001, 0.0],
+          loadOp: 'clear',
+          storeOp: 'store',
+        },
+      ],
+    });
+    
+    hdrRenderPass.setBindGroup(0, this.bindGroups.particleBufferReadOnly);
+    hdrRenderPass.setBindGroup(1, this.bindGroups.camera);
+    hdrRenderPass.setPipeline(this.pipelines.particleRenderGlow);
+    hdrRenderPass.draw(this.particleCount * 6);
+    
+    if (pixelsPerUnit < 1.0) {
+      hdrRenderPass.setPipeline(this.pipelines.particleRenderPoint);
+      hdrRenderPass.draw(this.particleCount * 6);
+    } else {
+      hdrRenderPass.setPipeline(this.pipelines.particleRender);
+      hdrRenderPass.draw(this.particleCount * 6);
+    }
+    hdrRenderPass.end();
+
+    const composeRenderPass = encoder.beginRenderPass({
+        colorAttachments: [
+            {
+                view: context.getCurrentTexture().createView(),
+                clearValue: [0, 0, 0, 0],
+                loadOp: 'clear',
+                storeOp: 'store',
+            },
+        ],
+    });
+    composeRenderPass.setBindGroup(0, this.bindGroups.compose);
+    composeRenderPass.setPipeline(this.pipelines.compose);
+    composeRenderPass.draw(3);
+    composeRenderPass.end();
+
+    const commandBuffer = encoder.finish();
+    this.device.queue.submit([commandBuffer]);
+  }
+}
+
+// Initialize the global tooltip simulation once
+async function initializeGlobalTooltipSimulation() {
+  if (tooltipSimulation) return tooltipSimulation;
+  
+  try {
+    const adapter = await navigator.gpu?.requestAdapter();
+    const device = await adapter?.requestDevice();
+    
+    if (!device) {
+      throw new Error('WebGPU not supported');
+    }
+
+    // Initialize your WebGPU simulation (adapted from your code)
+    tooltipSimulation = new TooltipLeniaSimulation(device);
+    
+    return tooltipSimulation;
+  } catch (error) {
+    console.error('Failed to initialize global tooltip simulation:', error);
+    return null;
+  }
+}
+
+
+async function updateTooltipSimulation(params, tooltipId) {
+  // Initialize global simulation if needed
+  if (!tooltipSimulation) {
+    await initializeGlobalTooltipSimulation();
+  }
+  
+  if (!tooltipSimulation) {
+    console.error('Failed to initialize simulation');
+    return;
+  }
+  
+  const tooltipElement = document.getElementById(tooltipId);
+  const targetCanvas = document.getElementById(`tooltip-canvas-${tooltipId}`);
+  const loadingElement = document.getElementById(`loading-${tooltipId}`);
+  
+  if (!tooltipElement || !targetCanvas) return;
+  
+  try {
+    // Always pause any running simulation first to prevent conflicts
+    tooltipSimulation.pause();
+
+    const context = targetCanvas.getContext('webgpu');
+    const surfaceFormat = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({ device: tooltipSimulation.device, format: surfaceFormat });
+
+    // Always reinitialize for each new canvas to avoid context sharing issues
+    if (!tooltipSimulation.initialized || tooltipSimulation.lastCanvasId !== tooltipId) {
+      tooltipSimulation.lastCanvasId = tooltipId;
+      await tooltipSimulation.initialize(targetCanvas);
+    } else {
+      // If canvas dimensions changed, recreate textures
+      if (tooltipSimulation.hdrTexture && 
+          (tooltipSimulation.hdrTexture.width !== targetCanvas.width || 
+           tooltipSimulation.hdrTexture.height !== targetCanvas.height)) {
+        await tooltipSimulation.createTextures(targetCanvas);
+        await tooltipSimulation.createBindGroups();
+      }
+    }
+
+    // Check if we need to update parameters
+    if (!paramsEqual(currentTooltipParams, params)) {
+      loadingElement.style.display = 'flex';
+      
+      // Update simulation with new parameters
+      await tooltipSimulation.updateParameters(params);
+      currentTooltipParams = { ...params };
+    }
+
+    // Start/resume simulation with clean state
+    tooltipSimulation.resume(context, targetCanvas);
+    
+    loadingElement.style.display = 'none';
+    
+  } catch (error) {
+    console.error('Error updating tooltip simulation:', error);
+    loadingElement.innerHTML = '<div style="color: #ff6666;">Simulation Error</div>';
+  }
+}
+
+function paramsEqual(a, b) {
+  if (!a || !b) return false;
+  return a.speciesCount === b.speciesCount &&
+         a.particleCount === b.particleCount &&
+         a.kernelsCount === b.kernelsCount &&
+         a.growthFuncsCount === b.growthFuncsCount &&
+         a.mapSize === b.mapSize &&
+         JSON.stringify(a.params) === JSON.stringify(b.params);
+}

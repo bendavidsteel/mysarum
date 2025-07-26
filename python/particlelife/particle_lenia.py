@@ -293,7 +293,7 @@ def draw_multi_species_particles(trajectory, map_size, species=None, num_species
     return _draw_particles(trajectory, map_size, particle_colors, start=start, offset=offset)
 
 def draw_particles(trajectory, map_size, start=-16000, offset=2000):
-    particle_colors = jp.zeros((trajectory.shape[1], 3))
+    particle_colors = jp.ones((trajectory.shape[1], 3))
     return _draw_particles(trajectory, map_size, particle_colors, start=start, offset=offset)
 
 def _draw_particles(trajectory, map_size, particle_colors, start=-16000, offset=2000):
@@ -327,9 +327,9 @@ def _draw_particles(trajectory, map_size, particle_colors, start=-16000, offset=
         scaled_pos = (positions / map_size) * img_size
         scaled_pos = jp.clip(scaled_pos, 0, img_size - 1)
         
-        # Start with a white background
-        image = jp.ones((img_size, img_size, 3))
-        
+        # Start with a black background
+        image = jp.zeros((img_size, img_size, 3))
+
         # Create a grid of coordinates
         x_indices = jp.arange(img_size)
         y_indices = jp.arange(img_size)
@@ -418,7 +418,7 @@ def draw_particles_3d_views(trajectory, map_size, particle_colors, img_size=800,
         scaled_pos = (positions / map_size) * img_size
         scaled_pos = jp.clip(scaled_pos, 0, img_size - 1)
         
-        # Start with a white background
+        # Start with a black background
         image = jp.zeros((img_size, img_size, 3))
         
         # Create a grid of coordinates

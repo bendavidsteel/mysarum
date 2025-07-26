@@ -68,7 +68,7 @@ def generate_lenia_video(key, num_particles, map_size, num_species, num_kernels,
     max_force = jp.max(jp.linalg.norm(force, axis=-1))
     # draw trajectory
 
-    video = draw_multi_species_particles(trajectory, map_size, species, num_species, start=-3000, offset=1000)
+    video = draw_particles(trajectory, map_size, start=-3000, offset=1000)
     return params, video, max_force
 
 def main():
@@ -141,7 +141,7 @@ def main():
         img_features = embeddr.get_embeddings(np_images)
 
         batch_params.extend(all_params)
-        batch_img_features.extend([img_features[i*videos[0].shape[0]:i*videos[0].shape[0]+videos[0].shape[0]] for i in range(batch_size)])
+        batch_img_features.extend([img_features[i*videos[0].shape[0]:i*videos[0].shape[0]+videos[0].shape[0]] for i in range(len(all_params))])
         batch_max_force.extend(max_force.tolist())
 
         pbar.update(1)
@@ -160,9 +160,9 @@ def main():
                 batch_img_features = []
                 batch_max_force = []
 
-        if len(df) % (10 * batch_size) == 0:
+        if len(df) % (4 * batch_size) == 0:
             df.write_parquet(embed_path)
-        if len(df) % (100 * batch_size) == 0:
+        if len(df) % (10 * batch_size) == 0:
             df.write_parquet(embed_backup_path)
 
 if __name__ == '__main__':

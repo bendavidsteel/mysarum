@@ -16,7 +16,7 @@ import torch
 from tqdm import tqdm
 import transformers
 
-from particle_lenia import step_f, Params, multi_step_scan_with_force, draw_particles, draw_multi_species_particles
+from particle_lenia import step_f, Params, multi_step_scan_with_force_and_energy, draw_particles, draw_multi_species_particles
 
 class Embedder:
     def __init__(self):
@@ -30,13 +30,11 @@ class Embedder:
 
 def to_storable(n_t):
     d = n_t._asdict()
-    d = [{k: np.array(v[i]).tolist() for k, v in d.items()} for i in range(n_t.map_size.shape[0])]
+    d = [{k: np.array(v[i]).tolist() for k, v in d.items()} for i in range(n_t.c_rep.shape[0])]
     return d
 
-@functools.partial(jax.jit, static_argnames=('num_particles', 'map_size', 'num_species', 'num_kernels', 'num_growth_funcs'))
-def generate_lenia_video(key, num_particles, map_size, num_species, num_kernels, num_growth_funcs):
-    # Initial parameters
-    
+@functools.partial(jax.jit, static_argnames=('num_species', 'num_kernels', 'num_growth_funcs'))
+def generate_params(key, num_species, num_kernels, num_growth_funcs):
     key, *subkeys = jax.random.split(key, 12)
     mu_k = jax.random.uniform(subkeys[0], (num_species, num_species, num_kernels), minval=1.0, maxval=5.0)
     sigma_k = jax.random.uniform(subkeys[1], (num_species, num_species, num_kernels), minval=0.5, maxval=3.0)
@@ -47,29 +45,45 @@ def generate_lenia_video(key, num_particles, map_size, num_species, num_kernels,
     w_k = jax.random.uniform(subkeys[6], (num_species, num_species, num_kernels), minval=-0.05, maxval=0.05)
     c_rep = jax.random.uniform(subkeys[7], (num_species, num_species), minval=0.5, maxval=3.0)
 
-    dt = 0.1
-    
     params = Params(
         mu_k=mu_k, 
         sigma_k=sigma_k, 
         w_k=w_k, 
         mu_g=mu_g, 
         sigma_g=sigma_g, 
-        c_rep=c_rep,
-        map_size=map_size
+        c_rep=c_rep
     )
+    return params
+
+@functools.partial(jax.jit, static_argnames=('num_particles', 'map_size', 'num_species', 'num_kernels', 'num_growth_funcs'))
+def generate_lenia_video(key, num_particles, map_size, num_species, num_kernels, num_growth_funcs):
+    # Initial parameters
     
+    dt = 0.1
+
+    params = generate_params(key, num_species, num_kernels, num_growth_funcs)
+
     num_dims = 2
     key, *subkeys = jax.random.split(key, 3)
     x = jax.random.uniform(subkeys[0], [num_particles, num_dims], minval=0, maxval=map_size)
     species = jax.random.randint(subkeys[1], [num_particles], 0, num_species)
 
-    carry, (trajectory, force) = multi_step_scan_with_force(params, x, species, dt, 20000)
+    carry, (trajectory, force, energy) = multi_step_scan_with_force_and_energy(params, x, species, dt, 20000, map_size)
     max_force = jp.max(jp.linalg.norm(force, axis=-1))
+    median_force = jp.median(jp.linalg.norm(force, axis=-1))
+
+    freq_ps = jp.abs(jp.fft.rfft(energy, axis=0))
+    freqs = jp.fft.rfftfreq(energy.shape[0], d=dt)
+    freq_idx = jp.argmax(freq_ps, axis=0)
+    freq = freqs[freq_idx]
+    freq_p = freq_ps[freq_idx]
+    median_freq = jp.median(freq)
+    median_freq_power = jp.median(freq_p)
+
     # draw trajectory
 
-    video = draw_particles(trajectory, map_size, start=-3000, offset=1000)
-    return params, video, max_force
+    video = draw_particles(trajectory, map_size, start=-3000, offset=1000, bloom=True)
+    return params, video, max_force, median_force, median_freq, median_freq_power
 
 def main():
     write_video = False
@@ -78,9 +92,12 @@ def main():
     
     batch_params = []
     batch_max_force = []
+    batch_median_force = []
+    batch_median_freq = []
+    batch_median_freq_power = []
     batch_img_features = []
-    embed_path = './data/particle_lenia_clip_embeddings.parquet.zstd'
-    embed_backup_path = './data/particle_lenia_clip_embeddings_backup.parquet.zstd'
+    embed_path = './data/particle_lenia_clip_embeddings1.parquet.zstd'
+    embed_backup_path = './data/particle_lenia_clip_embeddings1_backup.parquet.zstd'
     if not os.path.exists(embed_path):
         df = pl.DataFrame()
     else:
@@ -91,7 +108,8 @@ def main():
     pbar = tqdm()
 
     df_max_force = 20.0
-    df = df.filter(pl.col('max_force') < df_max_force)
+    if 'max_force' in df.columns:
+        df = df.filter(pl.col('max_force') < df_max_force)
 
     key = jax.random.PRNGKey(len(df))
 
@@ -105,12 +123,17 @@ def main():
         num_particles = int(jax.random.choice(subkeys[3], jp.array([100, 200, 400]), ()))
         map_size = 20
 
-        all_params, videos, max_force = jax.vmap(generate_lenia_video, in_axes=(0, None, None, None, None, None))(jax.random.split(key, batch_size), num_particles, map_size, num_species, num_kernels, num_growth_funcs)
+        key, *subkeys = jax.random.split(key, batch_size + 1)
+
+        all_params, videos, max_force, median_force, median_freq, median_freq_power = jax.vmap(generate_lenia_video, in_axes=(0, None, None, None, None, None))(jp.array(subkeys), num_particles, map_size, num_species, num_kernels, num_growth_funcs)
 
         all_params = to_storable(all_params)
         all_params = [all_params[i] for i in range(batch_size) if max_force[i] < df_max_force]
         videos = videos[max_force < df_max_force]
         max_force = max_force[max_force < df_max_force]
+        median_force = median_force[median_force < df_max_force]
+        median_freq = median_freq[median_freq < df_max_force]
+        median_freq_power = median_freq_power[median_freq_power < df_max_force]
 
         if len(all_params) == 0:
             continue
@@ -143,6 +166,9 @@ def main():
         batch_params.extend(all_params)
         batch_img_features.extend([img_features[i*videos[0].shape[0]:i*videos[0].shape[0]+videos[0].shape[0]] for i in range(len(all_params))])
         batch_max_force.extend(max_force.tolist())
+        batch_median_force.extend(median_force.tolist())
+        batch_median_freq.extend(median_freq.tolist())
+        batch_median_freq_power.extend(median_freq_power.tolist())
 
         pbar.update(1)
 
@@ -151,7 +177,10 @@ def main():
                 'params': batch_params, 
                 'img_features': batch_img_features,
                 'num_particles': [num_particles] * len(batch_params),
-                'max_force': batch_max_force
+                'max_force': batch_max_force,
+                'median_force': batch_median_force,
+                'median_freq': batch_median_freq,
+                'median_freq_power': batch_median_freq_power
             }, schema_overrides={'img_features': pl.Array(pl.Float32, (3, 512))})
             new_df = new_df.filter(pl.col('max_force') < df_max_force)
             if len(new_df) > 0:
@@ -159,6 +188,9 @@ def main():
                 batch_params = []
                 batch_img_features = []
                 batch_max_force = []
+                batch_median_force = []
+                batch_median_freq = []
+                batch_median_freq_power = []
 
         if len(df) % (4 * batch_size) == 0:
             df.write_parquet(embed_path)

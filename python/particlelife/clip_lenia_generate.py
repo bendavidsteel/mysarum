@@ -164,7 +164,7 @@ def main():
         img_features = embeddr.get_embeddings(np_images)
 
         batch_params.extend(all_params)
-        batch_img_features.extend([img_features[i*videos[0].shape[0]:i*videos[0].shape[0]+videos[0].shape[0]] for i in range(batch_size)])
+        batch_img_features.extend([img_features[i*videos[0].shape[0]:i*videos[0].shape[0]+videos[0].shape[0]] for i in range(len(all_params))])
         batch_max_force.extend(max_force.tolist())
         batch_median_force.extend(median_force.tolist())
         batch_median_freq.extend(median_freq.tolist())
@@ -192,9 +192,9 @@ def main():
                 batch_median_freq = []
                 batch_median_freq_power = []
 
-        if len(df) % (10 * batch_size) == 0:
+        if len(df) % (4 * batch_size) == 0:
             df.write_parquet(embed_path)
-        if len(df) % (100 * batch_size) == 0:
+        if len(df) % (10 * batch_size) == 0:
             df.write_parquet(embed_backup_path)
 
 if __name__ == '__main__':

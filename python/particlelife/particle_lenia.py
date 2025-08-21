@@ -4,6 +4,8 @@ import functools
 import einops
 import jax
 import jax.numpy as jp
+import colorcet as cc
+import matplotlib.colors as mcolors
 
 # Define namedtuples for parameters and fields
 Params = collections.namedtuple('Params', 'mu_k sigma_k w_k mu_g sigma_g c_rep')
@@ -462,8 +464,6 @@ def _draw_particles(trajectory, map_size, particle_colors, start=-16000, offset=
     
     # Subsample frames - keep 1 in 20
     subsampled_trajectory = trajectory[start::offset]
-    num_frames = subsampled_trajectory.shape[0]
-    num_particles = subsampled_trajectory.shape[1]
     
     # Define image dimensions and particle rendering parameters
     img_size = 800
@@ -670,6 +670,201 @@ def draw_particles_3d(trajectory, map_size, start=-16000, offset=2000):
     particle_colors = jp.zeros((trajectory.shape[1], 3))
     return draw_particles_3d_views(trajectory, map_size, particle_colors, 
                                   start=start, offset=offset)
+
+def generate_colors(n):
+    """
+    Generate n discrete colors with maximum saturation and value in HSV.
+    
+    Parameters:
+    n (int): Number of colors to generate
+    
+    Returns:
+    list: List of RGB color tuples
+    """
+    rgb_colors = cc.glasbey_bw_minc_20[:n]
+    
+    return jp.asarray(rgb_colors)
+
+# @functools.partial(jax.jit, static_argnames=['map_size', 'num_species', 'start', 'offset'])
+def fancy_draw_particles(trajectory, energies, map_size, species, colors, 
+                                   start=-16000, offset=2000):
+    """
+    Wrapper to create three orthogonal view animations with colored species for 3D particles.
+    """
+    # Pre-compute particle colors based on species
+    particle_colors = colors[species]
+    
+    subsampled_trajectory = trajectory[start::offset]
+    
+    # Define image dimensions and particle rendering parameters
+    img_size = 800
+    particle_radius = 10
+
+    @jax.jit
+    def hit_color_func(dists, radii, coord):
+        min_idx = jp.argmin(dists)
+        min_dist = dists[min_idx]
+        min_radius = radii[min_idx] / 2
+        bloom_color = particle_colors[min_idx]
+        # should be 0 when dist == radius, 1 when dist = 0
+        intensity = jp.maximum((1 - jp.clip(min_dist / min_radius, 0, 1) ** 3), jp.exp(-min_dist / min_radius))
+        return bloom_color * intensity
+
+    @jax.jit
+    def no_hit_color_func(dists, radii, coord):
+        return jp.zeros(3)
+    
+    # Alternative approach: use a splatting technique
+    @jax.jit
+    def render_frame(positions, energy):
+        """
+        Render particles using a splatting technique.
+        
+        This creates an alpha mask for each particle and composites them onto the image.
+        """
+        # Scale positions to image coordinates
+        scaled_pos = (positions / map_size) * img_size
+        scaled_pos = jp.clip(scaled_pos, 0, img_size - 1)
+
+        radii = (particle_radius + 5 * jp.exp(-energy)) * 2
+
+        # Create a grid of coordinates
+        x_indices = jp.arange(img_size)
+        y_indices = jp.arange(img_size)
+        X, Y = jp.meshgrid(x_indices, y_indices)
+        coords = jp.stack([X, Y], axis=-1)  # Shape: (img_size, img_size, 2)
+        
+        # for each pixel, compute color
+        def process_pixel(coord):
+            dists = jp.sqrt(jp.sum((coord - scaled_pos) ** 2, axis=-1))
+            min_dist_idx = jp.argmin(dists)
+            min_dist = dists[min_dist_idx]
+            min_dist_radius = radii[min_dist_idx]
+
+            return jax.lax.cond(min_dist <= min_dist_radius, hit_color_func, no_hit_color_func, dists, radii, coord)
+
+        image_fn = jax.vmap(jax.vmap(process_pixel, in_axes=0), in_axes=1)
+        image = image_fn(coords)
+        
+        return (image * 255).astype(jp.uint8)
+    
+    frames = jax.vmap(render_frame)(subsampled_trajectory, energies)
+
+    return frames
+
+@functools.partial(jax.jit, static_argnames=('fps', 'sample_rate'))
+def resample(x, fps, sample_rate):
+    return jp.interp(jp.arange(0, x.shape[0], fps / sample_rate), jp.arange(x.shape[0]), x)
+
+@functools.partial(jax.jit, static_argnames=('cutoff_freq', 'sample_rate'))
+def simple_lowpass(signal, cutoff_freq, sample_rate):
+    # Simple one-pole lowpass filter
+    rc = 1.0 / (2 * jp.pi * cutoff_freq)
+    dt = 1.0 / sample_rate
+    alpha = dt / (rc + dt)
+    
+    def scan_fn(carry, x):
+        y = alpha * x + (1 - alpha) * carry
+        return y, y
+    
+    _, filtered = jax.lax.scan(scan_fn, 0.0, signal)
+    return filtered
+
+def soft_clip(x, threshold=0.8):
+    # Soft clipping function
+    return jp.where(
+        jp.abs(x) <= threshold,
+        x,
+        threshold * jp.tanh(x / threshold)
+    )
+
+def create_envelope(length, attack_samples=1000):
+    attack = jp.linspace(0, 1, attack_samples)
+    sustain = jp.ones(length - attack_samples)
+    return jp.concatenate([attack, sustain])
+
+def triangle(x, center=0.5):
+    y1 = jp.clip((1 / center) * x, 0, 1)
+    y2 = jp.clip(1 / (1 - center) - (1 / (1 - center)) * x, 0, 1)
+    return 2 * y1 * y2 - 1
+
+# @functools.partial(jax.jit, static_argnames=('fps', 'sample_rate'))
+def sonify_particles(trajectory, energy, force, species, num_species, map_size, fps=30, sample_rate=44100):
+    base_freq = 100
+    resampled_energy = jax.vmap(resample, in_axes=(1, None, None))(energy, fps, sample_rate)
+
+    # Add vibrato to frequency before generating waveform
+    vibrato_rate = 5.0  # Hz
+    vibrato_depth = 0.01  # 1% of frequency
+    time = jp.arange(resampled_energy.shape[1]) / sample_rate
+    vibrato = 1 + vibrato_depth * jp.sin(2 * jp.pi * vibrato_rate * time)
+
+    freq = (400 * jp.exp(-resampled_energy) + base_freq) * vibrato[None, :]
+    p = jax.vmap(modcumsum, in_axes=(0, None))(freq / sample_rate, 1)
+    species_skew = 0.01 + species * 0.1
+    sawtooth = jax.vmap(triangle)(p, center=species_skew)
+    signal = jax.vmap(simple_lowpass, in_axes=(0, None, None))(sawtooth, 1000, sample_rate)
+
+    centre = jp.array([map_size / 2, map_size / 2])
+    left_ear = centre - jp.array([map_size / 3, 0])
+    right_ear = centre + jp.array([map_size / 3, 0])
+    left_ear_dist = jp.linalg.norm(trajectory - left_ear, axis=-1)
+    right_ear_dist = jp.linalg.norm(trajectory - right_ear, axis=-1)
+    
+    audio_unit_dist = 2
+    min_dist = 1.0  # Prevent division by very small numbers
+    force_mag = jp.linalg.norm(force, axis=-1)
+
+    left_gain = jp.log1p(force_mag) / jp.maximum(left_ear_dist / audio_unit_dist ** 2, min_dist)
+    right_gain = jp.log1p(force_mag) / jp.maximum(right_ear_dist / audio_unit_dist ** 2, min_dist)
+
+    left_gain = jax.vmap(resample, in_axes=(1, None, None))(left_gain, fps, sample_rate)
+    right_gain = jax.vmap(resample, in_axes=(1, None, None))(right_gain, fps, sample_rate)
+
+    # Apply gains with softer limiting
+    left_channel = signal * left_gain
+    right_channel = signal * right_gain
+
+    # Soft clipping with RMS normalization
+    num_particles = trajectory.shape[1]
+    left_channel = soft_clip(left_channel.sum(axis=0) / jp.sqrt(num_particles)) * 0.8
+    right_channel = soft_clip(right_channel.sum(axis=0) / jp.sqrt(num_particles)) * 0.8
+
+    envelope = create_envelope(signal.shape[1], int(0.1 * sample_rate))  # 100ms attack
+    left_channel *= envelope
+    right_channel *= envelope
+
+    return jp.stack([
+        left_channel,
+        right_channel
+    ], axis=0)
+
+
+@jax.jit
+def modcumsum(x, m):
+    assert len(x.shape) == 1
+    def modsum(carry, x):
+        carry = (carry + x) % m
+        return carry, carry
+    _, y = jax.lax.scan(modsum, 0, x)
+    return y
+
+
+def chunk_sonify_particles(trajectory, energy, force, fps=30):
+    num_frames = trajectory.shape[0]
+    sample_rate = 44100
+    duration = num_frames / fps  # total duration in seconds
+    t = jp.arange(0, duration, 1 / sample_rate)
+    base_freq = 200
+
+    left_channel = jp.zeros_like(t)
+    right_channel = jp.zeros_like(t)
+
+    # sawtooth wave for each particle
+    return jp.stack([
+        left_channel,
+        right_channel
+    ], axis=-1).astype(jp.float32)  # shape (num_samples, 2)
 
 @functools.partial(jax.jit, static_argnames=('num_steps', 'dt'))
 def multi_step_scan(params, initial_points, species, dt, num_steps, map_size):

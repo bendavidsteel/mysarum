@@ -8,6 +8,10 @@
           }
           
           const tooltipId = `tooltip-${Date.now()}`;
+
+          let speciesCount = params.w_k.length;
+          let kernelsCount = params.w_k[0][0].length;
+          let growthFuncsCount = params.mu_g[0].length;
           
           // Update simulation parameters after canvas is in DOM
           const waitForCanvas = () => {
@@ -35,16 +39,13 @@
             </div>
             <div class="tooltip-params">
                 <div class="param-row">
-                <span><strong>Species:</strong> ${params.speciesCount || 'N/A'}</span>
-                <span><strong>Particles:</strong> ${params.particleCount || 'N/A'}</span>
+                <span><strong>Species:</strong> ${speciesCount || 'N/A'}</span>
+                <span><strong>Kernels:</strong> ${kernelsCount || 'N/A'}</span>
+                <span></span>
                 </div>
                 <div class="param-row">
-                <span><strong>Kernels:</strong> ${params.kernelsCount || 'N/A'}</span>
-                <span><strong>Growth:</strong> ${params.growthFuncsCount || 'N/A'}</span>
-                </div>
-                <div class="param-row">
-                <span><strong>Map Size:</strong> ${params.mapSize || 'N/A'}</span>
-                <span><strong>Max Force:</strong> ${params.maxForce?.toFixed(1) || 'N/A'}</span>
+                <span><strong>Growth:</strong> ${growthFuncsCount || 'N/A'}</span>
+                <span></span>
                 </div>
             </div>
             </div>`;

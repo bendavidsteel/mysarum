@@ -1540,20 +1540,22 @@ class TooltipLeniaSimulation {
   async updateParameters(params) {
     if (!this.initialized) return;
     
-    if (params.params) {
+    try {
       // Use actual parameters from the data
-      const actualParams = params.params;
+      let speciesCount = params.w_k.length;
+      let kernelsCount = params.w_k[0][0].length;
+      let growthFuncsCount = params.mu_g[0].length;
       const systemDescription = {
-        particleCount: params.particleCount || 256,
+        particleCount: 200,
         species: [],
-        kernelsCount: params.kernelsCount || 1,
-        growthFuncsCount: params.growthFuncsCount || 1,
-        simulationSize: [params.mapSize || 80, params.mapSize || 80],
-        loopingBorders: false,
+        kernelsCount: kernelsCount || 1,
+        growthFuncsCount: growthFuncsCount || 1,
+        simulationSize: [80, 80],
+        loopingBorders:  true,
       };
       
       // Convert the actual parameters to the expected format
-      for (let i = 0; i < params.speciesCount; i++) {
+      for (let i = 0; i < speciesCount; i++) {
         const species = {
           color: [
             Math.pow(0.25 + Math.random() * 0.75, 2.2),
@@ -1561,31 +1563,20 @@ class TooltipLeniaSimulation {
             Math.pow(0.25 + Math.random() * 0.75, 2.2),
             1.0,
           ],
-          mu_k: actualParams.mu_k[i] ? actualParams.mu_k[i].flat() : [],
-          sigma_k: actualParams.sigma_k[i] ? actualParams.sigma_k[i].flat() : [],
-          w_k: actualParams.w_k[i] ? actualParams.w_k[i].flat() : [],
-          mu_g: actualParams.mu_g[i] || [],
-          sigma_g: actualParams.sigma_g[i] || [],
-          c_rep: actualParams.c_rep[i] || [],
+          mu_k: params.mu_k[i] ? params.mu_k[i].flat() : [],
+          sigma_k: params.sigma_k[i] ? params.sigma_k[i].flat() : [],
+          w_k: params.w_k[i] ? params.w_k[i].flat() : [],
+          mu_g: params.mu_g[i] || [],
+          sigma_g: params.sigma_g[i] || [],
+          c_rep: params.c_rep[i] || [],
           spawnWeight: 1.0,
         };
         systemDescription.species.push(species);
       }
       
       await this.loadSystem(systemDescription);
-    } else {
-      // Fallback to generating random parameters
-      const systemDescription = {
-        particleCount: params.particleCount || 256,
-        species: new Array(params.speciesCount || 3),
-        kernelsCount: params.kernelsCount || 1,
-        growthFuncsCount: params.growthFuncsCount || 1,
-        simulationSize: [80, 80],
-        loopingBorders: false,
-        seed: randomSeed(),
-      };
-      
-      await this.loadSystem(this.generateSystem(systemDescription));
+    } catch (error) {
+      console.error('Failed to update parameters:', error);
     }
   }
   
@@ -1794,14 +1785,11 @@ async function updateTooltipSimulation(params, tooltipId) {
       }
     }
 
-    // Check if we need to update parameters
-    if (!paramsEqual(currentTooltipParams, params)) {
-      loadingElement.style.display = 'flex';
-      
-      // Update simulation with new parameters
-      await tooltipSimulation.updateParameters(params);
-      currentTooltipParams = { ...params };
-    }
+    loadingElement.style.display = 'flex';
+    
+    // Update simulation with new parameters
+    await tooltipSimulation.updateParameters(params);
+    currentTooltipParams = { ...params };
 
     // Start/resume simulation with clean state
     tooltipSimulation.resume(context, targetCanvas);
@@ -1814,12 +1802,3 @@ async function updateTooltipSimulation(params, tooltipId) {
   }
 }
 
-function paramsEqual(a, b) {
-  if (!a || !b) return false;
-  return a.speciesCount === b.speciesCount &&
-         a.particleCount === b.particleCount &&
-         a.kernelsCount === b.kernelsCount &&
-         a.growthFuncsCount === b.growthFuncsCount &&
-         a.mapSize === b.mapSize &&
-         JSON.stringify(a.params) === JSON.stringify(b.params);
-}

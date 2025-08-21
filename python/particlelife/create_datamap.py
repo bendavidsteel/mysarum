@@ -1,4 +1,4 @@
-
+import concurrent.futures
 
 import datamapplot
 import pacmap
@@ -42,26 +42,19 @@ def get_life_like_scores(df):
         "living organisms",
         # "biological cells",
         # "a cell",
-        "chemical reaction",
-        "a plant",
-        "a fungus",
+        # "chemical reaction",
+        "multicellular organisms",
+        "plants",
+        "roots",
+        "fungi",
         "mould",
         "plankton",
         "deep sea creatures"
     ]
     
-    non_life_like_prompts = [
-        "random points",
-        "random dots",
-        "a random cloud of points",
-        "random particle cloud",
-        "random noise",
-        "a cloud"
-    ]
-    
     # Encode the prompts
     print("Encoding classification prompts...")
-    inputs = tokenizer(life_like_prompts + non_life_like_prompts, padding=True, return_tensors="pt")
+    inputs = tokenizer(life_like_prompts, padding=True, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
     text_features = model.get_text_features(**inputs)
     
@@ -90,17 +83,7 @@ def get_life_like_scores(df):
         logits_per_text = torch.einsum("btd,bkd->bkt", text_embeds, image_embeds)
         logits_per_text = logits_per_text * model.logit_scale.exp().to(text_embeds.device)
         
-        # Calculate probabilities
-        probs = torch.softmax(logits_per_text, dim=-1)
-        
-        # Average probabilities for life-like and non-life-like prompts
-        life_probs = torch.mean(probs[..., :len(life_like_prompts)], dim=-1)
-        non_life_probs = torch.mean(probs[..., len(life_like_prompts):], dim=-1)
-        
-        # Normalize to get final life-likeness score
-        life_scores = life_probs / (life_probs + non_life_probs)
-        
-        return life_scores.cpu().detach().numpy()
+        return torch.mean(logits_per_text, dim=-1).cpu().detach().numpy()
     
     # Process in batches
     for i in tqdm(range(0, len(embeddings), batch_size)):
@@ -114,64 +97,102 @@ def get_life_like_scores(df):
     
     return max_life_like_scores
 
+def _get_sim(mu_k_i, mu_k_j, sigma_k_i, sigma_k_j, w_k_i, w_k_j, mu_g_i, mu_g_j, sigma_g_i, sigma_g_j):
+    kernel_params_i = np.stack([mu_k_i, sigma_k_i, w_k_i], axis=-1)
+    kernel_params_j = np.stack([mu_k_j, sigma_k_j, w_k_j], axis=-1)
+    growth_params_i = np.stack([mu_g_i, sigma_g_i], axis=-1)
+    growth_params_j = np.stack([mu_g_j, sigma_g_j], axis=-1)
+    num_species_i = kernel_params_i.shape[0]
+    num_species_j = kernel_params_j.shape[0]
+    num_kernels_i = kernel_params_i.shape[2]
+    num_kernels_j = kernel_params_j.shape[2]
+    num_growth_funcs_i = growth_params_i.shape[1]
+    num_growth_funcs_j = growth_params_j.shape[1]
+    kernel_sim = np.sqrt(np.sum(np.square(kernel_params_i[:, np.newaxis, :, np.newaxis, :, np.newaxis] - kernel_params_j[np.newaxis, :, np.newaxis, :, np.newaxis]), axis=-1))
+    growth_sim = np.sqrt(np.sum(np.square(growth_params_i[:, np.newaxis, :, np.newaxis] - growth_params_j[np.newaxis, :, np.newaxis, :]), axis=-1))
+
+    max_kernel_axis = ()
+    max_growth_axis = ()
+    if num_species_i < num_species_j:
+        max_kernel_axis = (0, 2)
+        max_growth_axis = (0,)
+    else:
+        max_kernel_axis = (1, 3)
+        max_growth_axis = (1,)
+
+    if num_kernels_i < num_kernels_j:
+        max_kernel_axis += (4,)
+    else:
+        max_kernel_axis += (5,)
+
+    if num_growth_funcs_i < num_growth_funcs_j:
+        max_growth_axis += (2,)
+    else:
+        max_growth_axis += (3,)
+
+    kernel_sim = np.mean(np.min(kernel_sim, axis=max_kernel_axis))
+    growth_sim = np.mean(np.min(growth_sim, axis=max_growth_axis))
+
+    return (kernel_sim + growth_sim) / 2
+
+def get_sim(params_i, params_j):
+    mu_k_i = np.array(params_i['mu_k'])
+    mu_k_j = np.array(params_j['mu_k'])
+    sigma_k_i = np.array(params_i['sigma_k'])
+    sigma_k_j = np.array(params_j['sigma_k'])
+    w_k_i = np.array(params_i['w_k'])
+    w_k_j = np.array(params_j['w_k'])
+    mu_g_i = np.array(params_i['mu_g'])
+    mu_g_j = np.array(params_j['mu_g'])
+    sigma_g_i = np.array(params_i['sigma_g'])
+    sigma_g_j = np.array(params_j['sigma_g'])
+    return _get_sim(mu_k_i, mu_k_j, sigma_k_i, sigma_k_j, w_k_i, w_k_j, mu_g_i, mu_g_j, sigma_g_i, sigma_g_j)
 
 def main():
     # Use your existing parquet file
     parquet_file_path = "./data/particle_lenia_clip_embeddings1.parquet.zstd"
     
     print("Processing parquet file with UMAP...")
-    sample_size = 200
+    sample_size = 2000
     df = pl.read_parquet(parquet_file_path, n_rows=sample_size * 10)
 
     df = df.sort(pl.col('median_force'), descending=True).head(sample_size * 4)
     life_like_scores = get_life_like_scores(df)
     df = df.with_columns(pl.Series(name='life_like_score', values=life_like_scores))
     # life_like_threshold = 0.5
-    df = df.sort(pl.col('life_like_score'), descending=True).head(sample_size)
-
-    pbar = tqdm(total=np.sum(np.arange(1, sample_size + 1)), desc='Computing pairwise similarities')
-    A = np.zeros((sample_size, sample_size))
-    for i in range(df.shape[0]):
-        for j in range(i, df.shape[0]):
-            params_i = df['params'][i]
-            params_j = df['params'][j]
-            mu_k_i = np.array(params_i['mu_k'])
-            mu_k_j = np.array(params_j['mu_k'])
-            sigma_k_i = np.array(params_i['sigma_k'])
-            sigma_k_j = np.array(params_j['sigma_k'])
-            w_k_i = np.array(params_i['w_k'])
-            w_k_j = np.array(params_j['w_k'])
-            mu_g_i = np.array(params_i['mu_g'])
-            mu_g_j = np.array(params_j['mu_g'])
-            sigma_g_i = np.array(params_i['sigma_g'])
-            sigma_g_j = np.array(params_j['sigma_g'])
-            kernel_params_i = np.stack([mu_k_i, sigma_k_i, w_k_i], axis=-1)
-            kernel_params_j = np.stack([mu_k_j, sigma_k_j, w_k_j], axis=-1)
-            growth_params_i = np.stack([mu_g_i, sigma_g_i], axis=-1)
-            growth_params_j = np.stack([mu_g_j, sigma_g_j], axis=-1)
-            kernel_sim = np.sum(np.einsum('aabk,iijk->abij', kernel_params_i, kernel_params_j))
-            growth_sim = np.sum(np.einsum('abk,ijk->abij', growth_params_i, growth_params_j))
-            A[i, j] = (kernel_sim + growth_sim) / 2
-            pbar.update(1)
-
-    nearest_neighbours = np.argsort(-A, axis=1)[:, 1:11]
-    edges = []
-    for i in range(sample_size):
-        for j in nearest_neighbours[i]:
-            edges.append((i, j))
-    edge_df = pd.DataFrame(edges, columns=['source', 'target']).drop_duplicates()
-
-    life_like_scores = (100 * df['life_like_score']).log1p().to_numpy()
-    life_like_scores = (life_like_scores - life_like_scores.min()) / (life_like_scores.max() - life_like_scores.min())
-
-    oscillator_scores = ((df['median_freq'] > 0) * df['median_freq_power'].log1p()).to_numpy()
-    oscillator_scores = (oscillator_scores - oscillator_scores.min()) / (oscillator_scores.max() - oscillator_scores.min())
+    df = df.sort(pl.col('life_like_score')).tail(sample_size)
 
     df = df.with_columns([
         pl.col('params').struct.field('mu_k').list.len().alias('num_species'),
         pl.col('params').struct.field('mu_k').list.get(0).list.get(0).list.len().alias('num_kernels'),
         pl.col('params').struct.field('mu_g').list.get(0).list.len().alias('num_growth_funcs')
     ])
+
+    param_df = df.select('params').with_row_index()
+    arg_list = param_df.join(param_df, how='cross')\
+        .filter(pl.col('index') < pl.col('index_right'))\
+        .select([pl.col('index', 'index_right', 'params', 'params_right')])\
+        .rows()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(tqdm(executor.map(lambda p: get_sim(p[2], p[3]), arg_list), total=len(arg_list), desc='Computing pairwise similarities'))
+
+    A = np.zeros((sample_size, sample_size))
+    for (i, j, _, _), sim in zip(arg_list, results):
+        A[i, j] = sim
+
+    A += np.triu(A, k=1).T  # Make the matrix symmetric
+    nearest_neighbours = np.argsort(A, axis=1)[:, 1:11]
+    edges = []
+    for i in range(sample_size):
+        for j in nearest_neighbours[i]:
+            edges.append((i, j))
+    edge_df = pd.DataFrame(edges, columns=['source', 'target']).drop_duplicates()
+
+    life_like_scores = df['life_like_score'].to_numpy()
+
+    oscillator_scores = ((df['median_freq'] > 0) * df['median_freq_power'].log1p()).to_numpy()
+
     num_kernels = df['num_kernels'].to_numpy()
     num_species = df['num_species'].to_numpy()
     num_growth_funcs = df['num_growth_funcs'].to_numpy()

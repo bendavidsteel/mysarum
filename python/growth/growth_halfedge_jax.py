@@ -255,12 +255,25 @@ def make_first_triangle(state, width, height):
 
 def get_vertex_half_edge(state, vertex_a, vertex_b):
     """Get half edge from vertex_a to vertex_b"""
-    current_he = state.vertex_half_edge[vertex_a]
-    # TODO replace with jax lax while loop
-    half_edge_ab = jax.lax.while_loop(
-        lambda he: jnp.logical_and(state.half_edge_dest[he] != vertex_b, he != state.vertex_half_edge[vertex_a]),
-        lambda he: state.half_edge_next[state.half_edge_twin[he]],
-        current_he
+    start_he = state.vertex_half_edge[vertex_a]
+
+    def cond_func(carry):
+        he, first_iter = carry
+        # Continue if: (dest != vertex_b) AND (not back at start OR first iteration)
+        return jnp.logical_and(
+            state.half_edge_dest[he] != vertex_b,
+            jnp.logical_or(he != start_he, first_iter)
+        )
+
+    def body_func(carry):
+        he, _ = carry
+        next_he = state.half_edge_next[state.half_edge_twin[he]]
+        return (next_he, False)
+
+    half_edge_ab, _ = jax.lax.while_loop(
+        cond_func,
+        body_func,
+        (start_he, True)
     )
     return half_edge_ab
 
@@ -294,69 +307,59 @@ def _add_external_triangle(state, vertex_a, vertex_b, half_edge_ab, new_face_idx
     # Create new vertex at midpoint
     vertex_c = new_vertex_idx
     new_pos = (state.vertex_pos[vertex_a] + state.vertex_pos[vertex_b]) / 2
-    
+
     # New half edges
     half_edge_bc = new_half_edge_idx
     half_edge_ca = new_half_edge_idx + 1
     half_edge_cb = new_half_edge_idx + 2
     half_edge_ac = new_half_edge_idx + 3
-    
+
     # Get existing connectivity
     half_edge_b_next = state.half_edge_next[half_edge_ab]
     half_edge_a_prev = state.half_edge_prev[half_edge_ab]
-    
-    # Update arrays
+
+    # Build updates
     updates = {}
-    
-    # Add new vertex
+
+    # Update vertex references
     updates['vertex_idx'] = state.vertex_idx.at[vertex_c].set(vertex_c)
     updates['vertex_pos'] = state.vertex_pos.at[vertex_c].set(new_pos)
     updates['vertex_half_edge'] = state.vertex_half_edge.at[vertex_c].set(half_edge_ca)
-    
-    # Add new face
+
+    # Update face references
     updates['face_idx'] = state.face_idx.at[new_face_idx].set(new_face_idx)
     updates['face_half_edge'] = state.face_half_edge.at[new_face_idx].set(half_edge_ab)
-    
-    # Update existing half edge ab
-    updates['half_edge_face'] = state.half_edge_face.at[half_edge_ab].set(new_face_idx)
-    updates['half_edge_next'] = state.half_edge_next.at[half_edge_ab].set(half_edge_bc)
-    updates['half_edge_prev'] = state.half_edge_prev.at[half_edge_ab].set(half_edge_ca)
-    
-    # Add new half edges
-    updates['half_edge_idx'] = state.half_edge_idx.at[half_edge_bc].set(half_edge_bc)
-    updates['half_edge_idx'] = updates['half_edge_idx'].at[half_edge_ca].set(half_edge_ca)
-    updates['half_edge_idx'] = updates['half_edge_idx'].at[half_edge_cb].set(half_edge_cb)
-    updates['half_edge_idx'] = updates['half_edge_idx'].at[half_edge_ac].set(half_edge_ac)
-    
-    # Set properties for new half edges
-    updates['half_edge_face'] = updates['half_edge_face'].at[half_edge_bc].set(new_face_idx)
-    updates['half_edge_face'] = updates['half_edge_face'].at[half_edge_ca].set(new_face_idx)
-    updates['half_edge_face'] = updates['half_edge_face'].at[half_edge_cb].set(-1)
-    updates['half_edge_face'] = updates['half_edge_face'].at[half_edge_ac].set(-1)
-    
-    updates['half_edge_dest'] = state.half_edge_dest.at[half_edge_bc].set(vertex_c)
-    updates['half_edge_dest'] = updates['half_edge_dest'].at[half_edge_ca].set(vertex_a)
-    updates['half_edge_dest'] = updates['half_edge_dest'].at[half_edge_cb].set(vertex_b)
-    updates['half_edge_dest'] = updates['half_edge_dest'].at[half_edge_ac].set(vertex_c)
-    
-    updates['half_edge_twin'] = state.half_edge_twin.at[half_edge_bc].set(half_edge_cb)
-    updates['half_edge_twin'] = updates['half_edge_twin'].at[half_edge_cb].set(half_edge_bc)
-    updates['half_edge_twin'] = updates['half_edge_twin'].at[half_edge_ca].set(half_edge_ac)
-    updates['half_edge_twin'] = updates['half_edge_twin'].at[half_edge_ac].set(half_edge_ca)
-    
-    updates['half_edge_next'] = updates['half_edge_next'].at[half_edge_bc].set(half_edge_ca)
-    updates['half_edge_next'] = updates['half_edge_next'].at[half_edge_ca].set(half_edge_ab)
-    updates['half_edge_next'] = updates['half_edge_next'].at[half_edge_cb].set(half_edge_b_next)
-    updates['half_edge_next'] = updates['half_edge_next'].at[half_edge_ac].set(half_edge_cb)
-    updates['half_edge_next'] = updates['half_edge_next'].at[half_edge_a_prev].set(half_edge_ac)
-    
-    updates['half_edge_prev'] = updates['half_edge_prev'].at[half_edge_bc].set(half_edge_ab)
-    updates['half_edge_prev'] = updates['half_edge_prev'].at[half_edge_ca].set(half_edge_bc)
-    updates['half_edge_prev'] = updates['half_edge_prev'].at[half_edge_cb].set(half_edge_ac)
-    updates['half_edge_prev'] = updates['half_edge_prev'].at[half_edge_ac].set(half_edge_a_prev)
-    updates['half_edge_prev'] = updates['half_edge_prev'].at[half_edge_b_next].set(half_edge_cb)
-    
-    # Create updated state
+
+    # Update half edge indices
+    half_edge_idx_arr = jnp.array([half_edge_bc, half_edge_ca, half_edge_cb, half_edge_ac])
+    half_edge_idx_updates = jnp.array([half_edge_bc, half_edge_ca, half_edge_cb, half_edge_ac])
+    updates['half_edge_idx'] = state.half_edge_idx.at[half_edge_idx_arr].set(half_edge_idx_updates)
+
+    # Update half edge faces
+    half_edge_face_idx = jnp.array([half_edge_ab, half_edge_bc, half_edge_ca, half_edge_cb, half_edge_ac])
+    half_edge_face_updates = jnp.array([new_face_idx, new_face_idx, new_face_idx, -1, -1])
+    updates['half_edge_face'] = state.half_edge_face.at[half_edge_face_idx].set(half_edge_face_updates)
+
+    # Update half edge destinations
+    half_edge_dest_idx = jnp.array([half_edge_bc, half_edge_ca, half_edge_cb, half_edge_ac])
+    half_edge_dest_updates = jnp.array([vertex_c, vertex_a, vertex_b, vertex_c])
+    updates['half_edge_dest'] = state.half_edge_dest.at[half_edge_dest_idx].set(half_edge_dest_updates)
+
+    # Update half edge twins
+    half_edge_twin_idx = jnp.array([half_edge_bc, half_edge_cb, half_edge_ca, half_edge_ac])
+    half_edge_twin_updates = jnp.array([half_edge_cb, half_edge_bc, half_edge_ac, half_edge_ca])
+    updates['half_edge_twin'] = state.half_edge_twin.at[half_edge_twin_idx].set(half_edge_twin_updates)
+
+    # Update half edge next
+    half_edge_next_idx = jnp.array([half_edge_ab, half_edge_bc, half_edge_ca, half_edge_cb, half_edge_ac, half_edge_a_prev])
+    half_edge_next_updates = jnp.array([half_edge_bc, half_edge_ca, half_edge_ab, half_edge_b_next, half_edge_cb, half_edge_ac])
+    updates['half_edge_next'] = state.half_edge_next.at[half_edge_next_idx].set(half_edge_next_updates)
+
+    # Update half edge prev
+    half_edge_prev_idx = jnp.array([half_edge_ab, half_edge_bc, half_edge_ca, half_edge_cb, half_edge_ac, half_edge_b_next])
+    half_edge_prev_updates = jnp.array([half_edge_ca, half_edge_ab, half_edge_bc, half_edge_ac, half_edge_a_prev, half_edge_cb])
+    updates['half_edge_prev'] = state.half_edge_prev.at[half_edge_prev_idx].set(half_edge_prev_updates)
+
     return state._replace(**updates)
 
 def add_internal_edge_triangle(state, vertex_a, vertex_b):
@@ -383,82 +386,58 @@ def add_internal_edge_triangle(state, vertex_a, vertex_b):
     half_edge_da = half_edge_dc + 1
     face_adc = face_abc
 
-    face_idx = state.face_idx.at[face_dbc].set(face_dbc)
-    face_half_edge = state.face_half_edge.at[face_dbc].set(half_edge_bc)
-    face_half_edge = face_half_edge.at[face_adc].set(half_edge_ca)
-
-    new_vertex_pos = jnp.mean(jnp.stack([state.vertex_pos[vertex_a], state.vertex_pos[vertex_b]], axis=0), axis=0)
-
-    vertex_idx = state.vertex_idx.at[vertex_d].set(vertex_d)
-    vertex_pos = state.vertex_pos.at[vertex_d].set(new_vertex_pos)
-    vertex_half_edge = state.vertex_half_edge.at[vertex_d].set(half_edge_db)
-
-    half_edge_face = state.half_edge_face.at[half_edge_ad].set(face_adc)
-    half_edge_dest = state.half_edge_dest.at[half_edge_ad].set(vertex_d)
-    half_edge_twin = state.half_edge_twin.at[half_edge_ad].set(half_edge_da)
-    half_edge_next = state.half_edge_next.at[half_edge_ad].set(half_edge_dc)
-    half_edge_prev = state.half_edge_prev.at[half_edge_ad].set(half_edge_ca)
-
-    half_edge_idx = state.half_edge_idx.at[half_edge_db].set(half_edge_db)
-    half_edge_face = half_edge_face.at[half_edge_db].set(face_dbc)
-    half_edge_dest = half_edge_dest.at[half_edge_db].set(vertex_b)
-    half_edge_twin = half_edge_twin.at[half_edge_db].set(half_edge_bd)
-    half_edge_next = half_edge_next.at[half_edge_db].set(half_edge_bc)
-    half_edge_prev = half_edge_prev.at[half_edge_db].set(half_edge_cd)
-
     half_edge_ba_next = state.half_edge_next[half_edge_ba]
     half_edge_ba_prev = state.half_edge_prev[half_edge_ba]
-    half_edge_prev = half_edge_prev.at[half_edge_ba_next].set(half_edge_da)
-    half_edge_next = half_edge_next.at[half_edge_ba_prev].set(half_edge_bd)
+    new_vertex_pos = jnp.mean(jnp.stack([state.vertex_pos[vertex_a], state.vertex_pos[vertex_b]], axis=0), axis=0)
 
-    half_edge_dest = half_edge_dest.at[half_edge_bd].set(vertex_d)
-    half_edge_twin = half_edge_twin.at[half_edge_bd].set(half_edge_db)
-    half_edge_next = half_edge_next.at[half_edge_bd].set(half_edge_da)
+    # Build updates
+    updates = {}
 
-    half_edge_idx = half_edge_idx.at[half_edge_da].set(half_edge_da)
-    half_edge_face = half_edge_face.at[half_edge_da].set(-1)
-    half_edge_dest = half_edge_dest.at[half_edge_da].set(vertex_a)
-    half_edge_twin = half_edge_twin.at[half_edge_da].set(half_edge_ad)
-    half_edge_next = half_edge_next.at[half_edge_da].set(half_edge_ba_next)
-    half_edge_prev = half_edge_prev.at[half_edge_da].set(half_edge_bd)
+    # Update face references
+    face_idx_arr = jnp.array([face_dbc])
+    face_idx_updates = jnp.array([face_dbc])
+    updates['face_idx'] = state.face_idx.at[face_idx_arr].set(face_idx_updates)
 
-    half_edge_idx = half_edge_idx.at[half_edge_dc].set(half_edge_dc)
-    half_edge_face = half_edge_face.at[half_edge_dc].set(face_adc)
-    half_edge_dest = half_edge_dest.at[half_edge_dc].set(vertex_c)
-    half_edge_twin = half_edge_twin.at[half_edge_dc].set(half_edge_cd)
-    half_edge_next = half_edge_next.at[half_edge_dc].set(half_edge_ca)
-    half_edge_prev = half_edge_prev.at[half_edge_dc].set(half_edge_ad)
+    face_he_idx = jnp.array([face_dbc, face_adc])
+    face_he_updates = jnp.array([half_edge_bc, half_edge_ca])
+    updates['face_half_edge'] = state.face_half_edge.at[face_he_idx].set(face_he_updates)
 
-    half_edge_idx = half_edge_idx.at[half_edge_cd].set(half_edge_cd)
-    half_edge_face = half_edge_face.at[half_edge_cd].set(face_dbc)
-    half_edge_dest = half_edge_dest.at[half_edge_cd].set(vertex_d)
-    half_edge_twin = half_edge_twin.at[half_edge_cd].set(half_edge_dc)
-    half_edge_next = half_edge_next.at[half_edge_cd].set(half_edge_db)
-    half_edge_prev = half_edge_prev.at[half_edge_cd].set(half_edge_bc)
+    # Update vertex references
+    updates['vertex_idx'] = state.vertex_idx.at[vertex_d].set(vertex_d)
+    updates['vertex_pos'] = state.vertex_pos.at[vertex_d].set(new_vertex_pos)
+    updates['vertex_half_edge'] = state.vertex_half_edge.at[vertex_d].set(half_edge_db)
 
-    half_edge_face = half_edge_face.at[half_edge_ca].set(face_adc)
-    half_edge_next = half_edge_next.at[half_edge_ca].set(half_edge_ad)
-    half_edge_prev = half_edge_prev.at[half_edge_ca].set(half_edge_dc)
+    # Update half edge indices
+    half_edge_idx_arr = jnp.array([half_edge_db, half_edge_da, half_edge_dc, half_edge_cd])
+    half_edge_idx_updates = jnp.array([half_edge_db, half_edge_da, half_edge_dc, half_edge_cd])
+    updates['half_edge_idx'] = state.half_edge_idx.at[half_edge_idx_arr].set(half_edge_idx_updates)
 
-    half_edge_face = half_edge_face.at[half_edge_bc].set(face_dbc)
-    half_edge_next = half_edge_next.at[half_edge_bc].set(half_edge_cd)
-    half_edge_prev = half_edge_prev.at[half_edge_bc].set(half_edge_db)
+    # Update half edge faces
+    half_edge_face_idx = jnp.array([half_edge_ad, half_edge_db, half_edge_da, half_edge_dc, half_edge_cd, half_edge_ca, half_edge_bc])
+    half_edge_face_updates = jnp.array([face_adc, face_dbc, -1, face_adc, face_dbc, face_adc, face_dbc])
+    updates['half_edge_face'] = state.half_edge_face.at[half_edge_face_idx].set(half_edge_face_updates)
 
-    state = state._replace(
-        face_idx=face_idx,
-        face_half_edge=face_half_edge,
-        vertex_idx=vertex_idx,
-        vertex_pos=vertex_pos,
-        vertex_half_edge=vertex_half_edge,
-        half_edge_idx=half_edge_idx,
-        half_edge_face=half_edge_face,
-        half_edge_dest=half_edge_dest,
-        half_edge_twin=half_edge_twin,
-        half_edge_next=half_edge_next,
-        half_edge_prev=half_edge_prev
-    )
+    # Update half edge destinations
+    half_edge_dest_idx = jnp.array([half_edge_ad, half_edge_db, half_edge_bd, half_edge_da, half_edge_dc, half_edge_cd])
+    half_edge_dest_updates = jnp.array([vertex_d, vertex_b, vertex_d, vertex_a, vertex_c, vertex_d])
+    updates['half_edge_dest'] = state.half_edge_dest.at[half_edge_dest_idx].set(half_edge_dest_updates)
 
-    return state
+    # Update half edge twins
+    half_edge_twin_idx = jnp.array([half_edge_ad, half_edge_db, half_edge_bd, half_edge_da, half_edge_dc, half_edge_cd])
+    half_edge_twin_updates = jnp.array([half_edge_da, half_edge_bd, half_edge_db, half_edge_ad, half_edge_cd, half_edge_dc])
+    updates['half_edge_twin'] = state.half_edge_twin.at[half_edge_twin_idx].set(half_edge_twin_updates)
+
+    # Update half edge next
+    half_edge_next_idx = jnp.array([half_edge_ad, half_edge_db, half_edge_ba_prev, half_edge_bd, half_edge_da, half_edge_dc, half_edge_cd, half_edge_ca, half_edge_bc])
+    half_edge_next_updates = jnp.array([half_edge_dc, half_edge_bc, half_edge_bd, half_edge_da, half_edge_ba_next, half_edge_ca, half_edge_db, half_edge_ad, half_edge_cd])
+    updates['half_edge_next'] = state.half_edge_next.at[half_edge_next_idx].set(half_edge_next_updates)
+
+    # Update half edge prev
+    half_edge_prev_idx = jnp.array([half_edge_ad, half_edge_db, half_edge_ba_next, half_edge_da, half_edge_dc, half_edge_cd, half_edge_ca, half_edge_bc])
+    half_edge_prev_updates = jnp.array([half_edge_ca, half_edge_cd, half_edge_da, half_edge_bd, half_edge_ad, half_edge_bc, half_edge_dc, half_edge_db])
+    updates['half_edge_prev'] = state.half_edge_prev.at[half_edge_prev_idx].set(half_edge_prev_updates)
+
+    return state._replace(**updates)
 
 def add_internal_triangles(state, vertex_a, vertex_b):
     # find half edge from a to b
@@ -490,13 +469,6 @@ def _add_internal_triangles(state, vertex_a, vertex_b, half_edge_ab):
     face_ead = face_ebc + 1
 
     vertex_e = jnp.max(state.vertex_idx) + 1
-    vertex_idx = state.vertex_idx.at[vertex_e].set(vertex_e)
-    vertex_pos = state.vertex_pos.at[vertex_e].set(jnp.mean(jnp.stack([state.vertex_pos[vertex_a], state.vertex_pos[vertex_b]], axis=0), axis=0))
-
-    # create new face
-    new_face_idx = jnp.array([face_ebc, face_ead])
-    face_updates = jnp.array([face_ebc, face_ead])
-    face_idx = state.face_idx.at[new_face_idx].set(face_updates)
 
     # edit face aec
     half_edge_ec = jnp.max(state.half_edge_idx) + 1
@@ -507,98 +479,63 @@ def _add_internal_triangles(state, vertex_a, vertex_b, half_edge_ab):
     half_edge_ad = state.half_edge_next[half_edge_ba]
     half_edge_db = state.half_edge_next[half_edge_ad]
 
-    half_edge_dest = state.half_edge_dest.at[half_edge_ae].set(vertex_e)
-    half_edge_next = state.half_edge_next.at[half_edge_ae].set(half_edge_ec)
-    half_edge_twin = state.half_edge_twin.at[half_edge_ae].set(half_edge_ea)
-
-    half_edge_idx = state.half_edge_idx.at[half_edge_ec].set(half_edge_ec)
-    half_edge_twin = half_edge_twin.at[half_edge_ec].set(half_edge_ce)
-    half_edge_face = state.half_edge_face.at[half_edge_ec].set(face_aec)
-    half_edge_dest = half_edge_dest.at[half_edge_ec].set(vertex_c)
-    half_edge_next = half_edge_next.at[half_edge_ec].set(half_edge_ca)
-    half_edge_prev = state.half_edge_prev.at[half_edge_ec].set(half_edge_ae)
-
-    half_edge_prev = half_edge_prev.at[half_edge_ca].set(half_edge_ec)
-
     # edit face ebc
     half_edge_eb = half_edge_ce + 1
-    vertex_half_edge = state.vertex_half_edge.at[vertex_e].set(half_edge_eb)
-
-    half_edge_idx = half_edge_idx.at[half_edge_eb].set(half_edge_eb)
-    half_edge_twin = half_edge_twin.at[half_edge_eb].set(half_edge_be)
-    half_edge_face = half_edge_face.at[half_edge_eb].set(face_ebc)
-    half_edge_dest = half_edge_dest.at[half_edge_eb].set(vertex_b)
-    half_edge_next = half_edge_next.at[half_edge_eb].set(half_edge_bc)
-    half_edge_prev = half_edge_prev.at[half_edge_eb].set(half_edge_ce)
-
-    half_edge_face = half_edge_face.at[half_edge_bc].set(face_ebc)
-    half_edge_next = half_edge_next.at[half_edge_bc].set(half_edge_ce)
-    half_edge_prev = half_edge_prev.at[half_edge_bc].set(half_edge_eb)
-
-    half_edge_idx = half_edge_idx.at[half_edge_ce].set(half_edge_ce)
-    half_edge_twin = half_edge_twin.at[half_edge_ce].set(half_edge_ec)
-    half_edge_face = half_edge_face.at[half_edge_ce].set(face_ebc)
-    half_edge_dest = half_edge_dest.at[half_edge_ce].set(vertex_e)
-    half_edge_next = half_edge_next.at[half_edge_ce].set(half_edge_eb)
-    half_edge_prev = half_edge_prev.at[half_edge_ce].set(half_edge_bc)
 
     # edit face ead
     half_edge_de = half_edge_eb + 1
     half_edge_ed = half_edge_de + 1
 
-    half_edge_idx = half_edge_idx.at[half_edge_ea].set(half_edge_ea)
-    half_edge_twin = half_edge_twin.at[half_edge_ea].set(half_edge_ae)
-    half_edge_face = half_edge_face.at[half_edge_ea].set(face_ead)
-    half_edge_dest = half_edge_dest.at[half_edge_ea].set(vertex_a)
-    half_edge_next = half_edge_next.at[half_edge_ea].set(half_edge_ad)
-    half_edge_prev = half_edge_prev.at[half_edge_ea].set(half_edge_de)
+    new_vertex_pos = jnp.mean(jnp.stack([state.vertex_pos[vertex_a], state.vertex_pos[vertex_b]], axis=0), axis=0)
 
-    half_edge_face = half_edge_face.at[half_edge_ad].set(face_ead)
-    half_edge_next = half_edge_next.at[half_edge_ad].set(half_edge_de)
-    half_edge_prev = half_edge_prev.at[half_edge_ad].set(half_edge_ea)
+    # Build updates
+    updates = {}
 
-    half_edge_idx = half_edge_idx.at[half_edge_de].set(half_edge_de)
-    half_edge_twin = half_edge_twin.at[half_edge_de].set(half_edge_ed)
-    half_edge_face = half_edge_face.at[half_edge_de].set(face_ead)
-    half_edge_dest = half_edge_dest.at[half_edge_de].set(vertex_e)
-    half_edge_next = half_edge_next.at[half_edge_de].set(half_edge_ea)
-    half_edge_prev = half_edge_prev.at[half_edge_de].set(half_edge_ad)
+    # Update vertex references
+    updates['vertex_idx'] = state.vertex_idx.at[vertex_e].set(vertex_e)
+    updates['vertex_pos'] = state.vertex_pos.at[vertex_e].set(new_vertex_pos)
+    updates['vertex_half_edge'] = state.vertex_half_edge.at[vertex_e].set(half_edge_eb)
 
-    # edit existing face bed
-    half_edge_twin = half_edge_twin.at[half_edge_be].set(half_edge_eb)
-    half_edge_face = half_edge_face.at[half_edge_be].set(face_bed)
-    half_edge_dest = half_edge_dest.at[half_edge_be].set(vertex_e)
-    half_edge_next = half_edge_next.at[half_edge_be].set(half_edge_ed)
-    half_edge_prev = half_edge_prev.at[half_edge_be].set(half_edge_db)
+    # Update face references
+    face_idx_arr = jnp.array([face_ebc, face_ead])
+    face_idx_updates = jnp.array([face_ebc, face_ead])
+    updates['face_idx'] = state.face_idx.at[face_idx_arr].set(face_idx_updates)
 
-    half_edge_idx = half_edge_idx.at[half_edge_ed].set(half_edge_ed)
-    half_edge_twin = half_edge_twin.at[half_edge_ed].set(half_edge_de)
-    half_edge_face = half_edge_face.at[half_edge_ed].set(face_bed)
-    half_edge_dest = half_edge_dest.at[half_edge_ed].set(vertex_d)
-    half_edge_next = half_edge_next.at[half_edge_ed].set(half_edge_db)
-    half_edge_prev = half_edge_prev.at[half_edge_ed].set(half_edge_be)
+    face_he_idx = jnp.array([face_ebc, face_ead])
+    face_he_updates = jnp.array([half_edge_eb, half_edge_ea])
+    updates['face_half_edge'] = state.face_half_edge.at[face_he_idx].set(face_he_updates)
 
-    half_edge_next = half_edge_next.at[half_edge_db].set(half_edge_be)
-    half_edge_prev = half_edge_prev.at[half_edge_db].set(half_edge_ed)
+    # Update half edge indices
+    half_edge_idx_arr = jnp.array([half_edge_ec, half_edge_ea, half_edge_eb, half_edge_ce, half_edge_de, half_edge_ed])
+    half_edge_idx_updates = jnp.array([half_edge_ec, half_edge_ea, half_edge_eb, half_edge_ce, half_edge_de, half_edge_ed])
+    updates['half_edge_idx'] = state.half_edge_idx.at[half_edge_idx_arr].set(half_edge_idx_updates)
 
-    face_half_edge = state.face_half_edge.at[face_ebc].set(half_edge_eb)
-    face_half_edge = face_half_edge.at[face_ead].set(half_edge_ea)
+    # Update half edge faces
+    half_edge_face_idx = jnp.array([half_edge_ec, half_edge_eb, half_edge_bc, half_edge_ce, half_edge_ea, half_edge_ad, half_edge_de, half_edge_be, half_edge_ed])
+    half_edge_face_updates = jnp.array([face_aec, face_ebc, face_ebc, face_ebc, face_ead, face_ead, face_ead, face_bed, face_bed])
+    updates['half_edge_face'] = state.half_edge_face.at[half_edge_face_idx].set(half_edge_face_updates)
 
-    state = state._replace(
-        vertex_idx=vertex_idx,
-        vertex_pos=vertex_pos,
-        vertex_half_edge=vertex_half_edge,
-        face_idx=face_idx,
-        face_half_edge=face_half_edge,
-        half_edge_idx=half_edge_idx,
-        half_edge_face=half_edge_face,
-        half_edge_dest=half_edge_dest,
-        half_edge_twin=half_edge_twin,
-        half_edge_next=half_edge_next,
-        half_edge_prev=half_edge_prev
-    )
+    # Update half edge destinations
+    half_edge_dest_idx = jnp.array([half_edge_ae, half_edge_ec, half_edge_eb, half_edge_ce, half_edge_ea, half_edge_de, half_edge_be, half_edge_ed])
+    half_edge_dest_updates = jnp.array([vertex_e, vertex_c, vertex_b, vertex_e, vertex_a, vertex_e, vertex_e, vertex_d])
+    updates['half_edge_dest'] = state.half_edge_dest.at[half_edge_dest_idx].set(half_edge_dest_updates)
 
-    return state
+    # Update half edge twins
+    half_edge_twin_idx = jnp.array([half_edge_ae, half_edge_ec, half_edge_ce, half_edge_eb, half_edge_be, half_edge_ea, half_edge_de, half_edge_ed])
+    half_edge_twin_updates = jnp.array([half_edge_ea, half_edge_ce, half_edge_ec, half_edge_be, half_edge_eb, half_edge_ae, half_edge_ed, half_edge_de])
+    updates['half_edge_twin'] = state.half_edge_twin.at[half_edge_twin_idx].set(half_edge_twin_updates)
+
+    # Update half edge next
+    half_edge_next_idx = jnp.array([half_edge_ae, half_edge_ec, half_edge_ca, half_edge_eb, half_edge_bc, half_edge_ce, half_edge_ea, half_edge_ad, half_edge_de, half_edge_be, half_edge_ed, half_edge_db])
+    half_edge_next_updates = jnp.array([half_edge_ec, half_edge_ca, half_edge_ae, half_edge_bc, half_edge_ce, half_edge_eb, half_edge_ad, half_edge_de, half_edge_ea, half_edge_ed, half_edge_db, half_edge_be])
+    updates['half_edge_next'] = state.half_edge_next.at[half_edge_next_idx].set(half_edge_next_updates)
+
+    # Update half edge prev
+    half_edge_prev_idx = jnp.array([half_edge_ec, half_edge_ca, half_edge_ae, half_edge_eb, half_edge_bc, half_edge_ce, half_edge_ea, half_edge_ad, half_edge_de, half_edge_be, half_edge_ed, half_edge_db])
+    half_edge_prev_updates = jnp.array([half_edge_ae, half_edge_ec, half_edge_ca, half_edge_ce, half_edge_eb, half_edge_bc, half_edge_de, half_edge_ea, half_edge_ad, half_edge_db, half_edge_be, half_edge_ed])
+    updates['half_edge_prev'] = state.half_edge_prev.at[half_edge_prev_idx].set(half_edge_prev_updates)
+
+    return state._replace(**updates)
 
 @jax.jit
 def get_edge_count(state):
@@ -868,40 +805,6 @@ def calculate_face_normals(state):
     normals = jnp.where(vertex_norms > EPSILON, normals / vertex_norms, jnp.array([0.0, 0.0, 1.0]))
 
     return normals
-
-def draw_pygame(state, screen):
-    """Draw the mesh using pygame"""
-    screen.fill((0, 0, 0))
-    
-    # Convert JAX arrays to numpy for drawing
-    vertex_pos = np.array(state.vertex_pos)
-    vertex_idx = np.array(state.vertex_idx)
-    half_edge_dest = np.array(state.half_edge_dest)
-    half_edge_prev = np.array(state.half_edge_prev)
-    half_edge_idx = np.array(state.half_edge_idx)
-    vertex_suitability = np.array(state.vertex_suitability)
-    
-    # Draw edges
-    active_edges = half_edge_idx != -1
-    edges = np.stack([half_edge_dest, half_edge_dest[half_edge_prev]])
-    
-    for i in np.where(active_edges)[0]:
-        if edges[0, i] != -1 and edges[1, i] != -1:
-            start = vertex_pos[edges[0, i]]
-            end = vertex_pos[edges[1, i]]
-            if start[0] >= 0 and end[0] >= 0:  # Valid positions
-                pygame.draw.line(screen, (50, 50, 50), start.astype(int), end.astype(int), 2)
-    
-    # Draw vertices
-    active_vertices = vertex_idx != -1
-    for i in np.where(active_vertices)[0]:
-        pos = vertex_pos[i]
-        if pos[0] >= 0:  # Valid position
-            suitability = vertex_suitability[i]
-            color = int(255 * suitability)
-            pygame.draw.circle(screen, (color, color, color), pos.astype(int), 5)
-    
-    pygame.display.flip()
 
 def camera_matrix(width, height):
     return glm.ortho(0, width, height, 0, -1.0, 1.0)  

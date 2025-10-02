@@ -68,11 +68,8 @@ class Mesh:
                     vec3 light_dir = normalize(light_pos - world_pos);
                     vec3 face_normal = normalize(normal);
 
-                    // For two-sided lighting, use absolute value of dot product
-                    float diff = abs(dot(face_normal, light_dir));
-
                     vec3 ambient = ambient_color;
-                    vec3 diffuse = diff * light_color;
+                    vec3 diffuse = max(dot(face_normal, light_dir), 0.0) * light_color;
 
                     vec3 result = ambient + diffuse;
                     out_color = vec4(result, 1.0);
@@ -703,7 +700,7 @@ class Mesh:
         planar_force = (neighbour_avg - self.vertex_pos) * (self.vertex_idx != -1)[:, np.newaxis]
         return planar_force
     
-    def calculate_bulge_force(self):
+    def _get_edge_normals(self):
         # draw edge normals
         border_half_edges = np.where((self.half_edge_face[self.half_edge_idx] == -1) & (self.half_edge_idx != -1))[0]
         edges = np.stack([self.half_edge_dest[border_half_edges], self.half_edge_dest[self.half_edge_twin[border_half_edges]]])
@@ -712,6 +709,11 @@ class Mesh:
         edge_vector = edge_pos[1, :] - edge_pos[0, :]
         edge_normal = np.cross(edge_vector, z_orth)
         edge_normal /= np.linalg.norm(edge_normal, axis=-1)[:, np.newaxis] + EPSILON
+        return edges, edge_normal
+
+    def calculate_bulge_force(self):
+        # draw edge normals
+        edges, edge_normal = self._get_edge_normals()
         
         vertex_force = np.zeros_like(self.vertex_pos)
         np.add.at(vertex_force, edges[0], edge_normal)
@@ -761,19 +763,29 @@ class Mesh:
     def draw_pygame(self, screen):
         screen.fill((0, 0, 0))
         
-        # Draw connections
-        _, edge_pos = self.get_edge_positions()
+        edges, edge_pos = self.get_edge_positions()
         for i in range(edge_pos.shape[1]):
-            link_start = tuple(map(float, edge_pos[0, i]))
-            link_end = tuple(map(float, edge_pos[1, i]))
-            pygame.draw.line(screen, (50, 50, 50), link_start, link_end, 2)
+            start_pos = tuple(map(float, edge_pos[0, i, :2]))
+            end_pos = tuple(map(float, edge_pos[1, i, :2]))
+            pygame.draw.line(screen, (100, 100, 100), start_pos, end_pos, 1)
+
+        # Draw border edges
+        edges, edge_normal = self._get_edge_normals()
+        edge_positions = self.vertex_pos[edges]
+        for i in range(edge_positions.shape[1]):
+            start_pos = tuple(map(float, edge_positions[0, i, :2]))
+            end_pos = tuple(map(float, edge_positions[1, i, :2]))
+            normal_end = (edge_positions[0, i, :2] + edge_positions[1, i, :2]) / 2 + edge_normal[i, :2] * 10
+            normal_end = tuple(map(float, normal_end))
+            pygame.draw.line(screen, (200, 50, 50), start_pos, end_pos, 2)
+            pygame.draw.line(screen, (50, 200, 50), ((start_pos[0] + end_pos[0]) / 2, (start_pos[1] + end_pos[1]) / 2), normal_end, 2)
         
         # Draw cells
         active_cells = np.where(self.vertex_idx != -1)[0]
         cell_suitability = self.vertex_suitability[active_cells]
         active_cell_positions = self.vertex_pos[active_cells]
         for active_cell in active_cells:
-            cell_position = self.vertex_pos[active_cell]
+            cell_position = self.vertex_pos[active_cell, :2]
             cell_suitability = self.vertex_suitability[active_cell]
             pos = tuple(map(float, cell_position))
             pygame.draw.circle(screen, (int(255 * cell_suitability), int(255 * cell_suitability), int(255 * cell_suitability)), pos, 5)
@@ -853,9 +865,9 @@ def main():
 
     clock = pygame.time.Clock()
     pygame.init()
-    screen = pygame.display.set_mode((width, height), flags=pygame.OPENGL | pygame.DOUBLEBUF, vsync=True)
+    screen = pygame.display.set_mode((width, height))#, flags=pygame.OPENGL | pygame.DOUBLEBUF, vsync=True)
 
-    mesh.init_shader()
+    # mesh.init_shader()
 
     running = True
     while running:
@@ -868,7 +880,7 @@ def main():
                     print(f"Wireframe mode: {'ON' if mesh.wireframe_mode else 'OFF'}")
         
         mesh.update()
-        mesh.draw(screen)
+        mesh.draw_pygame(screen)
         clock.tick(60)
 
     pygame.quit()

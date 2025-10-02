@@ -1,12 +1,12 @@
 import collections
 import functools
 
+import glm
 import jax
 import jax.numpy as jnp
-from jax import lax
-import pygame
+import moderngl
 import numpy as np
-from typing import NamedTuple
+import pygame
 
 
 MAX_VERTICES = 1000
@@ -138,12 +138,25 @@ def calculate_bulge_force(state, params):
     boundary_mask = (state.half_edge_face == -1) & (state.half_edge_idx != -1)
     
     # Get edge vectors
-    edges = jnp.stack([state.half_edge_dest, state.half_edge_dest[state.half_edge_twin]])
+    edges = jnp.stack([
+        state.half_edge_dest[state.half_edge_twin],
+        state.half_edge_dest,
+    ])
     edge_pos = state.vertex_pos[edges]
     edge_vector = edge_pos[1] - edge_pos[0]
+
+    next_edge = jnp.stack([
+        state.half_edge_next[state.half_edge_twin],
+        state.half_edge_dest[state.half_edge_next[state.half_edge_twin]],
+
+    ])
+    next_edge_pos = state.vertex_pos[next_edge]
+    next_edge_vector = next_edge_pos[1] - next_edge_pos[0]
+
+    # calculate normals
+    surface_normal = jnp.cross(edge_vector, next_edge_vector)
+    edge_normal = jnp.cross(edge_vector, surface_normal)
     
-    # Calculate normals (rotate 90 degrees)
-    edge_normal = jnp.stack([-edge_vector[:, 1], edge_vector[:, 0]], axis=-1)
     edge_normal = edge_normal / (jnp.linalg.norm(edge_normal, axis=-1, keepdims=True) + EPSILON)
     
     # Apply only to boundary edges
@@ -189,9 +202,9 @@ def make_first_triangle(state, width, height):
     """Initialize the first triangle"""
     # Vertices
     vertex_positions = jnp.array([
-        [width/2, height/2],
-        [width/2 + 40, height/2],
-        [width/2 + 20, height/2 + 34.64]  # 40 * sqrt(3)/2
+        [width/2, height/2, 0],
+        [width/2 + 40, height/2, 0],
+        [width/2 + 20, height/2 + 34.64, 0]  # 40 * sqrt(3)/2
     ])
     
     vertex_idx = state.vertex_idx.at[:3].set(jnp.arange(3))
@@ -481,8 +494,9 @@ def _add_internal_triangles(state, vertex_a, vertex_b, half_edge_ab):
     vertex_pos = state.vertex_pos.at[vertex_e].set(jnp.mean(jnp.stack([state.vertex_pos[vertex_a], state.vertex_pos[vertex_b]], axis=0), axis=0))
 
     # create new face
-    face_idx = state.face_idx.at[face_ebc].set(face_ebc)
-    face_idx = face_idx.at[face_ead].set(face_ead)
+    new_face_idx = jnp.array([face_ebc, face_ead])
+    face_updates = jnp.array([face_ebc, face_ead])
+    face_idx = state.face_idx.at[new_face_idx].set(face_updates)
 
     # edit face aec
     half_edge_ec = jnp.max(state.half_edge_idx) + 1
@@ -628,6 +642,7 @@ def flip_edge(state, half_edge_ab):
         lambda: _flip_edge(state, half_edge_ab, half_edge_ba)
     )
     
+@jax.jit
 def _flip_edge(state, half_edge_ab, half_edge_ba):
     # Get vertices
     vertex_a = state.half_edge_dest[half_edge_ba]
@@ -658,47 +673,40 @@ def _flip_edge(state, half_edge_ab, half_edge_ba):
     updates = {}
     
     # Update face references
-    updates['face_half_edge'] = state.face_half_edge.at[face_adc].set(half_edge_ca)
-    updates['face_half_edge'] = updates['face_half_edge'].at[face_bcd].set(half_edge_db)
+    face_idx = jnp.array([face_adc, face_bcd])
+    face_updates = jnp.array([half_edge_ca, half_edge_db])
+    updates['face_half_edge'] = state.face_half_edge.at[face_idx].set(face_updates)
     
     # Update vertex references (in case they pointed to the flipped edge)
-    updates['vertex_half_edge'] = state.vertex_half_edge.at[vertex_a].set(half_edge_ad)
-    updates['vertex_half_edge'] = updates['vertex_half_edge'].at[vertex_b].set(half_edge_bc)
-    
+    vertex_idx = jnp.array([vertex_a, vertex_b])
+    vertex_updates = jnp.array([half_edge_ad, half_edge_bc])
+    updates['vertex_half_edge'] = state.vertex_half_edge.at[vertex_idx].set(vertex_updates)
+
     # Update the flipped edge
-    updates['half_edge_dest'] = state.half_edge_dest.at[half_edge_dc].set(vertex_c)
-    updates['half_edge_dest'] = updates['half_edge_dest'].at[half_edge_cd].set(vertex_d)
-    
-    updates['half_edge_next'] = state.half_edge_next.at[half_edge_dc].set(half_edge_ca)
-    updates['half_edge_next'] = updates['half_edge_next'].at[half_edge_cd].set(half_edge_db)
-    
-    updates['half_edge_prev'] = state.half_edge_prev.at[half_edge_dc].set(half_edge_ad)
-    updates['half_edge_prev'] = updates['half_edge_prev'].at[half_edge_cd].set(half_edge_bc)
-    
-    updates['half_edge_face'] = state.half_edge_face.at[half_edge_dc].set(face_adc)
-    updates['half_edge_face'] = updates['half_edge_face'].at[half_edge_cd].set(face_bcd)
+    half_edge_dest_idx = jnp.array([half_edge_dc, half_edge_cd])
+    half_edge_dest_updates = jnp.array([vertex_c, vertex_d])
+    updates['half_edge_dest'] = state.half_edge_dest.at[half_edge_dest_idx].set(half_edge_dest_updates)
     
     # Update surrounding half edges
-    updates['half_edge_next'] = updates['half_edge_next'].at[half_edge_ca].set(half_edge_ad)
-    updates['half_edge_next'] = updates['half_edge_next'].at[half_edge_ad].set(half_edge_dc)
-    updates['half_edge_next'] = updates['half_edge_next'].at[half_edge_db].set(half_edge_bc)
-    updates['half_edge_next'] = updates['half_edge_next'].at[half_edge_bc].set(half_edge_cd)
+    half_edge_next_idx = jnp.array([half_edge_dc, half_edge_cd, half_edge_ca, half_edge_ad, half_edge_db, half_edge_bc])
+    half_edge_next_updates = jnp.array([half_edge_ca, half_edge_db, half_edge_ad, half_edge_dc, half_edge_bc, half_edge_cd])
+    updates['half_edge_next'] = state.half_edge_next.at[half_edge_next_idx].set(half_edge_next_updates)
     
-    updates['half_edge_prev'] = updates['half_edge_prev'].at[half_edge_ca].set(half_edge_dc)
-    updates['half_edge_prev'] = updates['half_edge_prev'].at[half_edge_ad].set(half_edge_ca)
-    updates['half_edge_prev'] = updates['half_edge_prev'].at[half_edge_db].set(half_edge_cd)
-    updates['half_edge_prev'] = updates['half_edge_prev'].at[half_edge_bc].set(half_edge_db)
+    half_edge_prev_idx = jnp.array([half_edge_dc, half_edge_cd, half_edge_ca, half_edge_ad, half_edge_db, half_edge_bc])
+    half_edge_prev_updates = jnp.array([half_edge_ad, half_edge_bc, half_edge_dc, half_edge_ca, half_edge_cd, half_edge_db])
+    updates['half_edge_prev'] = state.half_edge_prev.at[half_edge_prev_idx].set(half_edge_prev_updates)
     
-    updates['half_edge_face'] = updates['half_edge_face'].at[half_edge_ca].set(face_adc)
-    updates['half_edge_face'] = updates['half_edge_face'].at[half_edge_ad].set(face_adc)
-    updates['half_edge_face'] = updates['half_edge_face'].at[half_edge_db].set(face_bcd)
-    updates['half_edge_face'] = updates['half_edge_face'].at[half_edge_bc].set(face_bcd)
+    half_edge_face_idx = jnp.array([half_edge_dc, half_edge_cd, half_edge_ca, half_edge_ad, half_edge_db, half_edge_bc])
+    half_edge_face_updates = jnp.array([face_adc, face_bcd, face_adc, face_adc, face_bcd, face_bcd])
+    updates['half_edge_face'] = state.half_edge_face.at[half_edge_face_idx].set(half_edge_face_updates)
     
     return state._replace(**updates)
 
 @jax.jit
 def refine_mesh(state):
     """Refine mesh by flipping edges to optimize vertex valences"""
+    edge_count = get_edge_count(state)
+
     # Find internal edges (both faces exist)
     edges = jnp.stack([state.half_edge_dest, state.half_edge_dest[state.half_edge_twin]], axis=-1)
     
@@ -718,23 +726,24 @@ def refine_mesh(state):
     ], axis=-1)
 
     # Process each internal edge
-    state, _ = jax.lax.scan(check_flip_edge, state, edges_data)
+    (state, _), _ = jax.lax.scan(check_flip_edge, (state, edge_count), edges_data)
     return state
 
-def check_flip_edge(state, edge_data):
+def check_flip_edge(state_and_counts, edge_data):
+
+    state, edge_count = state_and_counts
 
     edge = edge_data[:2]
     vertex_c, vertex_d, half_edge_idx, half_edge_face, half_edge_twin_face = edge_data[2:]
 
     return jax.lax.cond(
         (edge[0] < edge[1]) & (half_edge_face != -1) & (half_edge_twin_face != -1) & (half_edge_idx != -1),
-        lambda: _check_flip_edge(state, edge, vertex_c, vertex_d, half_edge_idx),
-        lambda: state
+        lambda: _check_flip_edge(state, edge_count, edge, vertex_c, vertex_d, half_edge_idx),
+        lambda: state_and_counts
     ), None # No output needed for scan
 
-def _check_flip_edge(state, edge, vertex_c, vertex_d, half_edge_idx):
-
-    edge_count = get_edge_count(state)
+@jax.jit
+def _check_flip_edge(state, edge_count, edge, vertex_c, vertex_d, half_edge_idx):
 
     vertex_quad = jnp.array([edge[0], edge[1], vertex_c, vertex_d])
     vertex_quad_edge_counts = edge_count[vertex_quad]
@@ -746,14 +755,23 @@ def _check_flip_edge(state, edge, vertex_c, vertex_d, half_edge_idx):
     no_flip_valence = jnp.sum(jnp.square(vertex_quad_edge_counts - no_flip_valence_weights))
     flip_valence = jnp.sum(jnp.square(vertex_quad_edge_counts - flip_valence_weights))
     
-    
+    should_flip = flip_valence < no_flip_valence
     state = jax.lax.cond(
-        flip_valence < no_flip_valence,
+        should_flip,
         lambda: flip_edge(state, half_edge_idx),
         lambda: state
     )
 
-    return state
+    # Update edge counts: if we flipped, a and b lose one edge, c and d gain one edge
+    edge_count_delta = jnp.zeros_like(edge_count)
+    edge_count_delta = edge_count_delta.at[edge[0]].add(jnp.where(should_flip, -1, 0))
+    edge_count_delta = edge_count_delta.at[edge[1]].add(jnp.where(should_flip, -1, 0))
+    edge_count_delta = edge_count_delta.at[vertex_c].add(jnp.where(should_flip, 1, 0))
+    edge_count_delta = edge_count_delta.at[vertex_d].add(jnp.where(should_flip, 1, 0))
+
+    new_edge_count = edge_count + edge_count_delta
+
+    return state, new_edge_count
 
 @jax.jit
 def maybe_generate_new_triangles(state, params, key, repulsion_mag):
@@ -789,7 +807,7 @@ def generate_new_triangles(state, params, key):
     key, subkey = jax.random.split(key)
 
     state = jax.lax.cond(
-        jnp.logical_and(chosen_on_boundary, twin_on_boundary),
+        jnp.logical_or(chosen_on_boundary, twin_on_boundary),
         lambda: add_boundary_triangle(state, chosen_vertex, dest_vertex, chosen_on_boundary, twin_on_boundary, subkey),
         lambda: add_internal_triangles(state, chosen_vertex, dest_vertex),
     )
@@ -813,6 +831,43 @@ def add_boundary_triangle(state, chosen_vertex, dest_vertex, chosen_on_boundary,
     )
 
     return state
+
+def calculate_face_normals(state):
+    normals = jnp.zeros((MAX_VERTICES, 3), dtype=np.float32)
+
+    # Get active faces
+    active_faces = state.face_idx[state.face_idx != -1]
+
+    # Get triangle vertices using the same pattern as in draw()
+    triangle_first_half_edges = state.face_half_edge[active_faces]
+    triangle_half_edges = jnp.stack([
+        triangle_first_half_edges,
+        state.half_edge_next[triangle_first_half_edges],
+        state.half_edge_next[state.half_edge_next[triangle_first_half_edges]],
+    ], -1)
+    triangle_vertices = state.half_edge_dest[triangle_half_edges]
+
+    # Get vertex positions for all triangles
+    triangle_positions = state.vertex_pos[triangle_vertices]  # shape: (n_faces, 3, 3)
+
+    # Calculate face normals using cross product
+    edge1 = triangle_positions[:, 1] - triangle_positions[:, 0]  # v2 - v1
+    edge2 = triangle_positions[:, 2] - triangle_positions[:, 0]  # v3 - v1
+    face_normals = jnp.cross(edge1, edge2)  # shape: (n_faces, 3)
+
+    # Normalize face normals
+    norms = jnp.linalg.norm(face_normals, axis=1, keepdims=True)
+    face_normals = jnp.where(norms > EPSILON, face_normals / norms, jnp.array([0.0, 0.0, 1.0]))
+
+    # Add face normals to vertex normals
+    for i in range(3):  # For each vertex in triangle
+        normals = normals.at[triangle_vertices[:, i]].add(face_normals)
+
+    # Normalize vertex normals
+    vertex_norms = jnp.linalg.norm(normals, axis=1, keepdims=True)
+    normals = jnp.where(vertex_norms > EPSILON, normals / vertex_norms, jnp.array([0.0, 0.0, 1.0]))
+
+    return normals
 
 def draw_pygame(state, screen):
     """Draw the mesh using pygame"""
@@ -848,6 +903,117 @@ def draw_pygame(state, screen):
     
     pygame.display.flip()
 
+def camera_matrix(width, height):
+    return glm.ortho(0, width, height, 0, -1.0, 1.0)  
+
+def draw(state, ctx, program, vao, vbo, nbo, ibo, screen, wireframe_mode=False):
+    active_faces = state.face_idx[state.face_idx != -1]
+    if len(active_faces) == 0:
+        return
+
+    # Calculate normals
+    normals = calculate_face_normals(state)
+
+    # Write ALL vertices to the buffer
+    vertex_pos_3d = np.stack([state.vertex_pos[:, 0:1], state.vertex_pos[:, 1:2], np.zeros((state.vertex_pos.shape[0], 1))], axis=-1)
+    all_vertices = np.ascontiguousarray(vertex_pos_3d.reshape(-1), dtype='f4')
+    vbo.write(all_vertices.tobytes())
+
+    # Write ALL normals to the buffer
+    all_normals = np.ascontiguousarray(normals.reshape(-1), dtype='f4')
+    nbo.write(all_normals.tobytes())
+
+    # Get all half-edges that have faces (not boundary half-edges with face == -1)
+    all_half_edges_with_faces = state.half_edge_idx[(state.half_edge_idx != -1) & (state.half_edge_face != -1)]
+
+    # Build triangles for all half-edges with faces
+    triangle_half_edges = np.stack([
+        all_half_edges_with_faces,
+        state.half_edge_next[all_half_edges_with_faces],
+        state.half_edge_next[state.half_edge_next[all_half_edges_with_faces]],
+    ], -1)
+    triangle_vertices = state.half_edge_dest[triangle_half_edges]
+
+    # Flatten to get index array
+    indices = np.ascontiguousarray(triangle_vertices.reshape(-1), dtype=np.uint32)
+    ibo.write(indices.tobytes())
+
+    camera = camera_matrix(screen.get_width(), screen.get_height())
+    ctx.clear()
+    ctx.enable(ctx.DEPTH_TEST)
+    ctx.disable(ctx.CULL_FACE)
+
+    # Set lighting uniforms
+    light_pos = np.array([screen.get_width()/2, screen.get_height()/4, 200.0], dtype='f4')
+    light_color = np.array([0.8, 0.8, 0.8], dtype='f4')
+    ambient_color = np.array([0.2, 0.2, 0.2], dtype='f4')
+
+    program['camera'].write(camera)
+    program['light_pos'].write(light_pos.tobytes())
+    program['light_color'].write(light_color.tobytes())
+    program['ambient_color'].write(ambient_color.tobytes())
+
+    # Render using the number of indices, not vertices
+    if wireframe_mode:
+        ctx.wireframe = True
+        vao.render(mode=moderngl.TRIANGLES, vertices=len(indices))
+        ctx.wireframe = False
+    else:
+        vao.render(mode=moderngl.TRIANGLES, vertices=len(indices))
+    pygame.display.flip()
+
+def init_shader():
+    ctx = moderngl.get_context()
+
+    program = ctx.program(
+        vertex_shader='''
+            #version 330 core
+
+            uniform mat4 camera;
+
+            layout (location = 0) in vec3 in_vertex;
+            layout (location = 1) in vec3 in_normal;
+
+            out vec3 world_pos;
+            out vec3 normal;
+
+            void main() {
+                world_pos = in_vertex;
+                normal = normalize(in_normal);
+                gl_Position = camera * vec4(in_vertex, 1.0);
+            }
+        ''',
+        fragment_shader='''
+            #version 330 core
+
+            uniform vec3 light_pos;
+            uniform vec3 light_color;
+            uniform vec3 ambient_color;
+
+            in vec3 world_pos;
+            in vec3 normal;
+
+            layout (location = 0) out vec4 out_color;
+
+            void main() {
+                vec3 light_dir = normalize(light_pos - world_pos);
+                vec3 face_normal = normalize(normal);
+
+                vec3 ambient = ambient_color;
+                vec3 diffuse = max(dot(face_normal, light_dir), 0.0) * light_color;
+
+                vec3 result = ambient + diffuse;
+                out_color = vec4(result, 1.0);
+            }
+        ''',
+    )
+
+    vbo = ctx.buffer(reserve=MAX_VERTICES * 3 * 4)
+    nbo = ctx.buffer(reserve=MAX_VERTICES * 3 * 4)  # normal buffer
+    ibo = ctx.buffer(reserve=MAX_VERTICES * 3 * 4)  # index buffer
+    vao = ctx.vertex_array(program, [(vbo, '3f', 'in_vertex'), (nbo, '3f', 'in_normal')], index_buffer=ibo)
+    return ctx, program, vao, vbo, nbo, ibo
+
 def main():
     width, height = 1400, 1400
     
@@ -855,7 +1021,7 @@ def main():
     key = jax.random.PRNGKey(42)
     
     # Create initial state and parameters
-    state = create_initial_state(num_dims=2)
+    state = create_initial_state(num_dims=3)
     params = MeshParams(
         spring_len=40.0,
         elastic_constant=0.1,
@@ -873,8 +1039,10 @@ def main():
     
     # Initialize pygame
     pygame.init()
-    screen = pygame.display.set_mode((width, height))
+    screen = pygame.display.set_mode((width, height), pygame.OPENGL | pygame.DOUBLEBUF, vsync=True)
     clock = pygame.time.Clock()
+
+    ctx, program, vao, vbo, nbo, ibo = init_shader()
     
     running = True
     frame_count = 0
@@ -894,7 +1062,8 @@ def main():
             state = refine_mesh(state)
         
         # Draw
-        draw_pygame(state, screen)
+        # draw_pygame(state, screen)
+        draw(state, ctx, program, vao, vbo, nbo, ibo, screen, wireframe_mode=False)
         clock.tick(60)
         frame_count += 1
     

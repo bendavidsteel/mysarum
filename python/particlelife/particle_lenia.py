@@ -5,7 +5,6 @@ import einops
 import jax
 import jax.numpy as jp
 import colorcet as cc
-import matplotlib.colors as mcolors
 
 # Define namedtuples for parameters and fields
 Params = collections.namedtuple('Params', 'mu_k sigma_k w_k mu_g sigma_g c_rep')
@@ -170,12 +169,17 @@ def precomputed_r_fields_f(p: Params, species, s, r):
     R = (c_rep / 2 * (1.0 - r).clip(0.0) ** 2).sum()
     return Fields(U, G, R, E=R - G)
 
-def fields_f(p: Params, points, species, x, s, map_size):
+def fields_f(p: Params, points, species, x, s, map_size, periodic=True):
     """Calculate the fields U, G, R, and E based on parameters and points.
     x: shape (2,) array of coordinates
     points: shape (N, 2) array of particle positions"""
     diff = x - points  # shape (N, N, D)
-    diff -= jp.round(diff / map_size) * map_size # periodic boundary
+    diff = jax.lax.cond(
+        periodic,
+        lambda x: x - jp.floor(x / map_size) * map_size,  # periodic boundary
+        lambda x: x,
+        diff
+    )
     r = jp.sqrt(jp.square(diff).sum(-1).clip(1e-10))  # shape (num_pairs,)
     mu_k = p.mu_k[s, species] # shape (num_points, num_kernels)
     sigma_k = p.sigma_k[s, species] # shape (num_points, num_kernels)
@@ -268,10 +272,15 @@ def evo_fields_and_update_f(p: Params, particles, species, x, s, key, current_pa
     
     return Fields(U, G, R, E=R - G), (new_species, new_param_idx)
 
-def direct_motion_f(params, points, species, map_size):
+def direct_motion_f(params, points, species, map_size, periodic=True):
     """Compute motion vector field using analytical gradients"""
     diff = points[:, None] - points  # shape (N, N, D)
-    diff -= jp.round(diff / map_size) * map_size # periodic boundary
+    diff = jax.lax.cond(
+        periodic,
+        lambda d: d - jp.round(d / map_size) * map_size, # periodic boundary
+        lambda d: d,
+        diff
+    )
     r2 = jp.square(diff).sum(-1)  # shape (N, N)
     r = jp.sqrt(r2.clip(1e-10))  # shape (N, N)
     r_unit = diff / r[..., None]  # shape (N, N, D)
@@ -351,10 +360,10 @@ def motion_f(params, points, species):
     grad_E = jax.grad(lambda p, s: fields_f(params, points, species, p, s).E)
     return -jax.vmap(grad_E)(points, species)
 
-def motion_and_energy_f(params, points, species, map_size):
+def motion_and_energy_f(params, points, species, map_size, periodic=True):
     """Compute the motion vector field as the negative gradient of the energy."""
 
-    grad_E = jax.value_and_grad(lambda p, s: fields_f(params, points, species, p, s, map_size).E)
+    grad_E = jax.value_and_grad(lambda p, s: fields_f(params, points, species, p, s, map_size, periodic=periodic).E)
     energy, grad = jax.vmap(grad_E)(points, species)
     return -grad, energy
 
@@ -365,10 +374,15 @@ def step_and_energy_f(params, points, species, dt, map_size):
     points -= jp.floor(points/map_size) * map_size  # periodic boundary
     return points, e
 
-def step_f(params, points, species, dt, map_size):
+def step_f(params, points, species, dt, map_size, periodic=True):
     """Perform a single Euler integration step."""
-    points += dt * direct_motion_f(params, points, species, map_size)
-    points -= jp.floor(points/map_size) * map_size  # periodic boundary
+    points += dt * direct_motion_f(params, points, species, map_size, periodic=periodic)
+    points = jax.lax.cond(
+        periodic,
+        lambda x: x - jp.floor(x/map_size) * map_size, # periodic boundary
+        lambda x: jp.clip(x, 0, map_size),
+        points
+    )
     return points
 
 def evo_step_f(params, particles, species, dt, map_size, key):
@@ -452,7 +466,7 @@ def draw_particles(trajectory, map_size, start=-16000, offset=2000, bloom=False)
     particle_colors = jp.ones((trajectory.shape[1], 3))
     return _draw_particles(trajectory, map_size, particle_colors, start=start, offset=offset, bloom=bloom)
 
-def _draw_particles(trajectory, map_size, particle_colors, start=-16000, offset=2000, bloom=False):
+def _draw_particles(trajectory, map_size, particle_colors, img_size=800, start=-16000, offset=2000, bloom=False):
     """
     Create an animation of particle trajectories using JAX and imageio.
     Optimized to minimize loops and leverage JAX's parallel processing.
@@ -466,7 +480,6 @@ def _draw_particles(trajectory, map_size, particle_colors, start=-16000, offset=
     subsampled_trajectory = trajectory[start::offset]
     
     # Define image dimensions and particle rendering parameters
-    img_size = 800
     particle_radius = 3
     radius_sq = particle_radius ** 2
 
@@ -524,8 +537,36 @@ def _draw_particles(trajectory, map_size, particle_colors, start=-16000, offset=
     frames = jax.vmap(render_frame)(subsampled_trajectory)
     return frames
 
+@functools.partial(jax.jit, static_argnames=['img_size'])
+def draw_particles_2d_fast(positions, particle_colors, map_size, img_size=800):
+    image = jp.zeros((img_size, img_size, 3), dtype=jp.float32)
+    
+    splat_size = 10
+    gaussian = jp.exp(-jp.linspace(-1, 1, splat_size)**2 / 0.1)
+    splat_template = jp.outer(gaussian, gaussian)
+    splats = splat_template[..., jp.newaxis] * particle_colors[:, jp.newaxis, jp.newaxis, :]
+    position_coords = (positions * img_size / map_size).astype(jp.int32)
+    
+    def add_splat(image, inputs):
+        position, splat = inputs
+        # Extract the region, add splat, then update
+        y_start = position[1] - splat_size // 2
+        x_start = position[0] - splat_size // 2
+        
+        current_region = jax.lax.dynamic_slice(
+            image, (y_start, x_start, 0), (splat_size, splat_size, 3)
+        )
+        updated_region = current_region + splat
+        
+        image = jax.lax.dynamic_update_slice(image, updated_region, (y_start, x_start, 0))
+        return image, None
+    
+    image, _ = jax.lax.scan(add_splat, image, (position_coords, splats))
+    return jp.clip(image, 0, 1)
+    
+
 @functools.partial(jax.jit, static_argnames=['map_size', 'num_species', 'start', 'offset'])
-def draw_multi_species_particles(trajectory, map_size, species=None, num_species=None, 
+def draw_multi_species_particles(trajectory, map_size, species, num_species, 
                                    start=-16000, offset=2000):
     """
     Wrapper to create three orthogonal view animations with colored species for 3D particles.
@@ -685,7 +726,7 @@ def generate_colors(n):
     
     return jp.asarray(rgb_colors)
 
-# @functools.partial(jax.jit, static_argnames=['map_size', 'num_species', 'start', 'offset'])
+@functools.partial(jax.jit, static_argnames=['map_size', 'start', 'offset'])
 def fancy_draw_particles(trajectory, energies, map_size, species, colors, 
                                    start=-16000, offset=2000):
     """
@@ -867,10 +908,10 @@ def chunk_sonify_particles(trajectory, energy, force, fps=30):
     ], axis=-1).astype(jp.float32)  # shape (num_samples, 2)
 
 @functools.partial(jax.jit, static_argnames=('num_steps', 'dt'))
-def multi_step_scan(params, initial_points, species, dt, num_steps, map_size):
+def multi_step_scan(params, initial_points, species, dt, num_steps, map_size, periodic=True):
     def scan_step(carry, _):
         points = carry
-        points = step_f(params, points, species, dt, map_size)
+        points = step_f(params, points, species, dt, map_size, periodic=periodic)
         return points, points
 
     final_points, trajectory = jax.lax.scan(
@@ -919,12 +960,17 @@ def multi_step_scan_with_force(params, initial_points, species, dt, num_steps, m
     return final_points, (trajectory, force)
 
 @functools.partial(jax.jit, static_argnames=('num_steps', 'dt', 'map_size'))
-def multi_step_scan_with_force_and_energy(params, initial_points, species, dt, num_steps, map_size):
+def multi_step_scan_with_force_and_energy(params, initial_points, species, dt, num_steps, map_size, periodic=True):
     def scan_step(carry, _):
         points = carry
-        f, e = motion_and_energy_f(params, points, species, map_size)
+        f, e = motion_and_energy_f(params, points, species, map_size, periodic=periodic)
         points += dt * f
-        points -= jp.floor(points/map_size) * map_size  # periodic boundary
+        points = jax.lax.cond(
+            periodic,
+            lambda x: x - jp.floor(x/map_size) * map_size, # periodic boundary
+            lambda x: jp.clip(x, 0, map_size),
+            points
+        )
         return points, (points, f, e)
 
     final_points, (trajectory, force, energy) = jax.lax.scan(

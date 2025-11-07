@@ -238,6 +238,7 @@ def update_func(positions, velocities, species, alpha, neighbors, params, key, s
     mutation_mask = jax.random.uniform(subkey, species.shape) < mutation_rate
     mutation_values = jax.random.normal(subkey, species.shape) * 0.1
     species = jnp.where(mutation_mask, species + mutation_values, species)
+    species = jnp.clip(species, -1.0, 1.0)
 
     return positions, velocities, species, alpha, neighbors, key
         
@@ -339,10 +340,11 @@ class ParticleLife:
 @jax.jit
 def species_to_color(species):
     """Convert species vectors to RGB colors."""
-    species = jnp.pad(species[:, :3], ((0, 0), (3 - species.shape[1], 0)), mode='constant')
-    colors = species % 1.0
-    # Ensure positive values and add alpha channel
-    colors = jnp.abs(colors)
+    colors = jnp.stack([
+        0.5 + 0.5 * jnp.maximum(species[:, 0], 0),
+        0.5 + 0.5 * jnp.maximum(-species[:, 0], 0),
+        0.5 + 0.5 * (species[:, 1] + 1) * 0.5,
+    ], axis=-1)
     return colors
 
 
@@ -385,7 +387,7 @@ def main():
     else:
         import imageio.v2 as iio
         video_filename = "./outputs/evo_particle_life.mp4"
-        num_frames = 1000
+        num_frames = 10
         w = iio.get_writer(video_filename, format='FFMPEG', mode='I', fps=30,
                        codec='libx264',
                        pixelformat='yuv420p')

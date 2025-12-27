@@ -6571,6 +6571,7 @@ version = "0.1.0"
 dependencies = [
  "bevy 0.18.0-rc.1",
  "bytemuck",
+ "crossbeam-channel",
  "futures",
  "nannou",
  "nannou_audio",

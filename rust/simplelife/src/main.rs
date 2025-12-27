@@ -2,12 +2,20 @@ use nannou::prelude::*;
 use nannou::wgpu::BufferInitDescriptor;
 use nannou_audio as audio;
 use nannou_audio::Buffer;
-use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
-use std::collections::VecDeque;
+use std::sync::Mutex;
+use crossbeam_channel::{self, Receiver};
+use ringbuf::{traits::{Consumer, Producer, Split, Observer}, HeapRb};
 
 const NUM_PARTICLES: u32 = 512;
-const AUDIO_CHUNK_SIZE: u32 = 8192;  // Larger chunks to reduce gaps
+const NUM_CHANNELS: u32 = 2;
+const SAMPLE_RATE: f32 = 44100.0;
+const TARGET_FRAME_RATE: f32 = 60.0;
+// Initial chunk size: samples needed per frame with some buffer headroom
+const INITIAL_CHUNK_SIZE: u32 = ((SAMPLE_RATE / TARGET_FRAME_RATE) as u32) * 2;
+// Bounds for chunk size adjustment
+const MIN_CHUNK_SIZE: u32 = (SAMPLE_RATE / TARGET_FRAME_RATE) as u32;
+const MAX_CHUNK_SIZE: u32 = INITIAL_CHUNK_SIZE * 8;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -38,8 +46,11 @@ struct AudioParams {
 }
 
 enum AudioCommand {
-    PushSamples(Vec<f32>),
     Exit,
+}
+
+struct AudioFeedback {
+    ideal_chunk_size: u32,
 }
 
 struct Compute {
@@ -59,15 +70,19 @@ struct Model {
     window: Entity,
     compute: Compute,
 
-    audio_tx: Sender<AudioCommand>,
+    // Wrapped in Mutex to satisfy Sync requirement (only accessed from main thread)
+    audio_producer: Mutex<ringbuf::HeapProd<f32>>,
+    audio_feedback_rx: Receiver<AudioFeedback>,
     _audio_thread: JoinHandle<()>,
 
     time: f32,
     read_task: Option<Task<Vec<f32>>>,
+    chunk_size: u32,
 }
 
 struct AudioModel {
-    buffer: VecDeque<f32>,
+    consumer: ringbuf::HeapCons<f32>,
+    feedback_tx: crossbeam_channel::Sender<AudioFeedback>,
 }
 
 fn main() {
@@ -87,13 +102,20 @@ fn model(app: &App) -> Model {
     let device = window.device();
     let queue = window.queue();
 
+    // Create ring buffer for lock-free audio transfer
+    // Size: enough for ~32 update frames worth of audio
+    let ring_buf_size = INITIAL_CHUNK_SIZE as usize * NUM_CHANNELS as usize * 32;
+    let ring_buf = HeapRb::<f32>::new(ring_buf_size);
+    let (audio_producer, audio_consumer) = ring_buf.split();
+
     // Start audio stream on a separate thread
     let audio_host = audio::Host::new();
+    let (audio_feedback_tx, audio_feedback_rx) = crossbeam_channel::unbounded();
     let audio_model = AudioModel {
-        buffer: VecDeque::with_capacity(AUDIO_CHUNK_SIZE as usize * 32),
+        consumer: audio_consumer,
+        feedback_tx: audio_feedback_tx,
     };
 
-    let (audio_tx, audio_rx) = mpsc::channel();
     let audio_thread = std::thread::spawn(move || {
         let stream = audio_host
             .new_output_stream(audio_model)
@@ -102,21 +124,9 @@ fn model(app: &App) -> Model {
             .unwrap();
         stream.play().unwrap();
 
-        // Process commands from main thread
+        // Keep thread alive - stream runs in background
         loop {
-            match audio_rx.recv() {
-                Ok(AudioCommand::PushSamples(samples)) => {
-                    let len = samples.len();
-                    stream.send(move |audio| {
-                        audio.buffer.extend(samples);
-                        eprintln!("Audio thread: pushed {} samples, buffer now {}", len, audio.buffer.len());
-                    }).ok();
-                }
-                Ok(AudioCommand::Exit) | Err(_) => {
-                    stream.pause().ok();
-                    break;
-                }
-            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
     });
 
@@ -183,14 +193,14 @@ fn model(app: &App) -> Model {
     // Audio compute pipeline
     let audio_out_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("audio_out"),
-        size: (AUDIO_CHUNK_SIZE * 2 * std::mem::size_of::<f32>() as u32) as u64,
+        size: (INITIAL_CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
 
     let audio_staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("audio_staging"),
-        size: (AUDIO_CHUNK_SIZE * 2 * std::mem::size_of::<f32>() as u32) as u64,
+        size: (INITIAL_CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -213,7 +223,7 @@ fn model(app: &App) -> Model {
         .uniform_buffer(wgpu::ShaderStages::COMPUTE, false)
         .build(&device);
 
-    let audio_out_size = (AUDIO_CHUNK_SIZE * 2 * std::mem::size_of::<f32>() as u32) as wgpu::BufferAddress;
+    let audio_out_size = (INITIAL_CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as wgpu::BufferAddress;
     let audio_bind_group = wgpu::BindGroupBuilder::new()
         .buffer_bytes(&particles_buf, 0, std::num::NonZeroU64::new(particles_buf_size))
         .buffer_bytes(&audio_out_buf, 0, std::num::NonZeroU64::new(audio_out_size))
@@ -240,9 +250,9 @@ fn model(app: &App) -> Model {
         &audio_params_buf,
         0,
         bytemuck::bytes_of(&AudioParams {
-            sample_rate: 44100.0,
+            sample_rate: SAMPLE_RATE,
             num_particles: NUM_PARTICLES,
-            chunk_size: AUDIO_CHUNK_SIZE,
+            chunk_size: INITIAL_CHUNK_SIZE,
             volume: 0.8,
         }),
     );
@@ -262,15 +272,17 @@ fn model(app: &App) -> Model {
     Model {
         window: w_id,
         compute,
-        audio_tx,
+        audio_producer: Mutex::new(audio_producer),
+        audio_feedback_rx,
         _audio_thread: audio_thread,
         time: 0.0,
         read_task: None,
+        chunk_size: INITIAL_CHUNK_SIZE,
     }
 }
 
-fn exit(_app: &App, model: Model) {
-    model.audio_tx.send(AudioCommand::Exit).ok();
+fn exit(_app: &App, _model: Model) {
+    // Audio thread will be cleaned up when Model is dropped
 }
 
 fn update(app: &App, model: &mut Model) {
@@ -278,12 +290,84 @@ fn update(app: &App, model: &mut Model) {
     let device = window.device();
     let queue = window.queue();
 
+    // Process audio feedback - use the latest ideal chunk size from audio thread
+    let mut latest_feedback = None;
+    while let Ok(feedback) = model.audio_feedback_rx.try_recv() {
+        latest_feedback = Some(feedback);
+    }
+
+    let mut chunk_size_changed = false;
+    if let Some(feedback) = latest_feedback {
+        let ideal = feedback.ideal_chunk_size;
+        let current = model.chunk_size;
+
+        // Only adjust if we're more than 20% off from ideal (hysteresis)
+        let ratio = ideal as f32 / current as f32;
+        if ratio < 0.8 || ratio > 1.2 {
+            // Blend towards ideal (smooth adjustment)
+            let new_chunk_size = ((current as f32 * 0.7) + (ideal as f32 * 0.3)) as u32;
+            let new_chunk_size = new_chunk_size.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
+
+            if new_chunk_size != current {
+                eprintln!("Chunk size adjusted: {} -> {} (ideal: {})", current, new_chunk_size, ideal);
+                model.chunk_size = new_chunk_size;
+                chunk_size_changed = true;
+            }
+        }
+    }
+
+    // Recreate audio buffers if chunk size changed
+    if chunk_size_changed {
+        let audio_buf_size = (model.chunk_size * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64;
+
+        model.compute.audio_out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("audio_out"),
+            size: audio_buf_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        model.compute.audio_staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("audio_staging"),
+            size: audio_buf_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Update audio params with new chunk size
+        queue.write_buffer(
+            &model.compute.audio_params_buf,
+            0,
+            bytemuck::bytes_of(&AudioParams {
+                sample_rate: SAMPLE_RATE,
+                num_particles: NUM_PARTICLES,
+                chunk_size: model.chunk_size,
+                volume: 0.8,
+            }),
+        );
+
+        // Recreate bind group with new buffer
+        let particles_buf_size = (NUM_PARTICLES as usize * std::mem::size_of::<Particle>()) as wgpu::BufferAddress;
+        let audio_bind_group_layout = wgpu::BindGroupLayoutBuilder::new()
+            .storage_buffer(wgpu::ShaderStages::COMPUTE, false, true)
+            .storage_buffer(wgpu::ShaderStages::COMPUTE, false, false)
+            .uniform_buffer(wgpu::ShaderStages::COMPUTE, false)
+            .build(&device);
+
+        model.compute.audio_bind_group = wgpu::BindGroupBuilder::new()
+            .buffer_bytes(&model.compute.particles_buf, 0, std::num::NonZeroU64::new(particles_buf_size))
+            .buffer_bytes(&model.compute.audio_out_buf, 0, std::num::NonZeroU64::new(audio_buf_size))
+            .buffer::<AudioParams>(&model.compute.audio_params_buf, 0..1)
+            .build(&device, &audio_bind_group_layout);
+    }
+
     // Check if previous read task completed
     if let Some(task) = &mut model.read_task {
         if let Some(samples) = block_on(future::poll_once(task)) {
             let max_val = samples.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-            eprintln!("GPU: sending {} samples, max={:.4}", samples.len(), max_val);
-            model.audio_tx.send(AudioCommand::PushSamples(samples)).ok();
+            // Push directly to ring buffer - no copying through channel
+            let pushed = model.audio_producer.lock().unwrap().push_slice(&samples);
+            eprintln!("GPU: produced {} samples (pushed {}), max={:.4}", samples.len(), pushed, max_val);
             model.read_task = None;
         }
     }
@@ -306,7 +390,7 @@ fn update(app: &App, model: &mut Model) {
     });
 
     // Create read buffer for audio
-    let audio_buf_size = (AUDIO_CHUNK_SIZE * 2 * std::mem::size_of::<f32>() as u32) as u64;
+    let audio_buf_size = (model.chunk_size * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64;
     let read_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("read-audio"),
         size: audio_buf_size,
@@ -346,7 +430,7 @@ fn update(app: &App, model: &mut Model) {
         });
         pass.set_pipeline(&model.compute.audio_pipeline);
         pass.set_bind_group(0, &model.compute.audio_bind_group, &[]);
-        pass.dispatch_workgroups((AUDIO_CHUNK_SIZE + 63) / 64, 1, 1);
+        pass.dispatch_workgroups((model.chunk_size + 63) / 64, 1, 1);
     }
 
     // Copy audio to read buffer
@@ -384,17 +468,46 @@ fn update(app: &App, model: &mut Model) {
 
 fn audio_fn(audio: &mut AudioModel, buffer: &mut Buffer) {
     static mut FRAME_COUNT: u32 = 0;
+
+    let buffer_len = audio.consumer.occupied_len();
+    let callback_samples = buffer.len() * NUM_CHANNELS as usize;
+
+    // Calculate how many samples we need per GPU update frame
+    // Audio callbacks run at SAMPLE_RATE/buffer_frames Hz, updates run at TARGET_FRAME_RATE Hz
+    // So we need (callback_rate / update_rate) * callback_samples per update
+    let buffer_frames = buffer.len() as f32 / NUM_CHANNELS as f32;
+    let callback_rate = SAMPLE_RATE / buffer_frames;
+    let callbacks_per_update = callback_rate / TARGET_FRAME_RATE;
+    let base_chunk_size = (callback_samples as f32 * callbacks_per_update) as usize;
+
+    // Target buffer: enough for ~4 update frames worth of audio
+    let target_buffer = base_chunk_size * 4;
+
+    let ideal_chunk_size = if buffer_len < target_buffer {
+        // Buffer is low - increase chunk size to catch up
+        let deficit = target_buffer - buffer_len;
+        base_chunk_size + deficit / 4
+    } else {
+        // Buffer is high - reduce chunk size to drain excess
+        let excess = buffer_len - target_buffer;
+        base_chunk_size.saturating_sub(excess / 8)
+    };
+
+    // Clamp to bounds and send
+    let ideal_chunk_size = (ideal_chunk_size as u32).clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
+    audio.feedback_tx.send(AudioFeedback { ideal_chunk_size }).ok();
+
     unsafe {
         FRAME_COUNT += 1;
         if FRAME_COUNT % 100 == 0 {
-            eprintln!("Audio callback: buffer has {}, needs {}", audio.buffer.len(), buffer.len());
+            eprintln!("Audio callback: buffer has {}, target {}, ideal chunk {}", buffer_len, target_buffer, ideal_chunk_size);
         }
     }
 
-    // Fill the output buffer from our local buffer
+    // Fill the output buffer from ring buffer (lock-free)
     for frame in buffer.frames_mut() {
         for sample in frame.iter_mut() {
-            *sample = audio.buffer.pop_front().unwrap_or(0.0);
+            *sample = audio.consumer.try_pop().unwrap_or(0.0);
         }
     }
 }

@@ -10,3 +10,4 @@ nannou_audio = { git = "https://github.com/nannou-org/nannou", branch = "bevy-re
 ringbuf = "0.4"
 bytemuck = { version = "1.14", features = ["derive"] }
 futures = "0.3"
+crossbeam-channel = "0.5"

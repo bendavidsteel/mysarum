@@ -3,11 +3,12 @@ use nannou::wgpu::BufferInitDescriptor;
 use nannou_audio as audio;
 use nannou_audio::Buffer;
 use std::thread::JoinHandle;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
 use crossbeam_channel::{self, Receiver};
 use ringbuf::{traits::{Consumer, Producer, Split, Observer}, HeapRb};
 
-const NUM_PARTICLES: u32 = 512;
+const NUM_PARTICLES: u32 = 64;
 const NUM_CHANNELS: u32 = 2;
 const SAMPLE_RATE: f32 = 44100.0;
 const TARGET_FRAME_RATE: f32 = 60.0;
@@ -16,6 +17,10 @@ const INITIAL_CHUNK_SIZE: u32 = ((SAMPLE_RATE / TARGET_FRAME_RATE) as u32) * 2;
 // Bounds for chunk size adjustment
 const MIN_CHUNK_SIZE: u32 = (SAMPLE_RATE / TARGET_FRAME_RATE) as u32;
 const MAX_CHUNK_SIZE: u32 = INITIAL_CHUNK_SIZE * 8;
+// Safety margin: target minimum buffer level (in samples) - enough for ~2 audio callbacks
+const TARGET_MIN_BUFFER: u32 = 4096;
+// Number of recent buffer levels to track for min calculation
+const BUFFER_HISTORY_SIZE: usize = 64;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -45,12 +50,9 @@ struct AudioParams {
     volume: f32,
 }
 
-enum AudioCommand {
-    Exit,
-}
-
 struct AudioFeedback {
-    ideal_chunk_size: u32,
+    min_buffer_level: u32,  // Minimum buffer level over recent history
+    current_buffer_level: u32,
 }
 
 struct Compute {
@@ -70,19 +72,28 @@ struct Model {
     window: Entity,
     compute: Compute,
 
-    // Wrapped in Mutex to satisfy Sync requirement (only accessed from main thread)
-    audio_producer: Mutex<ringbuf::HeapProd<f32>>,
+    // Wrapped in Arc<Mutex> for sharing with async readback task
+    audio_producer: Arc<Mutex<ringbuf::HeapProd<f32>>>,
     audio_feedback_rx: Receiver<AudioFeedback>,
     _audio_thread: JoinHandle<()>,
 
     time: f32,
-    read_task: Option<Task<Vec<f32>>>,
+    read_task: Option<Task<()>>,
     chunk_size: u32,
+
+    // PI controller state for chunk size adjustment
+    integral_error: f32,
+
+    // Shared particle data for rendering (updated by async readback task)
+    particles: Arc<Mutex<Vec<Particle>>>,
 }
 
 struct AudioModel {
     consumer: ringbuf::HeapCons<f32>,
     feedback_tx: crossbeam_channel::Sender<AudioFeedback>,
+
+    // Rolling buffer of recent buffer levels for min calculation
+    buffer_history: VecDeque<u32>,
 }
 
 fn main() {
@@ -111,9 +122,11 @@ fn model(app: &App) -> Model {
     // Start audio stream on a separate thread
     let audio_host = audio::Host::new();
     let (audio_feedback_tx, audio_feedback_rx) = crossbeam_channel::unbounded();
+
     let audio_model = AudioModel {
         consumer: audio_consumer,
         feedback_tx: audio_feedback_tx,
+        buffer_history: VecDeque::with_capacity(BUFFER_HISTORY_SIZE),
     };
 
     let audio_thread = std::thread::spawn(move || {
@@ -148,7 +161,7 @@ fn model(app: &App) -> Model {
     let particles_buf = device.create_buffer_init(&BufferInitDescriptor {
         label: Some("particles"),
         contents: bytemuck::cast_slice(&particles),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
     });
 
     let sim_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -272,12 +285,14 @@ fn model(app: &App) -> Model {
     Model {
         window: w_id,
         compute,
-        audio_producer: Mutex::new(audio_producer),
+        audio_producer: Arc::new(Mutex::new(audio_producer)),
         audio_feedback_rx,
         _audio_thread: audio_thread,
         time: 0.0,
         read_task: None,
         chunk_size: INITIAL_CHUNK_SIZE,
+        integral_error: 0.0,
+        particles: Arc::new(Mutex::new(particles)),
     }
 }
 
@@ -290,29 +305,50 @@ fn update(app: &App, model: &mut Model) {
     let device = window.device();
     let queue = window.queue();
 
-    // Process audio feedback - use the latest ideal chunk size from audio thread
+    // Process audio feedback - use the latest min buffer level from audio thread
     let mut latest_feedback = None;
+    let mut feedback_count = 0u32;
     while let Ok(feedback) = model.audio_feedback_rx.try_recv() {
         latest_feedback = Some(feedback);
+        feedback_count += 1;
     }
 
     let mut chunk_size_changed = false;
     if let Some(feedback) = latest_feedback {
-        let ideal = feedback.ideal_chunk_size;
-        let current = model.chunk_size;
+        let min_buffer = feedback.min_buffer_level as f32;
+        let current_buffer = feedback.current_buffer_level;
+        let target = TARGET_MIN_BUFFER as f32;
 
-        // Only adjust if we're more than 20% off from ideal (hysteresis)
-        let ratio = ideal as f32 / current as f32;
-        if ratio < 0.8 || ratio > 1.2 {
-            // Blend towards ideal (smooth adjustment)
-            let new_chunk_size = ((current as f32 * 0.7) + (ideal as f32 * 0.3)) as u32;
-            let new_chunk_size = new_chunk_size.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
+        // Log audio state (once per batch of feedback)
+        eprintln!(
+            "Audio: buffer={}, min_over_window={}, feedbacks={}",
+            current_buffer, feedback.min_buffer_level, feedback_count
+        );
 
-            if new_chunk_size != current {
-                eprintln!("Chunk size adjusted: {} -> {} (ideal: {})", current, new_chunk_size, ideal);
-                model.chunk_size = new_chunk_size;
-                chunk_size_changed = true;
-            }
+        // PI controller for chunk size
+        // Error: positive means buffer too low (need more samples), negative means buffer too high
+        let error = target - min_buffer;
+
+        // PI gains (tuned for stability - keep low to avoid oscillation)
+        let kp = 0.01;  // Proportional gain
+        let ki = 0.002; // Integral gain
+
+        // Update integral with anti-windup clamping
+        model.integral_error = (model.integral_error + error).clamp(-5000.0, 5000.0);
+
+        // Calculate adjustment
+        let adjustment = kp * error + ki * model.integral_error;
+
+        let new_chunk_size = ((model.chunk_size as f32) + adjustment) as u32;
+        let new_chunk_size = new_chunk_size.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
+
+        if new_chunk_size != model.chunk_size {
+            eprintln!(
+                "Chunk size: {} -> {} (min_buf={}, target={}, err={:.0}, int={:.0})",
+                model.chunk_size, new_chunk_size, min_buffer as u32, TARGET_MIN_BUFFER, error, model.integral_error
+            );
+            model.chunk_size = new_chunk_size;
+            chunk_size_changed = true;
         }
     }
 
@@ -363,11 +399,7 @@ fn update(app: &App, model: &mut Model) {
 
     // Check if previous read task completed
     if let Some(task) = &mut model.read_task {
-        if let Some(samples) = block_on(future::poll_once(task)) {
-            let max_val = samples.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-            // Push directly to ring buffer - no copying through channel
-            let pushed = model.audio_producer.lock().unwrap().push_slice(&samples);
-            eprintln!("GPU: produced {} samples (pushed {}), max={:.4}", samples.len(), pushed, max_val);
+        if block_on(future::poll_once(task)).is_some() {
             model.read_task = None;
         }
     }
@@ -442,22 +474,62 @@ fn update(app: &App, model: &mut Model) {
         audio_buf_size,
     );
 
+    // Create staging buffer for particle readback
+    let particles_buf_size = (NUM_PARTICLES as usize * std::mem::size_of::<Particle>()) as u64;
+    let particle_read_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("particle-read"),
+        size: particles_buf_size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    encoder.copy_buffer_to_buffer(
+        &model.compute.particles_buf,
+        0,
+        &particle_read_buffer,
+        0,
+        particles_buf_size,
+    );
+
     queue.submit(Some(encoder.finish()));
 
     // Only spawn new read task if previous one is done
     if model.read_task.is_none() {
+        let audio_producer_arc = model.audio_producer.clone();
+        let particles_arc = model.particles.clone();
+
         let future = async move {
-            let slice = read_buffer.slice(..);
-            let (tx, rx) = futures::channel::oneshot::channel();
-            slice.map_async(wgpu::MapMode::Read, |res| {
-                tx.send(res).expect("Channel closed");
+            // Read audio buffer
+            let audio_slice = read_buffer.slice(..);
+            let (audio_tx, audio_rx) = futures::channel::oneshot::channel();
+            audio_slice.map_async(wgpu::MapMode::Read, |res| {
+                audio_tx.send(res).expect("Channel closed");
             });
-            if let Ok(_) = rx.await {
-                let bytes = &slice.get_mapped_range()[..];
+
+            // Read particle buffer
+            let particle_slice = particle_read_buffer.slice(..);
+            let (particle_tx, particle_rx) = futures::channel::oneshot::channel();
+            particle_slice.map_async(wgpu::MapMode::Read, |res| {
+                particle_tx.send(res).expect("Channel closed");
+            });
+
+            // Wait for audio and copy to ring buffer
+            if let Ok(_) = audio_rx.await {
+                let bytes = &audio_slice.get_mapped_range()[..];
                 let floats = bytemuck::cast_slice::<u8, f32>(bytes);
-                floats.to_vec()
-            } else {
-                vec![]
+                if let Ok(mut producer) = audio_producer_arc.lock() {
+                    let pushed = producer.push_slice(floats);
+                    eprintln!("GPU: produced {} samples (pushed {})", floats.len(), pushed);
+                }
+            }
+
+            // Wait for particles and copy to shared vec
+            if let Ok(_) = particle_rx.await {
+                let bytes = &particle_slice.get_mapped_range()[..];
+                let particles: &[Particle] = bytemuck::cast_slice(bytes);
+                if let Ok(mut shared_particles) = particles_arc.lock() {
+                    shared_particles.copy_from_slice(particles);
+                }
             }
         };
 
@@ -467,42 +539,20 @@ fn update(app: &App, model: &mut Model) {
 }
 
 fn audio_fn(audio: &mut AudioModel, buffer: &mut Buffer) {
-    static mut FRAME_COUNT: u32 = 0;
+    let buffer_len = audio.consumer.occupied_len() as u32;
 
-    let buffer_len = audio.consumer.occupied_len();
-    let callback_samples = buffer.len() * NUM_CHANNELS as usize;
-
-    // Calculate how many samples we need per GPU update frame
-    // Audio callbacks run at SAMPLE_RATE/buffer_frames Hz, updates run at TARGET_FRAME_RATE Hz
-    // So we need (callback_rate / update_rate) * callback_samples per update
-    let buffer_frames = buffer.len() as f32 / NUM_CHANNELS as f32;
-    let callback_rate = SAMPLE_RATE / buffer_frames;
-    let callbacks_per_update = callback_rate / TARGET_FRAME_RATE;
-    let base_chunk_size = (callback_samples as f32 * callbacks_per_update) as usize;
-
-    // Target buffer: enough for ~4 update frames worth of audio
-    let target_buffer = base_chunk_size * 4;
-
-    let ideal_chunk_size = if buffer_len < target_buffer {
-        // Buffer is low - increase chunk size to catch up
-        let deficit = target_buffer - buffer_len;
-        base_chunk_size + deficit / 4
-    } else {
-        // Buffer is high - reduce chunk size to drain excess
-        let excess = buffer_len - target_buffer;
-        base_chunk_size.saturating_sub(excess / 8)
-    };
-
-    // Clamp to bounds and send
-    let ideal_chunk_size = (ideal_chunk_size as u32).clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
-    audio.feedback_tx.send(AudioFeedback { ideal_chunk_size }).ok();
-
-    unsafe {
-        FRAME_COUNT += 1;
-        if FRAME_COUNT % 100 == 0 {
-            eprintln!("Audio callback: buffer has {}, target {}, ideal chunk {}", buffer_len, target_buffer, ideal_chunk_size);
-        }
+    // Push new value, pop oldest if at capacity
+    audio.buffer_history.push_back(buffer_len);
+    if audio.buffer_history.len() > BUFFER_HISTORY_SIZE {
+        audio.buffer_history.pop_front();
     }
+
+    // Calculate min over the rolling window and send feedback
+    let min_buffer = audio.buffer_history.iter().copied().min().unwrap_or(0);
+    audio.feedback_tx.send(AudioFeedback {
+        min_buffer_level: min_buffer,
+        current_buffer_level: buffer_len,
+    }).ok();
 
     // Fill the output buffer from ring buffer (lock-free)
     for frame in buffer.frames_mut() {
@@ -516,17 +566,21 @@ fn view(app: &App, model: &Model) {
     let draw = app.draw();
     draw.background().color(BLACK);
 
-    // Draw particles as a visual indicator
-    let t = model.time;
-    for i in 0..NUM_PARTICLES {
-        let angle = (i as f32 / NUM_PARTICLES as f32) * TAU + t * 0.5;
-        let r = 200.0 + (t * 2.0 + i as f32 * 0.1).sin() * 50.0;
-        let x = angle.cos() * r;
-        let y = angle.sin() * r;
-        draw.ellipse()
-            .x_y(x, y)
-            .w_h(4.0, 4.0)
-            .hsla(i as f32 / NUM_PARTICLES as f32, 0.7, 0.6, 0.8);
+    let win = app.window_rect();
+    let scale = win.w().min(win.h()) * 0.9;
+
+    // Draw particles from actual GPU-computed positions
+    if let Ok(particles) = model.particles.lock() {
+        for (i, p) in particles.iter().enumerate() {
+            let x = p.pos[0] * scale;
+            let y = p.pos[1] * scale;
+            let hue = i as f32 / NUM_PARTICLES as f32;
+            let energy_brightness = 0.4 + p.energy.min(1.0) * 0.6;
+            draw.ellipse()
+                .x_y(x, y)
+                .w_h(6.0, 6.0)
+                .hsla(hue, 0.7, energy_brightness, 0.9);
+        }
     }
 }
 

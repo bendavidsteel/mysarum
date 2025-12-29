@@ -210,7 +210,6 @@ fn computeForces(@builtin(global_invocation_id) id : vec3u)
     var U = 0.0;
     var grad_U = vec2f(0.0, 0.0);
     var grad_R = vec2f(0.0, 0.0);
-    let scale = 4.0;
 
     for (var binX = binXMin; binX <= binXMax; binX += 1) {
         for (var binY = binYMin; binY <= binYMax; binY += 1) {
@@ -241,13 +240,13 @@ fn computeForces(@builtin(global_invocation_id) id : vec3u)
                     }
                 }
 
-                let r = length(diff) / scale;
+                let r = length(diff);
 				let r_unit = diff / r;
 				
 				for (var k = 0u; k < kernelsCount; k += 1) {
-					let mu_k = params_k[species * speciesCount * kernelsCount * 3 + otherSpecies * kernelsCount * 3 + k];
-                    let sigma_k = params_k[species * speciesCount * kernelsCount * 3 + otherSpecies * kernelsCount * 3 + k + 1];
-                    let w_k = params_k[species * speciesCount * kernelsCount * 3 + otherSpecies * kernelsCount * 3 + k + 2];
+					let mu_k = params_k[species * speciesCount * kernelsCount * 3 + otherSpecies * kernelsCount * 3 + k * 3];
+                    let sigma_k = params_k[species * speciesCount * kernelsCount * 3 + otherSpecies * kernelsCount * 3 + k * 3 + 1];
+                    let w_k = params_k[species * speciesCount * kernelsCount * 3 + otherSpecies * kernelsCount * 3 + k * 3 + 2];
                     let r_mu_k = r - mu_k;
                     let sigma2_k = sigma_k * sigma_k;
                     let u_kernel = w_k * exp(-r_mu_k * r_mu_k / sigma2_k);
@@ -267,8 +266,8 @@ fn computeForces(@builtin(global_invocation_id) id : vec3u)
     
     var dG_dU = 0.0;
     for (var k = 0u; k < growthFuncsCount; k += 1) {
-        let mu_g = params_g[species * growthFuncsCount * 2 + k];
-        let sigma_g = params_g[species * growthFuncsCount * 2 + k + 1];
+        let mu_g = params_g[species * growthFuncsCount * 2 + k * 2];
+        let sigma_g = params_g[species * growthFuncsCount * 2 + k * 2 + 1];
         let sigma2_g = sigma_g * sigma_g;
         let U_mu_g = U - mu_g;
         dG_dU += 2 * U_mu_g / sigma2_g * exp(-U_mu_g * U_mu_g / sigma2_g);
@@ -1509,14 +1508,14 @@ class TooltipLeniaSimulation {
       for (var j = 0; j < speciesCount; ++j) {
         c_rep[i * speciesCount + j] = systemDescription.species[i].c_rep[j];
         for (var k = 0; k < kernelsCount; ++k) {
-          params_k[i * speciesCount * kernelsCount * 3 + j * kernelsCount * 3 + k] = systemDescription.species[i].mu_k[j * kernelsCount + k];
-          params_k[i * speciesCount * kernelsCount * 3 + j * kernelsCount * 3 + k + 1] = systemDescription.species[i].sigma_k[j * kernelsCount + k];
-          params_k[i * speciesCount * kernelsCount * 3 + j * kernelsCount * 3 + k + 2] = systemDescription.species[i].w_k[j * kernelsCount + k];
+          params_k[i * speciesCount * kernelsCount * 3 + j * kernelsCount * 3 + k * 3] = systemDescription.species[i].mu_k[j * kernelsCount + k];
+          params_k[i * speciesCount * kernelsCount * 3 + j * kernelsCount * 3 + k * 3 + 1] = systemDescription.species[i].sigma_k[j * kernelsCount + k];
+          params_k[i * speciesCount * kernelsCount * 3 + j * kernelsCount * 3 + k * 3 + 2] = systemDescription.species[i].w_k[j * kernelsCount + k];
         }
       }
       for (var k = 0; k < growthFuncsCount; ++k) {
-        params_g[i * growthFuncsCount * 2 + k] = systemDescription.species[i].mu_g[k];
-        params_g[i * growthFuncsCount * 2 + k + 1] = systemDescription.species[i].sigma_g[k];
+        params_g[i * growthFuncsCount * 2 + k * 2] = systemDescription.species[i].mu_g[k];
+        params_g[i * growthFuncsCount * 2 + k * 2 + 1] = systemDescription.species[i].sigma_g[k];
       }
     }
     

@@ -11,17 +11,20 @@ use ringbuf::{traits::{Consumer, Producer, Split, Observer}, HeapRb};
 const NUM_PARTICLES: u32 = 64;
 const NUM_CHANNELS: u32 = 2;
 const SAMPLE_RATE: f32 = 44100.0;
-const TARGET_FRAME_RATE: f32 = 60.0;
-// Initial chunk size: samples needed per frame with some buffer headroom
-const INITIAL_CHUNK_SIZE: u32 = ((SAMPLE_RATE / TARGET_FRAME_RATE) as u32) * 2;
-// Bounds for chunk size adjustment
-const MIN_CHUNK_SIZE: u32 = (SAMPLE_RATE / TARGET_FRAME_RATE) as u32;
-const MAX_CHUNK_SIZE: u32 = INITIAL_CHUNK_SIZE * 8;
-// Safety margin: target minimum buffer level (in samples) - enough for ~2 audio callbacks
-const TARGET_MIN_BUFFER: u32 = 4096;
-// Number of recent buffer levels to track for min calculation
+const CHUNK_SIZE: u32 = 2048;
+const CHUNK_FLOATS: u32 = CHUNK_SIZE * NUM_CHANNELS;
+const INITIAL_REQUEST_THRESHOLD: u32 = CHUNK_FLOATS * 2;
+const MIN_REQUEST_THRESHOLD: u32 = CHUNK_FLOATS;
+const MAX_REQUEST_THRESHOLD: u32 = CHUNK_FLOATS * 16;
 const BUFFER_HISTORY_SIZE: usize = 64;
+const PARTICLE_SIZE: f32 = 12.0;
 
+// Shader sources (loaded at compile time)
+const PARTICLE_SHADER: &str = include_str!("shaders/particle.wgsl");
+const AUDIO_SHADER: &str = include_str!("shaders/audio.wgsl");
+const RENDER_SHADER: &str = include_str!("shaders/render.wgsl");
+
+// Particle struct - must match shader layout exactly
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct Particle {
@@ -29,7 +32,9 @@ struct Particle {
     vel: [f32; 2],
     phase: f32,
     energy: f32,
-    _pad: [f32; 2],
+    species: [f32; 2],
+    alpha: [f32; 2],
+    interaction: [f32; 2],
 }
 
 #[repr(C)]
@@ -38,7 +43,11 @@ struct SimParams {
     dt: f32,
     time: f32,
     num_particles: u32,
-    _pad: u32,
+    friction: f32,
+    mass: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 #[repr(C)]
@@ -50,42 +59,80 @@ struct AudioParams {
     volume: f32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct RenderParams {
+    screen_size: [f32; 2],
+    particle_size: f32,
+    num_particles: u32,
+}
+
+// Quad vertex for instanced rendering
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct QuadVertex {
+    position: [f32; 2],
+    uv: [f32; 2],
+}
+
+// Unit quad vertices (will be scaled by particle size in shader)
+const QUAD_VERTICES: [QuadVertex; 4] = [
+    QuadVertex { position: [-1.0, -1.0], uv: [0.0, 1.0] },
+    QuadVertex { position: [ 1.0, -1.0], uv: [1.0, 1.0] },
+    QuadVertex { position: [-1.0,  1.0], uv: [0.0, 0.0] },
+    QuadVertex { position: [ 1.0,  1.0], uv: [1.0, 0.0] },
+];
+
+const QUAD_INDICES: [u16; 6] = [0, 1, 2, 1, 3, 2];
+
+// Static vertex attributes for the quad
+const QUAD_VERTEX_ATTRS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
+
 struct AudioFeedback {
     min_buffer_level: u32,  // Minimum buffer level over recent history
     current_buffer_level: u32,
 }
 
+#[derive(Clone)]
 struct Compute {
-    particles_buf: wgpu::Buffer,
-    sim_params_buf: wgpu::Buffer,
-    particle_bind_group: wgpu::BindGroup,
-    particle_pipeline: wgpu::ComputePipeline,
+    particles_buf: Arc<wgpu::Buffer>,
+    sim_params_buf: Arc<wgpu::Buffer>,
+    particle_bind_group: Arc<wgpu::BindGroup>,
+    particle_pipeline: Arc<wgpu::ComputePipeline>,
 
-    audio_out_buf: wgpu::Buffer,
-    audio_staging_buf: wgpu::Buffer,
-    audio_params_buf: wgpu::Buffer,
-    audio_bind_group: wgpu::BindGroup,
-    audio_pipeline: wgpu::ComputePipeline,
+    audio_out_buf: Arc<wgpu::Buffer>,
+    audio_staging_buf: Arc<wgpu::Buffer>,
+    audio_params_buf: Arc<wgpu::Buffer>,
+    audio_bind_group: Arc<wgpu::BindGroup>,
+    audio_pipeline: Arc<wgpu::ComputePipeline>,
 }
 
+#[derive(Clone)]
+struct Render {
+    vertex_buffer: Arc<wgpu::Buffer>,
+    index_buffer: Arc<wgpu::Buffer>,
+    render_params_buf: Arc<wgpu::Buffer>,
+    bind_group: Arc<wgpu::BindGroup>,
+    pipeline: Arc<wgpu::RenderPipeline>,
+}
+
+#[derive(Clone)]
 struct Model {
     window: Entity,
     compute: Compute,
+    render: Render,
 
     // Wrapped in Arc<Mutex> for sharing with async readback task
     audio_producer: Arc<Mutex<ringbuf::HeapProd<f32>>>,
-    audio_feedback_rx: Receiver<AudioFeedback>,
-    _audio_thread: JoinHandle<()>,
+    audio_feedback_rx: Arc<Receiver<AudioFeedback>>,
+    _audio_thread: Arc<JoinHandle<()>>,
 
     time: f32,
-    read_task: Option<Task<()>>,
-    chunk_size: u32,
+    read_task: Arc<Mutex<Option<Task<()>>>>,
 
-    // PI controller state for chunk size adjustment
+    // PID controller state for request threshold adjustment
+    request_threshold: u32,
     integral_error: f32,
-
-    // Shared particle data for rendering (updated by async readback task)
-    particles: Arc<Mutex<Vec<Particle>>>,
 }
 
 struct AudioModel {
@@ -97,16 +144,15 @@ struct AudioModel {
 }
 
 fn main() {
-    nannou::app(model).update(update).exit(exit).run();
+    nannou::app(model).update(update).render(render).exit(exit).run();
 }
 
 fn model(app: &App) -> Model {
-    // Create window with view callback
+    // Create window
     let w_id = app
-        .new_window()
+        .new_window::<Model>()
         .primary()
         .size(800, 800)
-        .view(view)
         .build();
 
     let window = app.window(w_id);
@@ -115,7 +161,7 @@ fn model(app: &App) -> Model {
 
     // Create ring buffer for lock-free audio transfer
     // Size: enough for ~32 update frames worth of audio
-    let ring_buf_size = INITIAL_CHUNK_SIZE as usize * NUM_CHANNELS as usize * 32;
+    let ring_buf_size = CHUNK_SIZE as usize * NUM_CHANNELS as usize * 32;
     let ring_buf = HeapRb::<f32>::new(ring_buf_size);
     let (audio_producer, audio_consumer) = ring_buf.split();
 
@@ -153,7 +199,9 @@ fn model(app: &App) -> Model {
                 vel: [0.0, 0.0],
                 phase: random_f32(),
                 energy: 0.0,
-                _pad: [0.0; 2],
+                species: [0.0; 2],
+                alpha: [0.0; 2],
+                interaction: [0.0; 2],
             }
         })
         .collect();
@@ -206,14 +254,14 @@ fn model(app: &App) -> Model {
     // Audio compute pipeline
     let audio_out_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("audio_out"),
-        size: (INITIAL_CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64,
+        size: (CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
 
     let audio_staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("audio_staging"),
-        size: (INITIAL_CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64,
+        size: (CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -236,7 +284,7 @@ fn model(app: &App) -> Model {
         .uniform_buffer(wgpu::ShaderStages::COMPUTE, false)
         .build(&device);
 
-    let audio_out_size = (INITIAL_CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as wgpu::BufferAddress;
+    let audio_out_size = (CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as wgpu::BufferAddress;
     let audio_bind_group = wgpu::BindGroupBuilder::new()
         .buffer_bytes(&particles_buf, 0, std::num::NonZeroU64::new(particles_buf_size))
         .buffer_bytes(&audio_out_buf, 0, std::num::NonZeroU64::new(audio_out_size))
@@ -265,34 +313,107 @@ fn model(app: &App) -> Model {
         bytemuck::bytes_of(&AudioParams {
             sample_rate: SAMPLE_RATE,
             num_particles: NUM_PARTICLES,
-            chunk_size: INITIAL_CHUNK_SIZE,
+            chunk_size: CHUNK_SIZE,
             volume: 0.8,
         }),
     );
 
+    let particles_buf = Arc::new(particles_buf);
     let compute = Compute {
-        particles_buf,
-        sim_params_buf,
-        particle_bind_group,
-        particle_pipeline,
-        audio_out_buf,
-        audio_staging_buf,
-        audio_params_buf,
-        audio_bind_group,
-        audio_pipeline,
+        particles_buf: particles_buf.clone(),
+        sim_params_buf: Arc::new(sim_params_buf),
+        particle_bind_group: Arc::new(particle_bind_group),
+        particle_pipeline: Arc::new(particle_pipeline),
+        audio_out_buf: Arc::new(audio_out_buf),
+        audio_staging_buf: Arc::new(audio_staging_buf),
+        audio_params_buf: Arc::new(audio_params_buf),
+        audio_bind_group: Arc::new(audio_bind_group),
+        audio_pipeline: Arc::new(audio_pipeline),
+    };
+
+    // Create render pipeline for GPU-based particle rendering with instancing
+    let render_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("render_shader"),
+        source: wgpu::ShaderSource::Wgsl(RENDER_SHADER.into()),
+    });
+
+    // Vertex buffer for the quad
+    let vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("quad_vertices"),
+        contents: bytemuck::cast_slice(&QUAD_VERTICES),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+
+    // Index buffer for the quad
+    let index_buffer = device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("quad_indices"),
+        contents: bytemuck::cast_slice(&QUAD_INDICES),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+
+    // Render params uniform buffer
+    let render_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("render_params"),
+        size: std::mem::size_of::<RenderParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // Render bind group layout: particles storage + params uniform
+    let render_bind_group_layout = wgpu::BindGroupLayoutBuilder::new()
+        .storage_buffer(wgpu::ShaderStages::VERTEX, false, true) // particles read-only
+        .uniform_buffer(wgpu::ShaderStages::VERTEX, false)       // render params
+        .build(&device);
+
+    let render_bind_group = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&*particles_buf, 0, std::num::NonZeroU64::new(particles_buf_size))
+        .buffer::<RenderParams>(&render_params_buf, 0..1)
+        .build(&device, &render_bind_group_layout);
+
+    let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("render_pipeline_layout"),
+        bind_group_layouts: &[&render_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    let format = Frame::TEXTURE_FORMAT;
+    let msaa_samples = window.msaa_samples();
+
+    let render_pipeline = wgpu::RenderPipelineBuilder::from_layout(&render_pipeline_layout, &render_shader)
+        .vertex_entry_point("vs_main")
+        .fragment_shader(&render_shader)
+        .fragment_entry_point("fs_main")
+        .color_format(format)
+        .color_blend(wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::SrcAlpha,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        })
+        .alpha_blend(wgpu::BlendComponent::OVER)
+        .add_vertex_buffer::<QuadVertex>(&QUAD_VERTEX_ATTRS)
+        .sample_count(msaa_samples)
+        .primitive_topology(wgpu::PrimitiveTopology::TriangleList)
+        .build(&*device);
+
+    let render = Render {
+        vertex_buffer: Arc::new(vertex_buffer),
+        index_buffer: Arc::new(index_buffer),
+        render_params_buf: Arc::new(render_params_buf),
+        bind_group: Arc::new(render_bind_group),
+        pipeline: Arc::new(render_pipeline),
     };
 
     Model {
         window: w_id,
         compute,
+        render,
         audio_producer: Arc::new(Mutex::new(audio_producer)),
-        audio_feedback_rx,
-        _audio_thread: audio_thread,
+        audio_feedback_rx: Arc::new(audio_feedback_rx),
+        _audio_thread: Arc::new(audio_thread),
         time: 0.0,
-        read_task: None,
-        chunk_size: INITIAL_CHUNK_SIZE,
+        read_task: Arc::new(Mutex::new(None)),
+        request_threshold: INITIAL_REQUEST_THRESHOLD,
         integral_error: 0.0,
-        particles: Arc::new(Mutex::new(particles)),
     }
 }
 
@@ -305,102 +426,48 @@ fn update(app: &App, model: &mut Model) {
     let device = window.device();
     let queue = window.queue();
 
+    // Update render params with current window size
+    let win_size = window.size_pixels();
+    let render_params = RenderParams {
+        screen_size: [win_size.x as f32, win_size.y as f32],
+        particle_size: PARTICLE_SIZE,
+        num_particles: NUM_PARTICLES,
+    };
+    queue.write_buffer(
+        &*model.render.render_params_buf,
+        0,
+        bytemuck::bytes_of(&render_params),
+    );
+
     // Process audio feedback - use the latest min buffer level from audio thread
     let mut latest_feedback = None;
-    let mut feedback_count = 0u32;
     while let Ok(feedback) = model.audio_feedback_rx.try_recv() {
         latest_feedback = Some(feedback);
-        feedback_count += 1;
     }
 
-    let mut chunk_size_changed = false;
-    if let Some(feedback) = latest_feedback {
+    // PID controller adjusts request_threshold based on buffer feedback
+    if let Some(feedback) = &latest_feedback {
         let min_buffer = feedback.min_buffer_level as f32;
-        let current_buffer = feedback.current_buffer_level;
-        let target = TARGET_MIN_BUFFER as f32;
+        let target = (CHUNK_FLOATS * 2) as f32;
 
-        // Log audio state (once per batch of feedback)
-        eprintln!(
-            "Audio: buffer={}, min_over_window={}, feedbacks={}",
-            current_buffer, feedback.min_buffer_level, feedback_count
-        );
-
-        // PI controller for chunk size
-        // Error: positive means buffer too low (need more samples), negative means buffer too high
         let error = target - min_buffer;
+        let kp = 0.01;
+        let ki = 0.002;
 
-        // PI gains (tuned for stability - keep low to avoid oscillation)
-        let kp = 0.01;  // Proportional gain
-        let ki = 0.002; // Integral gain
-
-        // Update integral with anti-windup clamping
         model.integral_error = (model.integral_error + error).clamp(-5000.0, 5000.0);
-
-        // Calculate adjustment
         let adjustment = kp * error + ki * model.integral_error;
 
-        let new_chunk_size = ((model.chunk_size as f32) + adjustment) as u32;
-        let new_chunk_size = new_chunk_size.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
-
-        if new_chunk_size != model.chunk_size {
-            eprintln!(
-                "Chunk size: {} -> {} (min_buf={}, target={}, err={:.0}, int={:.0})",
-                model.chunk_size, new_chunk_size, min_buffer as u32, TARGET_MIN_BUFFER, error, model.integral_error
-            );
-            model.chunk_size = new_chunk_size;
-            chunk_size_changed = true;
-        }
-    }
-
-    // Recreate audio buffers if chunk size changed
-    if chunk_size_changed {
-        let audio_buf_size = (model.chunk_size * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64;
-
-        model.compute.audio_out_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("audio_out"),
-            size: audio_buf_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        model.compute.audio_staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("audio_staging"),
-            size: audio_buf_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Update audio params with new chunk size
-        queue.write_buffer(
-            &model.compute.audio_params_buf,
-            0,
-            bytemuck::bytes_of(&AudioParams {
-                sample_rate: SAMPLE_RATE,
-                num_particles: NUM_PARTICLES,
-                chunk_size: model.chunk_size,
-                volume: 0.8,
-            }),
-        );
-
-        // Recreate bind group with new buffer
-        let particles_buf_size = (NUM_PARTICLES as usize * std::mem::size_of::<Particle>()) as wgpu::BufferAddress;
-        let audio_bind_group_layout = wgpu::BindGroupLayoutBuilder::new()
-            .storage_buffer(wgpu::ShaderStages::COMPUTE, false, true)
-            .storage_buffer(wgpu::ShaderStages::COMPUTE, false, false)
-            .uniform_buffer(wgpu::ShaderStages::COMPUTE, false)
-            .build(&device);
-
-        model.compute.audio_bind_group = wgpu::BindGroupBuilder::new()
-            .buffer_bytes(&model.compute.particles_buf, 0, std::num::NonZeroU64::new(particles_buf_size))
-            .buffer_bytes(&model.compute.audio_out_buf, 0, std::num::NonZeroU64::new(audio_buf_size))
-            .buffer::<AudioParams>(&model.compute.audio_params_buf, 0..1)
-            .build(&device, &audio_bind_group_layout);
+        let new_threshold = ((model.request_threshold as f32) + adjustment) as u32;
+        model.request_threshold = new_threshold.clamp(MIN_REQUEST_THRESHOLD, MAX_REQUEST_THRESHOLD);
     }
 
     // Check if previous read task completed
-    if let Some(task) = &mut model.read_task {
-        if block_on(future::poll_once(task)).is_some() {
-            model.read_task = None;
+    {
+        let mut read_task = model.read_task.lock().unwrap();
+        if let Some(task) = read_task.as_mut() {
+            if block_on(future::poll_once(task)).is_some() {
+                *read_task = None;
+            }
         }
     }
 
@@ -412,7 +479,11 @@ fn update(app: &App, model: &mut Model) {
         dt,
         time: model.time,
         num_particles: NUM_PARTICLES,
-        _pad: 0,
+        friction: 0.1,
+        mass: 1.0,
+        _pad0: 0.0,
+        _pad1: 0.0,
+        _pad2: 0.0,
     };
     let sim_params_bytes = bytemuck::bytes_of(&sim_params);
     let new_sim_params_buf = device.create_buffer_init(&BufferInitDescriptor {
@@ -421,8 +492,8 @@ fn update(app: &App, model: &mut Model) {
         usage: wgpu::BufferUsages::COPY_SRC,
     });
 
-    // Create read buffer for audio
-    let audio_buf_size = (model.chunk_size * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64;
+    // Create read buffer for audio (fixed chunk size)
+    let audio_buf_size = (CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64;
     let read_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("read-audio"),
         size: audio_buf_size,
@@ -438,7 +509,7 @@ fn update(app: &App, model: &mut Model) {
     encoder.copy_buffer_to_buffer(
         &new_sim_params_buf,
         0,
-        &model.compute.sim_params_buf,
+        &*model.compute.sim_params_buf,
         0,
         std::mem::size_of::<SimParams>() as u64,
     );
@@ -449,54 +520,41 @@ fn update(app: &App, model: &mut Model) {
             label: Some("particle_pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&model.compute.particle_pipeline);
-        pass.set_bind_group(0, &model.compute.particle_bind_group, &[]);
+        pass.set_pipeline(&*model.compute.particle_pipeline);
+        pass.set_bind_group(0, &*model.compute.particle_bind_group, &[]);
         pass.dispatch_workgroups((NUM_PARTICLES + 63) / 64, 1, 1);
     }
 
-    // Audio synthesis pass
+    // Audio synthesis pass (fixed chunk size)
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("audio_pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&model.compute.audio_pipeline);
-        pass.set_bind_group(0, &model.compute.audio_bind_group, &[]);
-        pass.dispatch_workgroups((model.chunk_size + 63) / 64, 1, 1);
+        pass.set_pipeline(&*model.compute.audio_pipeline);
+        pass.set_bind_group(0, &*model.compute.audio_bind_group, &[]);
+        pass.dispatch_workgroups((CHUNK_SIZE + 63) / 64, 1, 1);
     }
 
     // Copy audio to read buffer
     encoder.copy_buffer_to_buffer(
-        &model.compute.audio_out_buf,
+        &*model.compute.audio_out_buf,
         0,
         &read_buffer,
         0,
         audio_buf_size,
     );
 
-    // Create staging buffer for particle readback
-    let particles_buf_size = (NUM_PARTICLES as usize * std::mem::size_of::<Particle>()) as u64;
-    let particle_read_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("particle-read"),
-        size: particles_buf_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    encoder.copy_buffer_to_buffer(
-        &model.compute.particles_buf,
-        0,
-        &particle_read_buffer,
-        0,
-        particles_buf_size,
-    );
-
     queue.submit(Some(encoder.finish()));
 
-    // Only spawn new read task if previous one is done
-    if model.read_task.is_none() {
+    // Only spawn new read task if previous one is done and buffer needs data
+    let should_request_audio = latest_feedback
+        .map(|f| f.current_buffer_level < model.request_threshold)
+        .unwrap_or(true);
+
+    let task_is_none = model.read_task.lock().unwrap().is_none();
+    if task_is_none && should_request_audio {
         let audio_producer_arc = model.audio_producer.clone();
-        let particles_arc = model.particles.clone();
 
         let future = async move {
             // Read audio buffer
@@ -506,35 +564,18 @@ fn update(app: &App, model: &mut Model) {
                 audio_tx.send(res).expect("Channel closed");
             });
 
-            // Read particle buffer
-            let particle_slice = particle_read_buffer.slice(..);
-            let (particle_tx, particle_rx) = futures::channel::oneshot::channel();
-            particle_slice.map_async(wgpu::MapMode::Read, |res| {
-                particle_tx.send(res).expect("Channel closed");
-            });
-
             // Wait for audio and copy to ring buffer
-            if let Ok(_) = audio_rx.await {
+            if audio_rx.await.is_ok() {
                 let bytes = &audio_slice.get_mapped_range()[..];
                 let floats = bytemuck::cast_slice::<u8, f32>(bytes);
                 if let Ok(mut producer) = audio_producer_arc.lock() {
-                    let pushed = producer.push_slice(floats);
-                    eprintln!("GPU: produced {} samples (pushed {})", floats.len(), pushed);
-                }
-            }
-
-            // Wait for particles and copy to shared vec
-            if let Ok(_) = particle_rx.await {
-                let bytes = &particle_slice.get_mapped_range()[..];
-                let particles: &[Particle] = bytemuck::cast_slice(bytes);
-                if let Ok(mut shared_particles) = particles_arc.lock() {
-                    shared_particles.copy_from_slice(particles);
+                    producer.push_slice(floats);
                 }
             }
         };
 
         let thread_pool = AsyncComputeTaskPool::get();
-        model.read_task = Some(thread_pool.spawn(future));
+        *model.read_task.lock().unwrap() = Some(thread_pool.spawn(future));
     }
 }
 
@@ -549,6 +590,8 @@ fn audio_fn(audio: &mut AudioModel, buffer: &mut Buffer) {
 
     // Calculate min over the rolling window and send feedback
     let min_buffer = audio.buffer_history.iter().copied().min().unwrap_or(0);
+
+    // Send feedback to main thread (PID controller will adjust threshold there)
     audio.feedback_tx.send(AudioFeedback {
         min_buffer_level: min_buffer,
         current_buffer_level: buffer_len,
@@ -562,167 +605,19 @@ fn audio_fn(audio: &mut AudioModel, buffer: &mut Buffer) {
     }
 }
 
-fn view(app: &App, model: &Model) {
-    let draw = app.draw();
-    draw.background().color(BLACK);
+fn render(_app: &RenderApp, model: &Model, frame: Frame) {
+    // GPU-based instanced rendering - no CPU roundtrip for particle positions
+    let mut encoder = frame.command_encoder();
 
-    let win = app.window_rect();
-    let scale = win.w().min(win.h()) * 0.9;
+    let mut render_pass = wgpu::RenderPassBuilder::new()
+        .color_attachment(frame.resolve_target_view().unwrap(), |color| color)
+        .begin(&mut encoder);
 
-    // Draw particles from actual GPU-computed positions
-    if let Ok(particles) = model.particles.lock() {
-        for (i, p) in particles.iter().enumerate() {
-            let x = p.pos[0] * scale;
-            let y = p.pos[1] * scale;
-            let hue = i as f32 / NUM_PARTICLES as f32;
-            let energy_brightness = 0.4 + p.energy.min(1.0) * 0.6;
-            draw.ellipse()
-                .x_y(x, y)
-                .w_h(6.0, 6.0)
-                .hsla(hue, 0.7, energy_brightness, 0.9);
-        }
-    }
+    render_pass.set_pipeline(&*model.render.pipeline);
+    render_pass.set_bind_group(0, &*model.render.bind_group, &[]);
+    render_pass.set_vertex_buffer(0, model.render.vertex_buffer.slice(..));
+    render_pass.set_index_buffer(model.render.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+
+    // Draw all particles with instancing
+    render_pass.draw_indexed(0..QUAD_INDICES.len() as u32, 0, 0..NUM_PARTICLES);
 }
-
-const PARTICLE_SHADER: &str = r#"
-struct Particle {
-    pos: vec2<f32>,
-    vel: vec2<f32>,
-    phase: f32,
-    energy: f32,
-    _pad: vec2<f32>,
-}
-
-struct SimParams {
-    dt: f32,
-    time: f32,
-    num_particles: u32,
-    _pad: u32,
-}
-
-@group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
-@group(0) @binding(1) var<uniform> params: SimParams;
-
-const PI: f32 = 3.14159265359;
-const TAU: f32 = 6.28318530718;
-
-// Simple Lenia-inspired kernel
-fn kernel(r: f32, mu: f32, sigma: f32) -> f32 {
-    return exp(-pow((r - mu) / sigma, 2.0) / 2.0);
-}
-
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x >= params.num_particles {
-        return;
-    }
-
-    var p = particles[id.x];
-
-    // Compute field from other particles
-    var field = 0.0;
-    var grad = vec2<f32>(0.0);
-
-    for (var i = 0u; i < params.num_particles; i++) {
-        if i == id.x {
-            continue;
-        }
-        let other = particles[i];
-        let diff = other.pos - p.pos;
-        let dist = length(diff);
-
-        if dist > 0.001 && dist < 0.5 {
-            let k = kernel(dist, 0.15, 0.05);
-            field += k;
-            grad += normalize(diff) * k;
-        }
-    }
-
-    // Growth function (Lenia-style)
-    let growth = kernel(field, 0.3, 0.1) * 2.0 - 1.0;
-
-    // Update velocity based on growth gradient
-    p.vel += grad * growth * params.dt * 0.5;
-    p.vel *= 0.98; // Damping
-
-    // Update position
-    p.pos += p.vel * params.dt;
-
-    // Boundary wrap
-    p.pos = fract(p.pos + 1.0) - 0.5;
-
-    // Update phase (for audio synthesis)
-    p.phase = fract(p.phase + params.dt * (1.0 + field * 2.0));
-
-    // Store energy for audio
-    p.energy = length(p.vel) + abs(growth) * 0.5;
-
-    particles[id.x] = p;
-}
-"#;
-
-const AUDIO_SHADER: &str = r#"
-struct Particle {
-    pos: vec2<f32>,
-    vel: vec2<f32>,
-    phase: f32,
-    energy: f32,
-    _pad: vec2<f32>,
-}
-
-struct AudioParams {
-    sample_rate: f32,
-    num_particles: u32,
-    chunk_size: u32,
-    volume: f32,
-}
-
-@group(0) @binding(0) var<storage, read> particles: array<Particle>;
-@group(0) @binding(1) var<storage, read_write> audio_out: array<vec2<f32>>;
-@group(0) @binding(2) var<uniform> params: AudioParams;
-
-const PI: f32 = 3.14159265359;
-const TAU: f32 = 6.28318530718;
-
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x >= params.chunk_size {
-        return;
-    }
-
-    let sample_idx = id.x;
-    let t = f32(sample_idx) / params.sample_rate;
-
-    var left = 0.0;
-    var right = 0.0;
-    var total_energy = 0.0;
-
-    // Sum contributions from all particles
-    for (var i = 0u; i < params.num_particles; i++) {
-        let p = particles[i];
-
-        // Base frequency derived from particle position
-        let base_freq = 100.0 + (p.pos.x + 0.5) * 400.0;
-
-        // Phase accumulation with particle's stored phase
-        let phase = TAU * base_freq * t + p.phase * TAU;
-
-        // Simple sine with harmonics, modulated by energy
-        let osc = sin(phase) + 0.5 * sin(phase * 2.0) + 0.25 * sin(phase * 3.0);
-
-        // Amplitude from particle energy (boosted for audibility)
-        let amp = p.energy * 0.5 + 0.002;  // base amplitude even with low energy
-
-        // Stereo pan based on x position
-        let pan = p.pos.x + 0.5; // 0 to 1
-
-        left += osc * amp * (1.0 - pan);
-        right += osc * amp * pan;
-        total_energy += p.energy;
-    }
-
-    // Normalize by particle count and apply volume
-    let norm = 1.0 / f32(params.num_particles);
-    audio_out[sample_idx] = vec2<f32>(left, right) * norm * params.volume;
-}
-"#;

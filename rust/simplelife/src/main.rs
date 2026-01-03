@@ -5,7 +5,7 @@ use nannou_audio::Buffer;
 use std::thread::JoinHandle;
 use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
-use crossbeam_channel::{self, Receiver};
+use crossbeam_channel::{self, Receiver, Sender};
 use ringbuf::{traits::{Consumer, Producer, Split, Observer}, HeapRb};
 
 const NUM_PARTICLES: u32 = 64;
@@ -88,6 +88,7 @@ const QUAD_INDICES: [u16; 6] = [0, 1, 2, 1, 3, 2];
 // Static vertex attributes for the quad
 const QUAD_VERTEX_ATTRS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
 
+#[derive(Clone)]
 struct AudioFeedback {
     min_buffer_level: u32,  // Minimum buffer level over recent history
     current_buffer_level: u32,
@@ -101,7 +102,8 @@ struct Compute {
     particle_pipeline: Arc<wgpu::ComputePipeline>,
 
     audio_out_buf: Arc<wgpu::Buffer>,
-    audio_staging_buf: Arc<wgpu::Buffer>,
+    // Double-buffered staging for audio readback
+    audio_staging_bufs: [Arc<wgpu::Buffer>; 2],
     audio_params_buf: Arc<wgpu::Buffer>,
     audio_bind_group: Arc<wgpu::BindGroup>,
     audio_pipeline: Arc<wgpu::ComputePipeline>,
@@ -118,21 +120,25 @@ struct Render {
 
 #[derive(Clone)]
 struct Model {
-    window: Entity,
     compute: Compute,
     render: Render,
 
-    // Wrapped in Arc<Mutex> for sharing with async readback task
+    // Wrapped in Arc<Mutex> for sharing with audio callback
     audio_producer: Arc<Mutex<ringbuf::HeapProd<f32>>>,
     audio_feedback_rx: Arc<Receiver<AudioFeedback>>,
     _audio_thread: Arc<JoinHandle<()>>,
 
+    // Channel for receiving audio data from GPU readback
+    audio_data_tx: Arc<Sender<Vec<f32>>>,
+    audio_data_rx: Arc<Receiver<Vec<f32>>>,
+
     time: f32,
-    read_task: Arc<Mutex<Option<Task<()>>>>,
+    frame_count: u64,
 
     // PID controller state for request threshold adjustment
     request_threshold: u32,
     integral_error: f32,
+    latest_feedback: Option<AudioFeedback>,
 }
 
 struct AudioModel {
@@ -151,7 +157,7 @@ fn model(app: &App) -> Model {
     // Create window
     let w_id = app
         .new_window::<Model>()
-        .primary()
+        .hdr(true)
         .size(800, 800)
         .build();
 
@@ -259,8 +265,15 @@ fn model(app: &App) -> Model {
         mapped_at_creation: false,
     });
 
-    let audio_staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("audio_staging"),
+    // Double-buffered staging for audio readback
+    let audio_staging_buf_0 = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("audio_staging_0"),
+        size: (CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let audio_staging_buf_1 = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("audio_staging_1"),
         size: (CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
@@ -325,7 +338,7 @@ fn model(app: &App) -> Model {
         particle_bind_group: Arc::new(particle_bind_group),
         particle_pipeline: Arc::new(particle_pipeline),
         audio_out_buf: Arc::new(audio_out_buf),
-        audio_staging_buf: Arc::new(audio_staging_buf),
+        audio_staging_bufs: [Arc::new(audio_staging_buf_0), Arc::new(audio_staging_buf_1)],
         audio_params_buf: Arc::new(audio_params_buf),
         audio_bind_group: Arc::new(audio_bind_group),
         audio_pipeline: Arc::new(audio_pipeline),
@@ -403,17 +416,22 @@ fn model(app: &App) -> Model {
         pipeline: Arc::new(render_pipeline),
     };
 
+    // Channel for GPU audio readback
+    let (audio_data_tx, audio_data_rx) = crossbeam_channel::unbounded();
+
     Model {
-        window: w_id,
         compute,
         render,
         audio_producer: Arc::new(Mutex::new(audio_producer)),
         audio_feedback_rx: Arc::new(audio_feedback_rx),
         _audio_thread: Arc::new(audio_thread),
+        audio_data_tx: Arc::new(audio_data_tx),
+        audio_data_rx: Arc::new(audio_data_rx),
         time: 0.0,
-        read_task: Arc::new(Mutex::new(None)),
+        frame_count: 0,
         request_threshold: INITIAL_REQUEST_THRESHOLD,
         integral_error: 0.0,
+        latest_feedback: None,
     }
 }
 
@@ -421,23 +439,13 @@ fn exit(_app: &App, _model: Model) {
     // Audio thread will be cleaned up when Model is dropped
 }
 
-fn update(app: &App, model: &mut Model) {
-    let window = app.window(model.window);
-    let device = window.device();
-    let queue = window.queue();
-
-    // Update render params with current window size
-    let win_size = window.size_pixels();
-    let render_params = RenderParams {
-        screen_size: [win_size.x as f32, win_size.y as f32],
-        particle_size: PARTICLE_SIZE,
-        num_particles: NUM_PARTICLES,
-    };
-    queue.write_buffer(
-        &*model.render.render_params_buf,
-        0,
-        bytemuck::bytes_of(&render_params),
-    );
+fn update(_app: &App, model: &mut Model) {
+    // Process audio data from GPU readback
+    while let Ok(audio_data) = model.audio_data_rx.try_recv() {
+        if let Ok(mut producer) = model.audio_producer.lock() {
+            producer.push_slice(&audio_data);
+        }
+    }
 
     // Process audio feedback - use the latest min buffer level from audio thread
     let mut latest_feedback = None;
@@ -461,22 +469,60 @@ fn update(app: &App, model: &mut Model) {
         model.request_threshold = new_threshold.clamp(MIN_REQUEST_THRESHOLD, MAX_REQUEST_THRESHOLD);
     }
 
-    // Check if previous read task completed
-    {
-        let mut read_task = model.read_task.lock().unwrap();
-        if let Some(task) = read_task.as_mut() {
-            if block_on(future::poll_once(task)).is_some() {
-                *read_task = None;
-            }
-        }
-    }
-
     let dt = 1.0 / 60.0;
     model.time += dt;
+    model.frame_count += 1;
+
+    // Store latest feedback for use in render
+    model.latest_feedback = latest_feedback;
+}
+
+fn audio_fn(audio: &mut AudioModel, buffer: &mut Buffer) {
+    let buffer_len = audio.consumer.occupied_len() as u32;
+
+    // Push new value, pop oldest if at capacity
+    audio.buffer_history.push_back(buffer_len);
+    if audio.buffer_history.len() > BUFFER_HISTORY_SIZE {
+        audio.buffer_history.pop_front();
+    }
+
+    // Calculate min over the rolling window and send feedback
+    let min_buffer = audio.buffer_history.iter().copied().min().unwrap_or(0);
+
+    // Send feedback to main thread (PID controller will adjust threshold there)
+    audio.feedback_tx.send(AudioFeedback {
+        min_buffer_level: min_buffer,
+        current_buffer_level: buffer_len,
+    }).ok();
+
+    // Fill the output buffer from ring buffer (lock-free)
+    for frame in buffer.frames_mut() {
+        for sample in frame.iter_mut() {
+            *sample = audio.consumer.try_pop().unwrap_or(0.0);
+        }
+    }
+}
+
+fn render(app: &RenderApp, model: &Model, frame: Frame) {
+    let device = frame.device();
+
+    // Update render params with current window size
+    let frame_size = frame.texture_size();
+    let render_params = RenderParams {
+        screen_size: [frame_size[0] as f32, frame_size[1] as f32],
+        particle_size: PARTICLE_SIZE,
+        num_particles: NUM_PARTICLES,
+    };
+    let render_params_bytes = bytemuck::bytes_of(&render_params);
+    let new_render_params_buf = device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("render-params-transfer"),
+        contents: render_params_bytes,
+        usage: wgpu::BufferUsages::COPY_SRC,
+    });
 
     // Update sim params
     let sim_params = SimParams {
-        dt,
+        dt: 1.0 / 60.0,
         time: model.time,
         num_particles: NUM_PARTICLES,
         friction: 0.1,
@@ -492,20 +538,18 @@ fn update(app: &App, model: &mut Model) {
         usage: wgpu::BufferUsages::COPY_SRC,
     });
 
-    // Create read buffer for audio (fixed chunk size)
     let audio_buf_size = (CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64;
-    let read_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("read-audio"),
-        size: audio_buf_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
 
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("compute_encoder"),
-    });
+    let mut encoder = frame.command_encoder();
 
-    // Copy new sim params
+    // Copy new params
+    encoder.copy_buffer_to_buffer(
+        &new_render_params_buf,
+        0,
+        &*model.render.render_params_buf,
+        0,
+        std::mem::size_of::<RenderParams>() as u64,
+    );
     encoder.copy_buffer_to_buffer(
         &new_sim_params_buf,
         0,
@@ -536,88 +580,62 @@ fn update(app: &App, model: &mut Model) {
         pass.dispatch_workgroups((CHUNK_SIZE + 63) / 64, 1, 1);
     }
 
-    // Copy audio to read buffer
+    // Double-buffer audio readback: write to one buffer, read from the other
+    let write_idx = (model.frame_count % 2) as usize;
+    let read_idx = ((model.frame_count + 1) % 2) as usize;
+
+    // Copy audio to the write staging buffer
     encoder.copy_buffer_to_buffer(
         &*model.compute.audio_out_buf,
         0,
-        &read_buffer,
+        &*model.compute.audio_staging_bufs[write_idx],
         0,
         audio_buf_size,
     );
 
-    queue.submit(Some(encoder.finish()));
+    // GPU-based instanced rendering
+    {
+        let mut render_pass = wgpu::RenderPassBuilder::new()
+            .color_attachment(frame.resolve_target_view().unwrap(), |color| color)
+            .begin(&mut encoder);
 
-    // Only spawn new read task if previous one is done and buffer needs data
-    let should_request_audio = latest_feedback
-        .map(|f| f.current_buffer_level < model.request_threshold)
-        .unwrap_or(true);
+        render_pass.set_pipeline(&*model.render.pipeline);
+        render_pass.set_bind_group(0, &*model.render.bind_group, &[]);
+        render_pass.set_vertex_buffer(0, model.render.vertex_buffer.slice(..));
+        render_pass.set_index_buffer(model.render.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
 
-    let task_is_none = model.read_task.lock().unwrap().is_none();
-    if task_is_none && should_request_audio {
-        let audio_producer_arc = model.audio_producer.clone();
+        // Draw all particles with instancing
+        render_pass.draw_indexed(0..QUAD_INDICES.len() as u32, 0, 0..NUM_PARTICLES);
+    }
 
-        let future = async move {
-            // Read audio buffer
-            let audio_slice = read_buffer.slice(..);
-            let (audio_tx, audio_rx) = futures::channel::oneshot::channel();
-            audio_slice.map_async(wgpu::MapMode::Read, |res| {
-                audio_tx.send(res).expect("Channel closed");
-            });
+    // After frame 1, we can start reading from the buffer that was written in the previous frame
+    // The map_async will complete after this frame's commands are submitted by nannou
+    if model.frame_count >= 2 {
+        let read_buf = model.compute.audio_staging_bufs[read_idx].clone();
+        let audio_tx = model.audio_data_tx.clone();
+        let audio_buf_size = audio_buf_size as usize;
 
-            // Wait for audio and copy to ring buffer
-            if audio_rx.await.is_ok() {
-                let bytes = &audio_slice.get_mapped_range()[..];
-                let floats = bytemuck::cast_slice::<u8, f32>(bytes);
-                if let Ok(mut producer) = audio_producer_arc.lock() {
-                    producer.push_slice(floats);
-                }
+        let slice = read_buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            if result.is_ok() {
+                // Need to get the mapped range and copy data
+                // This callback runs on the wgpu device thread after the map completes
+                // We'll handle the actual reading in a separate step
             }
-        };
+        });
 
-        let thread_pool = AsyncComputeTaskPool::get();
-        *model.read_task.lock().unwrap() = Some(thread_pool.spawn(future));
+        // Use bevy's async task pool to handle the buffer reading
+        let read_buf_for_task = model.compute.audio_staging_bufs[read_idx].clone();
+        std::thread::spawn(move || {
+            // Wait a bit for the map to complete (this is a workaround)
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            let slice = read_buf_for_task.slice(..);
+            if let Ok(mapped) = std::panic::catch_unwind(|| slice.get_mapped_range()) {
+                let floats: Vec<f32> = bytemuck::cast_slice(&mapped[..audio_buf_size]).to_vec();
+                drop(mapped);
+                read_buf_for_task.unmap();
+                let _ = audio_tx.send(floats);
+            }
+        });
     }
-}
-
-fn audio_fn(audio: &mut AudioModel, buffer: &mut Buffer) {
-    let buffer_len = audio.consumer.occupied_len() as u32;
-
-    // Push new value, pop oldest if at capacity
-    audio.buffer_history.push_back(buffer_len);
-    if audio.buffer_history.len() > BUFFER_HISTORY_SIZE {
-        audio.buffer_history.pop_front();
-    }
-
-    // Calculate min over the rolling window and send feedback
-    let min_buffer = audio.buffer_history.iter().copied().min().unwrap_or(0);
-
-    // Send feedback to main thread (PID controller will adjust threshold there)
-    audio.feedback_tx.send(AudioFeedback {
-        min_buffer_level: min_buffer,
-        current_buffer_level: buffer_len,
-    }).ok();
-
-    // Fill the output buffer from ring buffer (lock-free)
-    for frame in buffer.frames_mut() {
-        for sample in frame.iter_mut() {
-            *sample = audio.consumer.try_pop().unwrap_or(0.0);
-        }
-    }
-}
-
-fn render(_app: &RenderApp, model: &Model, frame: Frame) {
-    // GPU-based instanced rendering - no CPU roundtrip for particle positions
-    let mut encoder = frame.command_encoder();
-
-    let mut render_pass = wgpu::RenderPassBuilder::new()
-        .color_attachment(frame.resolve_target_view().unwrap(), |color| color)
-        .begin(&mut encoder);
-
-    render_pass.set_pipeline(&*model.render.pipeline);
-    render_pass.set_bind_group(0, &*model.render.bind_group, &[]);
-    render_pass.set_vertex_buffer(0, model.render.vertex_buffer.slice(..));
-    render_pass.set_index_buffer(model.render.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-
-    // Draw all particles with instancing
-    render_pass.draw_indexed(0..QUAD_INDICES.len() as u32, 0, 0..NUM_PARTICLES);
 }

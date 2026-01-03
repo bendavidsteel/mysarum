@@ -5,7 +5,7 @@ use nannou_audio::Buffer;
 use std::thread::JoinHandle;
 use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
-use crossbeam_channel::{self, Receiver, Sender};
+use crossbeam_channel::{self, Receiver};
 use ringbuf::{traits::{Consumer, Producer, Split, Observer}, HeapRb};
 
 const NUM_PARTICLES: u32 = 64;
@@ -127,10 +127,6 @@ struct Model {
     audio_producer: Arc<Mutex<ringbuf::HeapProd<f32>>>,
     audio_feedback_rx: Arc<Receiver<AudioFeedback>>,
     _audio_thread: Arc<JoinHandle<()>>,
-
-    // Channel for receiving audio data from GPU readback
-    audio_data_tx: Arc<Sender<Vec<f32>>>,
-    audio_data_rx: Arc<Receiver<Vec<f32>>>,
 
     time: f32,
     frame_count: u64,
@@ -416,17 +412,12 @@ fn model(app: &App) -> Model {
         pipeline: Arc::new(render_pipeline),
     };
 
-    // Channel for GPU audio readback
-    let (audio_data_tx, audio_data_rx) = crossbeam_channel::unbounded();
-
     Model {
         compute,
         render,
         audio_producer: Arc::new(Mutex::new(audio_producer)),
         audio_feedback_rx: Arc::new(audio_feedback_rx),
         _audio_thread: Arc::new(audio_thread),
-        audio_data_tx: Arc::new(audio_data_tx),
-        audio_data_rx: Arc::new(audio_data_rx),
         time: 0.0,
         frame_count: 0,
         request_threshold: INITIAL_REQUEST_THRESHOLD,
@@ -440,13 +431,6 @@ fn exit(_app: &App, _model: Model) {
 }
 
 fn update(_app: &App, model: &mut Model) {
-    // Process audio data from GPU readback
-    while let Ok(audio_data) = model.audio_data_rx.try_recv() {
-        if let Ok(mut producer) = model.audio_producer.lock() {
-            producer.push_slice(&audio_data);
-        }
-    }
-
     // Process audio feedback - use the latest min buffer level from audio thread
     let mut latest_feedback = None;
     while let Ok(feedback) = model.audio_feedback_rx.try_recv() {
@@ -609,32 +593,22 @@ fn render(app: &RenderApp, model: &Model, frame: Frame) {
     }
 
     // After frame 1, we can start reading from the buffer that was written in the previous frame
-    // The map_async will complete after this frame's commands are submitted by nannou
+    // The map_async callback fires when the buffer is ready - do all work inside the callback
     if model.frame_count >= 2 {
         let read_buf = model.compute.audio_staging_bufs[read_idx].clone();
-        let audio_tx = model.audio_data_tx.clone();
+        let read_buf_for_callback = read_buf.clone();
+        let audio_producer = model.audio_producer.clone();
         let audio_buf_size = audio_buf_size as usize;
 
-        let slice = read_buf.slice(..);
-        slice.map_async(wgpu::MapMode::Read, move |result| {
+        read_buf.slice(..).map_async(wgpu::MapMode::Read, move |result| {
             if result.is_ok() {
-                // Need to get the mapped range and copy data
-                // This callback runs on the wgpu device thread after the map completes
-                // We'll handle the actual reading in a separate step
-            }
-        });
-
-        // Use bevy's async task pool to handle the buffer reading
-        let read_buf_for_task = model.compute.audio_staging_bufs[read_idx].clone();
-        std::thread::spawn(move || {
-            // Wait a bit for the map to complete (this is a workaround)
-            std::thread::sleep(std::time::Duration::from_millis(16));
-            let slice = read_buf_for_task.slice(..);
-            if let Ok(mapped) = std::panic::catch_unwind(|| slice.get_mapped_range()) {
-                let floats: Vec<f32> = bytemuck::cast_slice(&mapped[..audio_buf_size]).to_vec();
-                drop(mapped);
-                read_buf_for_task.unmap();
-                let _ = audio_tx.send(floats);
+                let data = read_buf_for_callback.slice(..).get_mapped_range();
+                let floats = bytemuck::cast_slice::<u8, f32>(&data[..audio_buf_size]);
+                if let Ok(mut producer) = audio_producer.lock() {
+                    producer.push_slice(floats);
+                }
+                drop(data);
+                read_buf_for_callback.unmap();
             }
         });
     }

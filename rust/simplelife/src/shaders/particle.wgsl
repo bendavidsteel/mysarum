@@ -18,9 +18,13 @@ struct SimParams {
     num_particles: u32,
     friction: f32,
     mass: f32,
-    _pad0: f32,
+    map_x0: f32,
+    map_x1: f32,
+    map_y0: f32,
+    map_y1: f32,
     _pad1: f32,
     _pad2: f32,
+    _pad3: f32,
 }
 
 @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
@@ -34,7 +38,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     var p = particles[id.x];
 
-    let force = vec2<f32>(sin(params.time), cos(params.time)) * 10.0;
+    let force = vec2<f32>(sin(params.time), cos(params.time)) * 0.001;
 
     let mu = pow(0.5, params.dt / params.friction);
     p.vel *= mu;
@@ -45,10 +49,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     p.pos += p.vel * params.dt;
 
     // Wrap positions to stay in [-1, 1] range
-    p.pos = (p.pos + 1.0) % 2.0 - 1.0;
-    // Handle negative modulo correctly
-    if (p.pos.x < -1.0) { p.pos.x += 2.0; }
-    if (p.pos.y < -1.0) { p.pos.y += 2.0; }
+    let map_min = vec2<f32>(params.map_x0, params.map_y0);
+    let map_max = vec2<f32>(params.map_x1, params.map_y1);
+    let map_size = map_max - map_min;
+    p.pos -= floor((p.pos - map_min) / map_size) * map_size;
 
     // Update energy based on velocity magnitude
     let speed = length(p.vel);

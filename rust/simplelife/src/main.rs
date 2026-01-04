@@ -2,7 +2,7 @@ use nannou::prelude::*;
 use nannou::wgpu::BufferInitDescriptor;
 use nannou_audio as audio;
 use nannou_audio::Buffer;
-use std::thread::JoinHandle;
+use std::thread::{JoinHandle, current};
 use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
 use crossbeam_channel::{self, Receiver};
@@ -23,6 +23,7 @@ const PARTICLE_SIZE: f32 = 12.0;
 const PARTICLE_SHADER: &str = include_str!("shaders/particle.wgsl");
 const AUDIO_SHADER: &str = include_str!("shaders/audio.wgsl");
 const RENDER_SHADER: &str = include_str!("shaders/render.wgsl");
+const PHASE_UPDATE_SHADER: &str = include_str!("shaders/phase_update.wgsl");
 
 // Particle struct - must match shader layout exactly
 #[repr(C)]
@@ -45,9 +46,13 @@ struct SimParams {
     num_particles: u32,
     friction: f32,
     mass: f32,
-    _pad0: f32,
+    map_x0: f32,
+    map_x1: f32,
+    map_y0: f32,
+    map_y1: f32,
     _pad1: f32,
     _pad2: f32,
+    _pad3: f32,
 }
 
 #[repr(C)]
@@ -57,6 +62,15 @@ struct AudioParams {
     num_particles: u32,
     chunk_size: u32,
     volume: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct PhaseUpdateParams {
+    sample_rate: f32,
+    num_particles: u32,
+    chunk_size: u32,
+    _pad: u32,
 }
 
 #[repr(C)]
@@ -107,6 +121,10 @@ struct Compute {
     audio_params_buf: Arc<wgpu::Buffer>,
     audio_bind_group: Arc<wgpu::BindGroup>,
     audio_pipeline: Arc<wgpu::ComputePipeline>,
+
+    phase_update_params_buf: Arc<wgpu::Buffer>,
+    phase_update_bind_group: Arc<wgpu::BindGroup>,
+    phase_update_pipeline: Arc<wgpu::ComputePipeline>,
 }
 
 #[derive(Clone)]
@@ -130,6 +148,15 @@ struct Model {
 
     time: f32,
     frame_count: u64,
+    map_x0: f32,
+    map_x1: f32,
+    map_y0: f32,
+    map_y1: f32,
+
+    current_x0: f32,
+    current_x1: f32,
+    current_y0: f32,
+    current_y1: f32,
 
     // PID controller state for request threshold adjustment
     request_threshold: u32,
@@ -191,13 +218,23 @@ fn model(app: &App) -> Model {
         }
     });
 
+    let map_x0 = -4.0;
+    let map_x1 = 4.0;
+    let map_y0 = -4.0;
+    let map_y1 = 4.0;
+
+    let current_x0 = map_x0;
+    let current_x1 = map_x1;
+    let current_y0 = map_y0;
+    let current_y1 = map_y1;
+
     // Initialize particles
     let particles: Vec<Particle> = (0..NUM_PARTICLES)
         .map(|i| {
-            let angle = (i as f32 / NUM_PARTICLES as f32) * TAU;
-            let r = 0.3 + random_f32() * 0.2;
+            let x = map_x0 + (map_x1 - map_x0) * random_f32();
+            let y = map_y0 + (map_y1 - map_y0) * random_f32();
             Particle {
-                pos: [angle.cos() * r, angle.sin() * r],
+                pos: [x, y],
                 vel: [0.0, 0.0],
                 phase: random_f32(),
                 energy: 0.0,
@@ -315,6 +352,56 @@ fn model(app: &App) -> Model {
         cache: None,
     });
 
+    let phase_update_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("phase_update_shader"),
+        source: wgpu::ShaderSource::Wgsl(PHASE_UPDATE_SHADER.into()),
+    });
+
+    // Phase update params buffer
+    let phase_update_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("phase_update_params"),
+        size: std::mem::size_of::<PhaseUpdateParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let phase_update_bind_group_layout = wgpu::BindGroupLayoutBuilder::new()
+        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, false) // particles read-write
+        .uniform_buffer(wgpu::ShaderStages::COMPUTE, false)
+        .build(&device);
+
+    let phase_update_bind_group = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&particles_buf, 0, std::num::NonZeroU64::new(particles_buf_size))
+        .buffer::<PhaseUpdateParams>(&phase_update_params_buf, 0..1)
+        .build(&device, &phase_update_bind_group_layout);
+
+    let phase_update_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("phase_update_pl"),
+        bind_group_layouts: &[&phase_update_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    let phase_update_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("phase_update_pipeline"),
+        layout: Some(&phase_update_pipeline_layout),
+        module: &phase_update_shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    // Write initial phase update params
+    queue.write_buffer(
+        &phase_update_params_buf,
+        0,
+        bytemuck::bytes_of(&PhaseUpdateParams {
+            sample_rate: SAMPLE_RATE,
+            num_particles: NUM_PARTICLES,
+            chunk_size: CHUNK_SIZE,
+            _pad: 0,
+        }),
+    );
+
     // Write initial audio params
     queue.write_buffer(
         &audio_params_buf,
@@ -338,6 +425,9 @@ fn model(app: &App) -> Model {
         audio_params_buf: Arc::new(audio_params_buf),
         audio_bind_group: Arc::new(audio_bind_group),
         audio_pipeline: Arc::new(audio_pipeline),
+        phase_update_params_buf: Arc::new(phase_update_params_buf),
+        phase_update_bind_group: Arc::new(phase_update_bind_group),
+        phase_update_pipeline: Arc::new(phase_update_pipeline),
     };
 
     // Create render pipeline for GPU-based particle rendering with instancing
@@ -420,6 +510,14 @@ fn model(app: &App) -> Model {
         _audio_thread: Arc::new(audio_thread),
         time: 0.0,
         frame_count: 0,
+        map_x0,
+        map_x1,
+        map_y0,
+        map_y1,
+        current_x0,
+        current_x1,
+        current_y0,
+        current_y1,
         request_threshold: INITIAL_REQUEST_THRESHOLD,
         integral_error: 0.0,
         latest_feedback: None,
@@ -511,9 +609,13 @@ fn render(app: &RenderApp, model: &Model, frame: Frame) {
         num_particles: NUM_PARTICLES,
         friction: 0.1,
         mass: 1.0,
-        _pad0: 0.0,
+        map_x0: model.map_x0,
+        map_x1: model.map_x1,
+        map_y0: model.map_y0,
+        map_y1: model.map_y1,
         _pad1: 0.0,
         _pad2: 0.0,
+        _pad3: 0.0,
     };
     let sim_params_bytes = bytemuck::bytes_of(&sim_params);
     let new_sim_params_buf = device.create_buffer_init(&BufferInitDescriptor {
@@ -562,6 +664,16 @@ fn render(app: &RenderApp, model: &Model, frame: Frame) {
         pass.set_pipeline(&*model.compute.audio_pipeline);
         pass.set_bind_group(0, &*model.compute.audio_bind_group, &[]);
         pass.dispatch_workgroups((CHUNK_SIZE + 63) / 64, 1, 1);
+    }
+
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("phase_update_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&*model.compute.phase_update_pipeline);
+        pass.set_bind_group(0, &*model.compute.phase_update_bind_group, &[]);
+        pass.dispatch_workgroups((NUM_PARTICLES + 63) / 64, 1, 1);
     }
 
     // Double-buffer audio readback: write to one buffer, read from the other

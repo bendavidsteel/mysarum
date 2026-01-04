@@ -44,7 +44,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let base_freq = 100.0 + (p.pos.x + 0.5) * 400.0;
 
         // Phase accumulation with particle's stored phase
-        let phase = TAU * base_freq * t + p.phase * TAU;
+        let phase = TAU * base_freq * t + p.phase;
 
         // Simple sine with harmonics, modulated by energy
         let osc = sin(phase) + 0.5 * sin(phase * 2.0) + 0.25 * sin(phase * 3.0);

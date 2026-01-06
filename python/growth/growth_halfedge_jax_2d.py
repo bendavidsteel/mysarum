@@ -11,38 +11,81 @@ import pygame
 
 from growth_halfedge_jax import (
     MeshParams, 
+    MeshState,
     add_external_triangle,
-    create_initial_state,
-    maybe_generate_new_triangles,
+    create_initial_state_and_params,
     refine_mesh, 
     make_first_triangle,
     calculate_spring_force,
     calculate_repulsion_force,
+    add_boundary_triangle,
+    add_internal_edge_triangle,
+    add_internal_triangles,
+    get_on_boundary,
+    update_vertex_state,
+    set_vertex_state_edge,
     EPSILON
 )
 
 @jax.jit
-def update_positions(state, params, dt=0.1):
+def calculate_planar_force_open(state, params):
+    """Calculate planar forces to keep mesh flat"""
+    # for each vertex, sum its neighbour positions and get its edge count
+    vertex_sum = jnp.zeros_like(state.vertex_pos)
+    edge_count = jnp.zeros((state.vertex_idx.shape[0],), dtype=int)
+    start_half_edge = state.vertex_half_edge.copy()
+    start_vertex = state.half_edge_dest[start_half_edge]
+    vertex_a = start_vertex.copy()
+    half_edge_a = start_half_edge.copy()
+    iterating = jnp.ones_like(half_edge_a)
+
+    # TODO maybe no planar force for boundary vertices?
+    
+    def cond_func(carry):
+        vertex_sum, edge_count, half_edge_a, vertex_a, iterating = carry
+        return jnp.any(iterating)
+    
+    def body_func(carry):
+        vertex_sum, edge_count, half_edge_a, vertex_a, iterating = carry
+        half_edge_b = state.half_edge_next[state.half_edge_twin[half_edge_a]]
+        vertex_b = state.half_edge_dest[half_edge_b]
+        iterating = iterating & (vertex_b != start_vertex)
+        vertex_sum += (state.vertex_pos[vertex_b] * iterating[:, np.newaxis])
+        edge_count += iterating
+        return (vertex_sum, edge_count, half_edge_b, vertex_b, iterating)
+
+    vertex_sum, edge_count, _, _, _ = jax.lax.while_loop(
+        cond_func,
+        body_func,
+        (vertex_sum, edge_count, half_edge_a, vertex_a, iterating)
+    )
+
+    neighbour_avg = vertex_sum / (edge_count[:, np.newaxis] + EPSILON)
+    planar_force = (neighbour_avg - state.vertex_pos) * (state.vertex_idx != -1)[:, np.newaxis]
+
+    on_boundary = get_on_boundary(state)
+    planar_force *= ~on_boundary[:, np.newaxis]
+
+    return planar_force
+
+@jax.jit
+def update_positions(state: MeshState, params: MeshParams, dt=0.1):
     """Update vertex positions based on forces"""
     spring_force = calculate_spring_force(state, params)
     repulsion_mag, repulsion_force = calculate_repulsion_force(state, params)
     bulge_force = calculate_bulge_force_2d(state, params)
-    
-    total_force = (spring_force + 
-                   params.repulsion_strength * repulsion_force + 
-                   params.bulge_strength * bulge_force)
-    
+    planar_force = calculate_planar_force_open(state, params)
+
+    total_force = (spring_force +
+                   params.repulsion_strength * repulsion_force +
+                   params.bulge_strength * bulge_force +
+                   params.planar_strength * planar_force)
+
     # Only update active vertices
     active_mask = state.vertex_idx != -1
     new_positions = state.vertex_pos + dt * total_force * active_mask[:, None]
     
-    # Update suitability
-    min_repulsion = jnp.min(jnp.where(repulsion_mag > 0, repulsion_mag, jnp.inf))
-    min_repulsion = jnp.where(jnp.isfinite(min_repulsion), min_repulsion, 1.0)
-    repulsion_norm = repulsion_mag / min_repulsion
-    new_suitability = 1 / (1 + repulsion_norm ** 2) * active_mask.astype(jnp.float32)
-    
-    return state._replace(vertex_pos=new_positions, vertex_suitability=new_suitability), repulsion_mag
+    return state._replace(vertex_pos=new_positions), repulsion_mag
 
 
 def draw_pygame(state, screen):
@@ -52,10 +95,11 @@ def draw_pygame(state, screen):
     # Convert JAX arrays to numpy for drawing
     vertex_pos = np.array(state.vertex_pos)
     vertex_idx = np.array(state.vertex_idx)
+    vertex_colour = np.array((0.5 * (jnp.tanh(state.vertex_state[:, :-1]) + 1) * 255).astype(np.uint8))
     half_edge_dest = np.array(state.half_edge_dest)
     half_edge_prev = np.array(state.half_edge_prev)
     half_edge_idx = np.array(state.half_edge_idx)
-    vertex_suitability = np.array(state.vertex_suitability)
+    # vertex_suitability = np.array(state.vertex_suitability)
     
     # Draw edges
     active_edges = half_edge_idx != -1
@@ -72,11 +116,12 @@ def draw_pygame(state, screen):
     active_vertices = vertex_idx != -1
     for i in np.where(active_vertices)[0]:
         pos = vertex_pos[i]
-        if pos[0] >= 0:  # Valid position
-            suitability = vertex_suitability[i]
-            color = int(255 * suitability)
-            pygame.draw.circle(screen, (color, color, color), pos.astype(int), 5)
-    
+        colour = vertex_colour[i]
+        if len(colour) == 3:
+            pygame.draw.circle(screen, (colour[0], colour[1], colour[2]), pos.astype(int), 5)
+        else:
+            pygame.draw.circle(screen, (colour[0], colour[0], colour[0]), pos.astype(int), 5)
+
     pygame.display.flip()
 
 def make_first_triangle(state, width, height):
@@ -135,7 +180,7 @@ def make_first_triangle(state, width, height):
     )
 
 @jax.jit
-def calculate_bulge_force_2d(state, params):
+def calculate_bulge_force_2d(state: MeshState, params: MeshParams):
     """Calculate bulge forces for boundary edges"""
     # Find boundary half edges
     boundary_mask = (state.half_edge_face == -1) & (state.half_edge_idx != -1)
@@ -149,7 +194,7 @@ def calculate_bulge_force_2d(state, params):
     edge_vector = edge_pos[1] - edge_pos[0]
 
     next_edge = jnp.stack([
-        state.half_edge_next[state.half_edge_twin],
+        state.half_edge_dest[state.half_edge_twin],
         state.half_edge_dest[state.half_edge_next[state.half_edge_twin]],
 
     ])
@@ -179,21 +224,87 @@ def calculate_bulge_force_2d(state, params):
     
     return vertex_force
 
+def generate_new_triangles(state, params, key):
+    # Find active vertices
+
+    key, subkey = jax.random.split(key)
+    # Choose a random vertex weighted by suitability
+    logits = state.vertex_state[:, -1]
+    probs = jax.nn.softmax(logits, where=state.vertex_idx != -1)
+    chosen_vertex = jax.random.choice(subkey, state.vertex_idx, p=probs)
+    
+    # Get its half edge and destination
+    chosen_half_edge = state.vertex_half_edge[chosen_vertex]
+    dest_vertex = state.half_edge_dest[chosen_half_edge]
+
+    # Check if on boundary
+    chosen_on_boundary = state.half_edge_face[chosen_half_edge] == -1
+    twin_on_boundary = state.half_edge_face[state.half_edge_twin[chosen_half_edge]] == -1
+    
+    key, subkey = jax.random.split(key)
+
+    state = jax.lax.cond(
+        jnp.logical_or(chosen_on_boundary, twin_on_boundary),
+        lambda: add_boundary_triangle(state, chosen_vertex, dest_vertex, chosen_on_boundary, twin_on_boundary, subkey),
+        lambda: add_internal_triangles(state, chosen_vertex, dest_vertex),
+    )
+
+    return state, key
+
+def add_boundary_triangle(state, chosen_vertex, dest_vertex, chosen_on_boundary, twin_on_boundary, subkey):
+    # Add triangle based on boundary status
+    state = jax.lax.cond(
+        jax.random.uniform(subkey) < 0.5,
+        lambda: state,
+        lambda: jax.lax.cond(
+            twin_on_boundary,
+            lambda: add_internal_edge_triangle(state, chosen_vertex, dest_vertex),
+            lambda: add_internal_edge_triangle(state, dest_vertex, chosen_vertex)
+        )
+    )
+
+    return state
+
+@jax.jit
+def maybe_generate_new_triangles(state, params, key, repulsion_mag):
+    """Randomly generate new triangles"""
+    key, subkey = jax.random.split(key)
+    
+    # Only generate with 10% probability
+    return jax.lax.cond(
+        jax.random.uniform(subkey) < 0.1,
+        lambda: generate_new_triangles(state, params, key),
+        lambda: (state, key),
+    )
+
+@jax.jit
+def boundary_conditions(state: MeshState, width, height):
+    """Keep vertices within bounds"""
+    vertex_pos = state.vertex_pos
+    vertex_pos = jnp.clip(vertex_pos, min=0, max=jnp.array([width, height]))
+    return state._replace(vertex_pos=vertex_pos)
+
 def main():
     width, height = 1400, 1400
     
     # Initialize JAX
-    key = jax.random.PRNGKey(42)
+    key = jax.random.PRNGKey(0)
     
     # Create initial state and parameters
-    state = create_initial_state(num_dims=2)
-    params = MeshParams(
-        spring_len=40.0,
-        elastic_constant=0.1,
-        repulsion_distance=200.0,
-        repulsion_strength=2.0,
-        bulge_strength=10.0,
-        planar_strength=0.1
+    num_dims = 2
+    state_dims = 2
+    hidden_state_dims = 4
+    scale = 0.02
+    key, *subkeys = jax.random.split(key, 4)
+    state, params = create_initial_state_and_params(
+        subkeys, 
+        num_dims=num_dims, 
+        state_dims=state_dims, 
+        hidden_state_dims=hidden_state_dims, 
+        scale=scale,
+        elastic_constant=0.2,
+        repulsion_distance=40.0,
+        repulsion_strength=10.0,
     )
     
     # Initialize first triangle
@@ -216,6 +327,10 @@ def main():
         
         # Update physics
         state, repulsion_mag = update_positions(state, params)
+        state = boundary_conditions(state, width, height)
+
+        state = set_vertex_state_edge(state)
+        state = update_vertex_state(state, params)
         
         # Generate new triangles
         state, key = maybe_generate_new_triangles(state, params, key, repulsion_mag)
@@ -223,11 +338,15 @@ def main():
         # Refine mesh every 10 frames
         if frame_count % 10 == 0:
             state = refine_mesh(state)
+
+        if frame_count % 10 == 5:
+            # natural_freqs, eigenvecs = get_natural_frequencies(state, params)
+            pass
         
         # Draw
         # draw_pygame(state, screen)
         draw_pygame(state, screen)
-        clock.tick(60)
+        clock.tick(120)
         frame_count += 1
     
     pygame.quit()

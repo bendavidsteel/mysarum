@@ -204,12 +204,13 @@ fn computeForces(@builtin(global_invocation_id) id : vec3u)
 
     let particlePosition = vec2f(particle.x, particle.y);
 
-	let speciesCount = u32(simulationOptions.speciesCount);
-	let kernelsCount = u32(simulationOptions.kernelsCount);
-	let growthFuncsCount = u32(simulationOptions.growthFuncsCount);
+    let speciesCount = u32(simulationOptions.speciesCount);
+    let kernelsCount = u32(simulationOptions.kernelsCount);
+    let growthFuncsCount = u32(simulationOptions.growthFuncsCount);
     var U = 0.0;
     var grad_U = vec2f(0.0, 0.0);
     var grad_R = vec2f(0.0, 0.0);
+    let scale = 4.0;
 
     for (var binX = binXMin; binX <= binXMax; binX += 1) {
         for (var binY = binYMin; binY <= binYMax; binY += 1) {
@@ -240,21 +241,21 @@ fn computeForces(@builtin(global_invocation_id) id : vec3u)
                     }
                 }
 
-                let r = length(diff);
-				let r_unit = diff / r;
-				
-				for (var k = 0u; k < kernelsCount; k += 1) {
-					let mu_k = params_k[species * speciesCount * kernelsCount * 3 + otherSpecies * kernelsCount * 3 + k * 3];
-                    let sigma_k = params_k[species * speciesCount * kernelsCount * 3 + otherSpecies * kernelsCount * 3 + k * 3 + 1];
-                    let w_k = params_k[species * speciesCount * kernelsCount * 3 + otherSpecies * kernelsCount * 3 + k * 3 + 2];
-                    let r_mu_k = r - mu_k;
-                    let sigma2_k = sigma_k * sigma_k;
-                    let u_kernel = w_k * exp(-r_mu_k * r_mu_k / sigma2_k);
-                    U += u_kernel;
+                let r = length(diff) / scale;
+                let r_unit = diff / r;
+                
+                for (var k = 0u; k < kernelsCount; k += 1) {
+                  let mu_k = params_k[species * speciesCount * kernelsCount * 3 + otherSpecies * kernelsCount * 3 + k * 3];
+                  let sigma_k = params_k[species * speciesCount * kernelsCount * 3 + otherSpecies * kernelsCount * 3 + k * 3 + 1];
+                  let w_k = params_k[species * speciesCount * kernelsCount * 3 + otherSpecies * kernelsCount * 3 + k * 3 + 2];
+                  let r_mu_k = r - mu_k;
+                  let sigma2_k = sigma_k * sigma_k;
+                  let u_kernel = w_k * exp(-r_mu_k * r_mu_k / sigma2_k);
+                  U += u_kernel;
 
-                    let dU_dr = -2.0 * u_kernel * r_mu_k / sigma2_k;
-                    grad_U += dU_dr * r_unit;
-				}
+                  let dU_dr = -2.0 * u_kernel * r_mu_k / sigma2_k;
+                  grad_U += dU_dr * r_unit;
+				        }
 
                 let this_c_rep = c_rep[species * speciesCount + otherSpecies];
                 let d_rep = 1.0;

@@ -8,16 +8,19 @@ use std::collections::VecDeque;
 use crossbeam_channel::{self, Receiver};
 use ringbuf::{traits::{Consumer, Producer, Split, Observer}, HeapRb};
 
-const NUM_PARTICLES: u32 = 64;
+const NUM_PARTICLES: u32 = 1;
 const NUM_CHANNELS: u32 = 2;
-const SAMPLE_RATE: f32 = 44100.0;
+const SAMPLE_RATE: u32 = 22050;
 const CHUNK_SIZE: u32 = 2048;
 const CHUNK_FLOATS: u32 = CHUNK_SIZE * NUM_CHANNELS;
 const INITIAL_REQUEST_THRESHOLD: u32 = CHUNK_FLOATS * 2;
 const MIN_REQUEST_THRESHOLD: u32 = CHUNK_FLOATS;
-const MAX_REQUEST_THRESHOLD: u32 = CHUNK_FLOATS * 16;
+const MAX_REQUEST_THRESHOLD: u32 = CHUNK_FLOATS * 4;
 const BUFFER_HISTORY_SIZE: usize = 64;
-const PARTICLE_SIZE: f32 = 12.0;
+const PARTICLE_SIZE: f32 = 0.05;
+const PAN_SPEED: f32 = 0.2;
+const ZOOM_SPEED: f32 = 0.1;
+const AUDIO_LOG_INTERVAL_FRAMES: u64 = 60; // Log audio stats every ~1 second at 60fps
 
 // Shader sources (loaded at compile time)
 const PARTICLE_SHADER: &str = include_str!("shaders/particle.wgsl");
@@ -62,6 +65,8 @@ struct AudioParams {
     num_particles: u32,
     chunk_size: u32,
     volume: f32,
+    current_x: [f32; 2],  // Current viewport x (min, max)
+    current_y: [f32; 2],  // Current viewport y (min, max)
 }
 
 #[repr(C)]
@@ -76,7 +81,10 @@ struct PhaseUpdateParams {
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct RenderParams {
-    screen_size: [f32; 2],
+    map_x: [f32; 2],      // Simulation bounds x (min, max)
+    map_y: [f32; 2],      // Simulation bounds y (min, max)
+    current_x: [f32; 2],  // Current viewport x (min, max)
+    current_y: [f32; 2],  // Current viewport y (min, max)
     particle_size: f32,
     num_particles: u32,
 }
@@ -148,6 +156,7 @@ struct Model {
 
     time: f32,
     frame_count: u64,
+
     map_x0: f32,
     map_x1: f32,
     map_y0: f32,
@@ -162,6 +171,10 @@ struct Model {
     request_threshold: u32,
     integral_error: f32,
     latest_feedback: Option<AudioFeedback>,
+    last_buffer_level: u32,
+
+    // Audio logging state
+    last_log_frame: u64,
 }
 
 struct AudioModel {
@@ -182,6 +195,7 @@ fn model(app: &App) -> Model {
         .new_window::<Model>()
         .hdr(true)
         .size(800, 800)
+        .key_pressed(key_pressed)
         .build();
 
     let window = app.window(w_id);
@@ -208,6 +222,8 @@ fn model(app: &App) -> Model {
         let stream = audio_host
             .new_output_stream(audio_model)
             .render(audio_fn)
+            .channels(NUM_CHANNELS as usize)
+            .sample_rate(SAMPLE_RATE)
             .build()
             .unwrap();
         stream.play().unwrap();
@@ -238,8 +254,8 @@ fn model(app: &App) -> Model {
                 vel: [0.0, 0.0],
                 phase: random_f32(),
                 energy: 0.0,
-                species: [0.0; 2],
-                alpha: [0.0; 2],
+                species: [random_f32(), random_f32()],
+                alpha: [random_f32(), random_f32()],
                 interaction: [0.0; 2],
             }
         })
@@ -395,7 +411,7 @@ fn model(app: &App) -> Model {
         &phase_update_params_buf,
         0,
         bytemuck::bytes_of(&PhaseUpdateParams {
-            sample_rate: SAMPLE_RATE,
+            sample_rate: SAMPLE_RATE as f32,
             num_particles: NUM_PARTICLES,
             chunk_size: CHUNK_SIZE,
             _pad: 0,
@@ -407,10 +423,12 @@ fn model(app: &App) -> Model {
         &audio_params_buf,
         0,
         bytemuck::bytes_of(&AudioParams {
-            sample_rate: SAMPLE_RATE,
+            sample_rate: SAMPLE_RATE as f32,
             num_particles: NUM_PARTICLES,
             chunk_size: CHUNK_SIZE,
             volume: 0.8,
+            current_x: [current_x0, current_x1],
+            current_y: [current_y0, current_y1],
         }),
     );
 
@@ -521,6 +539,8 @@ fn model(app: &App) -> Model {
         request_threshold: INITIAL_REQUEST_THRESHOLD,
         integral_error: 0.0,
         latest_feedback: None,
+        last_buffer_level: 0,  // Start at 0 to fill buffer initially
+        last_log_frame: 0,
     }
 }
 
@@ -528,11 +548,77 @@ fn exit(_app: &App, _model: Model) {
     // Audio thread will be cleaned up when Model is dropped
 }
 
+fn key_pressed(_app: &App, model: &mut Model, key: KeyCode) {
+    let view_width = model.current_x1 - model.current_x0;
+    let view_height = model.current_y1 - model.current_y0;
+    let pan_x = view_width * PAN_SPEED;
+    let pan_y = view_height * PAN_SPEED;
+
+    match key {
+        // Pan controls (WASD)
+        KeyCode::KeyW => {
+            model.current_y0 += pan_y;
+            model.current_y1 += pan_y;
+        }
+        KeyCode::KeyS => {
+            model.current_y0 -= pan_y;
+            model.current_y1 -= pan_y;
+        }
+        KeyCode::KeyA => {
+            model.current_x0 -= pan_x;
+            model.current_x1 -= pan_x;
+        }
+        KeyCode::KeyD => {
+            model.current_x0 += pan_x;
+            model.current_x1 += pan_x;
+        }
+        // Zoom controls (E to zoom in, F to zoom out)
+        KeyCode::KeyE => {
+            let center_x = (model.current_x0 + model.current_x1) / 2.0;
+            let center_y = (model.current_y0 + model.current_y1) / 2.0;
+            let new_width = view_width * (1.0 - ZOOM_SPEED);
+            let new_height = view_height * (1.0 - ZOOM_SPEED);
+            model.current_x0 = center_x - new_width / 2.0;
+            model.current_x1 = center_x + new_width / 2.0;
+            model.current_y0 = center_y - new_height / 2.0;
+            model.current_y1 = center_y + new_height / 2.0;
+        }
+        KeyCode::KeyF => {
+            let center_x = (model.current_x0 + model.current_x1) / 2.0;
+            let center_y = (model.current_y0 + model.current_y1) / 2.0;
+            let new_width = view_width * (1.0 + ZOOM_SPEED);
+            let new_height = view_height * (1.0 + ZOOM_SPEED);
+            model.current_x0 = center_x - new_width / 2.0;
+            model.current_x1 = center_x + new_width / 2.0;
+            model.current_y0 = center_y - new_height / 2.0;
+            model.current_y1 = center_y + new_height / 2.0;
+        }
+        // Reset view to full map
+        KeyCode::KeyR => {
+            model.current_x0 = model.map_x0;
+            model.current_x1 = model.map_x1;
+            model.current_y0 = model.map_y0;
+            model.current_y1 = model.map_y1;
+        }
+        _ => {}
+    }
+}
+
 fn update(_app: &App, model: &mut Model) {
     // Process audio feedback - use the latest min buffer level from audio thread
     let mut latest_feedback = None;
+    let mut had_underrun = false;
     while let Ok(feedback) = model.audio_feedback_rx.try_recv() {
+        // Detect underrun: buffer dropped to 0
+        if feedback.current_buffer_level == 0 {
+            had_underrun = true;
+        }
         latest_feedback = Some(feedback);
+    }
+
+    // Log underrun immediately when detected
+    if had_underrun {
+        eprintln!("[AUDIO] Buffer underrun detected!");
     }
 
     // PID controller adjusts request_threshold based on buffer feedback
@@ -555,11 +641,37 @@ fn update(_app: &App, model: &mut Model) {
     model.time += dt;
     model.frame_count += 1;
 
-    // Store latest feedback for use in render
-    model.latest_feedback = latest_feedback;
+    // Periodic logging of buffer status
+    if model.frame_count - model.last_log_frame >= AUDIO_LOG_INTERVAL_FRAMES {
+        if let Some(feedback) = &latest_feedback {
+            eprintln!(
+                "[AUDIO] Buffer: current={}, min={}, threshold={}",
+                feedback.current_buffer_level,
+                feedback.min_buffer_level,
+                model.request_threshold
+            );
+        }
+        model.last_log_frame = model.frame_count;
+    }
+
+    // Store latest feedback and update last_buffer_level
+    if let Some(feedback) = latest_feedback {
+        model.last_buffer_level = feedback.current_buffer_level;
+        model.latest_feedback = Some(feedback);
+    }
+    // If no feedback received this frame, last_buffer_level retains its previous value
 }
 
 fn audio_fn(audio: &mut AudioModel, buffer: &mut Buffer) {
+    // Fill the output buffer from ring buffer (lock-free)
+    // Explicitly write to each channel as in the nannou example
+    for frame in buffer.frames_mut() {
+        let left = audio.consumer.try_pop().unwrap_or(0.0);
+        let right = audio.consumer.try_pop().unwrap_or(0.0);
+        frame[0] = left;
+        frame[1] = right;
+    }
+
     let buffer_len = audio.consumer.occupied_len() as u32;
 
     // Push new value, pop oldest if at capacity
@@ -576,22 +688,17 @@ fn audio_fn(audio: &mut AudioModel, buffer: &mut Buffer) {
         min_buffer_level: min_buffer,
         current_buffer_level: buffer_len,
     }).ok();
-
-    // Fill the output buffer from ring buffer (lock-free)
-    for frame in buffer.frames_mut() {
-        for sample in frame.iter_mut() {
-            *sample = audio.consumer.try_pop().unwrap_or(0.0);
-        }
-    }
 }
 
 fn render(app: &RenderApp, model: &Model, frame: Frame) {
     let device = frame.device();
 
-    // Update render params with current window size
-    let frame_size = frame.texture_size();
+    // Update render params with current viewport
     let render_params = RenderParams {
-        screen_size: [frame_size[0] as f32, frame_size[1] as f32],
+        map_x: [model.map_x0, model.map_x1],
+        map_y: [model.map_y0, model.map_y1],
+        current_x: [model.current_x0, model.current_x1],
+        current_y: [model.current_y0, model.current_y1],
         particle_size: PARTICLE_SIZE,
         num_particles: NUM_PARTICLES,
     };
@@ -624,6 +731,22 @@ fn render(app: &RenderApp, model: &Model, frame: Frame) {
         usage: wgpu::BufferUsages::COPY_SRC,
     });
 
+    // Update audio params with current viewport
+    let audio_params = AudioParams {
+        sample_rate: SAMPLE_RATE as f32,
+        num_particles: NUM_PARTICLES,
+        chunk_size: CHUNK_SIZE,
+        volume: 0.8,
+        current_x: [model.current_x0, model.current_x1],
+        current_y: [model.current_y0, model.current_y1],
+    };
+    let audio_params_bytes = bytemuck::bytes_of(&audio_params);
+    let new_audio_params_buf = device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("audio-params-transfer"),
+        contents: audio_params_bytes,
+        usage: wgpu::BufferUsages::COPY_SRC,
+    });
+
     let audio_buf_size = (CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64;
 
     let mut encoder = frame.command_encoder();
@@ -643,6 +766,13 @@ fn render(app: &RenderApp, model: &Model, frame: Frame) {
         0,
         std::mem::size_of::<SimParams>() as u64,
     );
+    encoder.copy_buffer_to_buffer(
+        &new_audio_params_buf,
+        0,
+        &*model.compute.audio_params_buf,
+        0,
+        std::mem::size_of::<AudioParams>() as u64,
+    );
 
     // Particle simulation pass
     {
@@ -655,39 +785,65 @@ fn render(app: &RenderApp, model: &Model, frame: Frame) {
         pass.dispatch_workgroups((NUM_PARTICLES + 63) / 64, 1, 1);
     }
 
-    // Audio synthesis pass (fixed chunk size)
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("audio_pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&*model.compute.audio_pipeline);
-        pass.set_bind_group(0, &*model.compute.audio_bind_group, &[]);
-        pass.dispatch_workgroups((CHUNK_SIZE + 63) / 64, 1, 1);
+    let need_audio = model.last_buffer_level < model.request_threshold;
+
+    if need_audio {
+        // Audio synthesis pass (fixed chunk size)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("audio_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&*model.compute.audio_pipeline);
+            pass.set_bind_group(0, &*model.compute.audio_bind_group, &[]);
+            pass.dispatch_workgroups((CHUNK_SIZE + 63) / 64, 1, 1);
+        }
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("phase_update_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&*model.compute.phase_update_pipeline);
+            pass.set_bind_group(0, &*model.compute.phase_update_bind_group, &[]);
+            pass.dispatch_workgroups((NUM_PARTICLES + 63) / 64, 1, 1);
+        }
+
+        // TODO ensure buffer gets read on next frame even if audio not needed?
+        // Double-buffer audio readback: write to one buffer, read from the other
+        let write_idx = (model.audio_frame_count % 2) as usize;
+        let read_idx = ((model.audio_frame_count + 1) % 2) as usize;
+
+        // Copy audio to the write staging buffer
+        encoder.copy_buffer_to_buffer(
+            &*model.compute.audio_out_buf,
+            0,
+            &*model.compute.audio_staging_bufs[write_idx],
+            0,
+            audio_buf_size,
+        );
+
+        // After frame 1, we can start reading from the buffer that was written in the previous frame
+        // The map_async callback fires when the buffer is ready - do all work inside the callback
+        if model.frame_count >= 2 {
+            let read_buf = model.compute.audio_staging_bufs[read_idx].clone();
+            let read_buf_for_callback = read_buf.clone();
+            let audio_producer = model.audio_producer.clone();
+            let audio_buf_size = audio_buf_size as usize;
+
+            read_buf.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+                if result.is_ok() {
+                    let data = read_buf_for_callback.slice(..).get_mapped_range();
+                    let floats = bytemuck::cast_slice::<u8, f32>(&data[..audio_buf_size]);
+                    if let Ok(mut producer) = audio_producer.lock() {
+                        producer.push_slice(floats);
+                    }
+                    drop(data);
+                    read_buf_for_callback.unmap();
+                }
+            });
+        }
     }
-
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("phase_update_pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&*model.compute.phase_update_pipeline);
-        pass.set_bind_group(0, &*model.compute.phase_update_bind_group, &[]);
-        pass.dispatch_workgroups((NUM_PARTICLES + 63) / 64, 1, 1);
-    }
-
-    // Double-buffer audio readback: write to one buffer, read from the other
-    let write_idx = (model.frame_count % 2) as usize;
-    let read_idx = ((model.frame_count + 1) % 2) as usize;
-
-    // Copy audio to the write staging buffer
-    encoder.copy_buffer_to_buffer(
-        &*model.compute.audio_out_buf,
-        0,
-        &*model.compute.audio_staging_bufs[write_idx],
-        0,
-        audio_buf_size,
-    );
 
     // GPU-based instanced rendering
     {
@@ -702,26 +858,5 @@ fn render(app: &RenderApp, model: &Model, frame: Frame) {
 
         // Draw all particles with instancing
         render_pass.draw_indexed(0..QUAD_INDICES.len() as u32, 0, 0..NUM_PARTICLES);
-    }
-
-    // After frame 1, we can start reading from the buffer that was written in the previous frame
-    // The map_async callback fires when the buffer is ready - do all work inside the callback
-    if model.frame_count >= 2 {
-        let read_buf = model.compute.audio_staging_bufs[read_idx].clone();
-        let read_buf_for_callback = read_buf.clone();
-        let audio_producer = model.audio_producer.clone();
-        let audio_buf_size = audio_buf_size as usize;
-
-        read_buf.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-            if result.is_ok() {
-                let data = read_buf_for_callback.slice(..).get_mapped_range();
-                let floats = bytemuck::cast_slice::<u8, f32>(&data[..audio_buf_size]);
-                if let Ok(mut producer) = audio_producer.lock() {
-                    producer.push_slice(floats);
-                }
-                drop(data);
-                read_buf_for_callback.unmap();
-            }
-        });
     }
 }

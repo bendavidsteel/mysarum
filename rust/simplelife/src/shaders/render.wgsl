@@ -28,7 +28,10 @@ struct VertexOutput {
 }
 
 struct RenderParams {
-    screen_size: vec2<f32>,
+    map_x: vec2<f32>,
+    map_y: vec2<f32>,
+    current_x: vec2<f32>,
+    current_y: vec2<f32>,
     particle_size: f32,
     num_particles: u32,
 }
@@ -43,13 +46,25 @@ fn vs_main(
 ) -> VertexOutput {
     let particle = particles[instance];
 
-    // Scale particle size in normalized device coordinates
-    let aspect = params.screen_size.x / params.screen_size.y;
-    let size = params.particle_size / params.screen_size.y;
+    // Orthographic projection: map world coords to clip space [-1, 1]
+    // current_x.x = left, current_x.y = right
+    // current_y.x = bottom, current_y.y = top
+    let view_width = params.current_x.y - params.current_x.x;
+    let view_height = params.current_y.y - params.current_y.x;
 
-    // Offset vertex by particle position
-    // Particle pos is in [-1, 1] range already (simulation space)
-    var pos = particle.pos + vertex.position * vec2<f32>(size / aspect, size);
+    // Transform particle position from world space to normalized device coordinates
+    let ndc_x = 2.0 * (particle.pos.x - params.current_x.x) / view_width - 1.0;
+    let ndc_y = 2.0 * (particle.pos.y - params.current_y.x) / view_height - 1.0;
+
+    // Scale particle size relative to view (particle_size is in world units)
+    let size_ndc_x = params.particle_size * 2.0 / view_width;
+    let size_ndc_y = params.particle_size * 2.0 / view_height;
+
+    // Offset vertex by particle position in NDC
+    let pos = vec2<f32>(
+        ndc_x + vertex.position.x * size_ndc_x,
+        ndc_y + vertex.position.y * size_ndc_y
+    );
 
     var out: VertexOutput;
     out.clip_position = vec4<f32>(pos, 0.0, 1.0);

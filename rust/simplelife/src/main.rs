@@ -4,11 +4,12 @@ use nannou_audio as audio;
 use nannou_audio::Buffer;
 use std::thread::{JoinHandle, current};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicI8, Ordering};
 use std::collections::VecDeque;
 use crossbeam_channel::{self, Receiver};
 use ringbuf::{traits::{Consumer, Producer, Split, Observer}, HeapRb};
 
-const NUM_PARTICLES: u32 = 1;
+const NUM_PARTICLES: u32 = 64;
 const NUM_CHANNELS: u32 = 2;
 const SAMPLE_RATE: u32 = 22050;
 const CHUNK_SIZE: u32 = 2048;
@@ -175,6 +176,10 @@ struct Model {
 
     // Audio logging state
     last_log_frame: u64,
+
+    // Track which staging buffer was written to last (-1 if no audio generated yet, 0 or 1 otherwise)
+    // Uses AtomicI8 for interior mutability since render() takes &Model
+    last_audio_staging_idx: Arc<AtomicI8>,
 }
 
 struct AudioModel {
@@ -541,6 +546,7 @@ fn model(app: &App) -> Model {
         latest_feedback: None,
         last_buffer_level: 0,  // Start at 0 to fill buffer initially
         last_log_frame: 0,
+        last_audio_staging_idx: Arc::new(AtomicI8::new(-1)),
     }
 }
 
@@ -624,7 +630,7 @@ fn update(_app: &App, model: &mut Model) {
     // PID controller adjusts request_threshold based on buffer feedback
     if let Some(feedback) = &latest_feedback {
         let min_buffer = feedback.min_buffer_level as f32;
-        let target = (CHUNK_FLOATS * 2) as f32;
+        let target = (CHUNK_FLOATS) as f32;
 
         let error = target - min_buffer;
         let kp = 0.01;
@@ -787,6 +793,29 @@ fn render(app: &RenderApp, model: &Model, frame: Frame) {
 
     let need_audio = model.last_buffer_level < model.request_threshold;
 
+    // First, read back audio from previous frame if there was any
+    // This must happen regardless of whether we need new audio this frame
+    let prev_staging_idx = model.last_audio_staging_idx.load(Ordering::Relaxed);
+    if prev_staging_idx >= 0 {
+        let read_idx = prev_staging_idx as usize;
+        let read_buf = model.compute.audio_staging_bufs[read_idx].clone();
+        let read_buf_for_callback = read_buf.clone();
+        let audio_producer = model.audio_producer.clone();
+        let audio_buf_size = audio_buf_size as usize;
+
+        read_buf.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            if result.is_ok() {
+                let data = read_buf_for_callback.slice(..).get_mapped_range();
+                let floats = bytemuck::cast_slice::<u8, f32>(&data[..audio_buf_size]);
+                if let Ok(mut producer) = audio_producer.lock() {
+                    producer.push_slice(floats);
+                }
+                drop(data);
+                read_buf_for_callback.unmap();
+            }
+        });
+    }
+
     if need_audio {
         // Audio synthesis pass (fixed chunk size)
         {
@@ -809,10 +838,9 @@ fn render(app: &RenderApp, model: &Model, frame: Frame) {
             pass.dispatch_workgroups((NUM_PARTICLES + 63) / 64, 1, 1);
         }
 
-        // TODO ensure buffer gets read on next frame even if audio not needed?
-        // Double-buffer audio readback: write to one buffer, read from the other
-        let write_idx = (model.audio_frame_count % 2) as usize;
-        let read_idx = ((model.audio_frame_count + 1) % 2) as usize;
+        // Double-buffer audio readback: choose the buffer we didn't read from this frame
+        // If prev was -1 (none) or 1, write to 0; if prev was 0, write to 1
+        let write_idx = if prev_staging_idx == 0 { 1usize } else { 0usize };
 
         // Copy audio to the write staging buffer
         encoder.copy_buffer_to_buffer(
@@ -823,26 +851,11 @@ fn render(app: &RenderApp, model: &Model, frame: Frame) {
             audio_buf_size,
         );
 
-        // After frame 1, we can start reading from the buffer that was written in the previous frame
-        // The map_async callback fires when the buffer is ready - do all work inside the callback
-        if model.frame_count >= 2 {
-            let read_buf = model.compute.audio_staging_bufs[read_idx].clone();
-            let read_buf_for_callback = read_buf.clone();
-            let audio_producer = model.audio_producer.clone();
-            let audio_buf_size = audio_buf_size as usize;
-
-            read_buf.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-                if result.is_ok() {
-                    let data = read_buf_for_callback.slice(..).get_mapped_range();
-                    let floats = bytemuck::cast_slice::<u8, f32>(&data[..audio_buf_size]);
-                    if let Ok(mut producer) = audio_producer.lock() {
-                        producer.push_slice(floats);
-                    }
-                    drop(data);
-                    read_buf_for_callback.unmap();
-                }
-            });
-        }
+        // Record that we wrote to this buffer so next frame can read it
+        model.last_audio_staging_idx.store(write_idx as i8, Ordering::Relaxed);
+    } else {
+        // No audio generated this frame, so nothing to read next frame
+        model.last_audio_staging_idx.store(-1, Ordering::Relaxed);
     }
 
     // GPU-based instanced rendering

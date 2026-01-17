@@ -1,17 +1,3 @@
-// Particle struct - shared definition
-struct Particle {
-    pos: vec2<f32>,
-    vel: vec2<f32>,
-    phase: f32,
-    energy: f32,
-    species: vec2<f32>,
-    alpha: vec2<f32>,
-    interaction: vec2<f32>,
-}
-
-const PI: f32 = 3.14159265359;
-const TAU: f32 = 6.28318530718;
-
 // Render shader for GPU-side particle rendering
 // Uses instancing to draw a quad per particle, fragment shader draws the particle
 
@@ -69,7 +55,7 @@ fn vs_main(
     var out: VertexOutput;
     out.clip_position = vec4<f32>(pos, 0.0, 1.0);
     out.uv = vertex.uv;
-    out.hue = f32(instance) / f32(params.num_particles);
+    out.hue = particle.species.x;
     out.energy = particle.energy;
 
     return out;

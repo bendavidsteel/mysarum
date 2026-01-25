@@ -53,12 +53,14 @@ struct SimParams {
 
 // Waveform functions for audio synthesis
 
-fn compute_frequency(p: Particle) -> f32 {
-    return 100.0 + 500.0 * p.species.x;
+fn compute_frequency(p: Particle, t: f32) -> f32 {
+    let base_freq = 100.0 + tanh(p.energy) * 10.0;
+    return 100.0 + p.species.x * sin(TAU * base_freq * 2.0 * t) + p.species.y * cos(TAU * base_freq * 3.0 * t);
 }
 
 fn compute_amplitude(p: Particle) -> f32 {
-    return p.energy * 0.5 + 0.002;
+    let speed = length(p.vel);
+    return -tanh(p.energy) * 0.1 + 0.8 + 0.1 * speed;
 }
 
 fn compute_oscillator(phase: f32) -> f32 {
@@ -66,6 +68,6 @@ fn compute_oscillator(phase: f32) -> f32 {
 }
 
 fn compute_phase(p: Particle, t: f32) -> f32 {
-    let freq = compute_frequency(p);
-    return TAU * freq * t + p.phase;
+    let freq = compute_frequency(p, t);
+    return p.phase + TAU * freq * t;
 }

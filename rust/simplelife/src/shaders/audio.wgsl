@@ -80,6 +80,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
+    // add compression
+    let compression_threshold = 0.8;
+
     // Normalize by visible particle count and apply volume
     if (visible_count > 0u) {
         let norm = 1.0 / log(f32(visible_count) + 1.0);

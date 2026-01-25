@@ -48,6 +48,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let height = params.map_y1 - params.map_y0;
 
     var totalForce = vec2f(0.0, 0.0);
+    var totalEnergy = 0.0;
 
     let copyBinXRand = random3(vec3f(params.time, particle.pos.x, particle.pos.y));
     let copyBinYRand = random4(vec4f(params.time, particle.pos.y, particle.pos.x, particle.vel.x));
@@ -66,7 +67,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             for (var j = binStart; j < binEnd; j += 1) {
                 let other = particles[j];
 
-                let forceStrength = dot(particle.alpha, other.species) * params.max_force_strength;
+                let alpha = dot(particle.alpha, other.species) * params.max_force_strength;
 
                 var r = other.pos - particle.pos;
 
@@ -82,15 +83,26 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 if (d > 0.0 && d < params.radius) {
                     let n = r / d;
 
-                    var totalForceMag = 0.0;
+                    var f = 0.0;
+                    var e = 0.0;
+                    let forceRegion = params.radius - params.collision_radius;
+                    let r_mid = params.collision_radius + forceRegion * 0.5;
                     if (d < params.collision_radius) {
-                        totalForceMag = max(0.0, params.collision_radius - d) * -params.collision_strength;
+                        let dd = params.collision_radius - d;
+                        f = dd * -params.collision_strength;
+                        e = 0.5 * (f * dd - alpha * forceRegion);
+                    } else if (d >= params.collision_radius && d < r_mid) {
+                        let dd = d - params.collision_radius;
+                        f = 2 * alpha * dd / forceRegion;
+                        e = 0.5 * (f * dd - alpha * forceRegion);
                     } else {
-                        let forceRegion = params.radius - params.collision_radius;
-                        totalForceMag = forceStrength * max(0.0, 1.0 - abs(2 * d - forceRegion) / forceRegion);
+                        let dm = d - params.radius;
+                        f = -2 * alpha * dm / forceRegion;
+                        e = 0.5 * f * dm;
                     }
 
-                    totalForce += totalForceMag * n;
+                    totalForce += f * n;
+                    totalEnergy += e;
                 }
 
                 if (binX == i32(binInfo.binX) + copyBinXOffset && binY == i32(binInfo.binY) + copyBinYOffset) {
@@ -125,8 +137,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let map_size = map_max - map_min;
     particle.pos -= floor((particle.pos - map_min) / map_size) * map_size;
 
-    // TODO Update energy based on energy func
-
+    // Update energy based on energy func
+    particle.energy = totalEnergy;
 
     particles[id.x] = particle;
 }

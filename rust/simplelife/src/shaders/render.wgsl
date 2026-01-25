@@ -42,9 +42,11 @@ fn vs_main(
     let ndc_x = 2.0 * (particle.pos.x - params.current_x.x) / view_width - 1.0;
     let ndc_y = 2.0 * (particle.pos.y - params.current_y.x) / view_height - 1.0;
 
+    let particle_size = params.particle_size * 3.0;
+
     // Scale particle size relative to view (particle_size is in world units)
-    let size_ndc_x = params.particle_size * 2.0 / view_width;
-    let size_ndc_y = params.particle_size * 2.0 / view_height;
+    let size_ndc_x = particle_size * 2.0 / view_width;
+    let size_ndc_y = particle_size * 2.0 / view_height;
 
     // Offset vertex by particle position in NDC
     let pos = vec2<f32>(
@@ -98,18 +100,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Soft edge with glow
-    let core_radius = 0.6;
-    let core = smoothstep(core_radius, 0.0, dist);
-    let glow = smoothstep(1.0, core_radius, dist);
+    let scaled_energy = tanh(in.energy);
+    let core_radius = 0.2 + 0.1 * scaled_energy;
+    var core = 0.0;
+    if (dist < core_radius - 0.05) {
+        core = 0.4;
+    } else if (dist < core_radius + 0.05) {
+        core = 0.9;
+    }
+    let glow = pow(1 - dist, 2.0) * (0.5 - 0.2 * scaled_energy);
 
     // Energy affects brightness
-    let energy_brightness = 0.4 + min(in.energy, 1.0) * 0.6;
+    let energy_brightness = 0.8 + 0.2 * scaled_energy;
 
     // Convert HSL to RGB
-    let rgb = hsl_to_rgb(in.hue, 0.7, energy_brightness * 0.5);
+    let rgb = hsl_to_rgb(in.hue, 0.9, energy_brightness * 0.5);
 
     // Combine core and glow
-    let alpha = core + glow * 0.5;
+    let alpha = max(core, glow);
 
     return vec4<f32>(rgb * alpha, alpha * 0.9);
 }

@@ -58,6 +58,8 @@ GPU generates 2048-sample stereo chunks → staging buffer → lock-free ring bu
 
 **SimParams/AudioParams** in `main.rs` configure simulation constants, spatial hash grid dimensions, audio sample rate (22,050 Hz), chunk size, etc.
 
+**Model** must derive `Clone` - this is required by the nannou render function signature.
+
 ## Shader Files
 
 | File | Purpose |

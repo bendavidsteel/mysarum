@@ -209,6 +209,9 @@ struct Model {
     audio_feedback_rx: Arc<Receiver<AudioFeedback>>,
     _audio_thread: Arc<JoinHandle<()>>,
 
+    window: Entity,
+    settings: Settings,
+
     time: f32,
     frame_count: u64,
 
@@ -247,6 +250,21 @@ struct AudioModel {
 
     // Rolling buffer of recent buffer levels for min calculation
     buffer_history: VecDeque<u32>,
+}
+
+#[derive(Clone)]
+struct Settings {
+    volume: f32,
+    dt: f32,
+    friction: f32,
+    mass: f32,
+    radius: f32,
+    collision_radius: f32,
+    collision_strength: f32,
+    max_force_strength: f32,
+    copy_radius: f32,
+    copy_cos_sim_threshold: f32,
+    copy_probability: f32,
 }
 
 fn main() {
@@ -308,22 +326,72 @@ fn model(app: &App) -> Model {
     let current_y0 = map_y0;
     let current_y1 = map_y1;
 
-    // Initialize particles
-    let particles: Vec<Particle> = (0..NUM_PARTICLES)
-        .map(|i| {
-            let x = map_x0 + (map_x1 - map_x0) * random_f32();
-            let y = map_y0 + (map_y1 - map_y0) * random_f32();
-            Particle {
-                pos: [x, y],
-                vel: [0.0, 0.0],
-                phase: random_f32(),
-                energy: 0.0,
-                species: [random_f32(), random_f32()],
-                alpha: [random_f32(), random_f32()],
-                interaction: [0.0; 2],
+    // Initialize particles in spatial bins with per-bin species
+    let min_bin_species = 1;
+    let max_bin_species = 3;
+    let initial_velocity = 0.1;
+
+    // Calculate grid dimensions for initialization bins
+    let grid_size_x = ((map_x1 - map_x0) / BIN_SIZE).ceil() as u32;
+    let grid_size_y = ((map_y1 - map_y0) / BIN_SIZE).ceil() as u32;
+    let bin_count = grid_size_x * grid_size_y;
+
+    // Species definition for a bin
+    struct BinSpecies {
+        sx: f32,
+        sy: f32,
+        ax: f32,
+        ay: f32,
+    }
+
+    let mut particles = Vec::with_capacity(NUM_PARTICLES as usize);
+
+    for j in 0..grid_size_y {
+        for i in 0..grid_size_x {
+            let bin_index = j * grid_size_x + i;
+            let bin_start = (NUM_PARTICLES * bin_index / bin_count) as usize;
+            let bin_end = if i == grid_size_x - 1 && j == grid_size_y - 1 {
+                NUM_PARTICLES as usize
+            } else {
+                (NUM_PARTICLES * (bin_index + 1) / bin_count) as usize
+            };
+            let bin_particle_count = bin_end - bin_start;
+
+            // Create random species set for this bin
+            let num_bin_species = min_bin_species + (random_f32() * (max_bin_species - min_bin_species + 1) as f32) as usize;
+            let num_bin_species = num_bin_species.min(max_bin_species);
+            let species_in_bin: Vec<BinSpecies> = (0..num_bin_species)
+                .map(|_| BinSpecies {
+                    sx: random_f32() * 2.0 - 1.0,
+                    sy: random_f32() * 2.0 - 1.0,
+                    ax: random_f32() * 2.0 - 1.0,
+                    ay: random_f32() * 2.0 - 1.0,
+                })
+                .collect();
+
+            for k in 0..bin_particle_count {
+                let species_id = k % num_bin_species;
+                let species = &species_in_bin[species_id];
+
+                // Position within this bin
+                let x = map_x0 + (i as f32 + random_f32()) * (map_x1 - map_x0) / grid_size_x as f32;
+                let y = map_y0 + (j as f32 + random_f32()) * (map_y1 - map_y0) / grid_size_y as f32;
+
+                particles.push(Particle {
+                    pos: [x, y],
+                    vel: [
+                        initial_velocity * (random_f32() * 2.0 - 1.0),
+                        initial_velocity * (random_f32() * 2.0 - 1.0),
+                    ],
+                    phase: random_f32(),
+                    energy: 0.0,
+                    species: [species.sx, species.sy],
+                    alpha: [species.ax, species.ay],
+                    interaction: [0.0; 2],
+                });
             }
-        })
-        .collect();
+        }
+    }
 
     let particles_buf = device.create_buffer_init(&BufferInitDescriptor {
         label: Some("particles"),
@@ -855,7 +923,7 @@ fn model(app: &App) -> Model {
         .color_format(format)
         .color_blend(wgpu::BlendComponent {
             src_factor: wgpu::BlendFactor::SrcAlpha,
-            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            dst_factor: wgpu::BlendFactor::One,  // Additive blending - order independent
             operation: wgpu::BlendOperation::Add,
         })
         .alpha_blend(wgpu::BlendComponent::OVER)
@@ -878,6 +946,20 @@ fn model(app: &App) -> Model {
         audio_producer: Arc::new(Mutex::new(audio_producer)),
         audio_feedback_rx: Arc::new(audio_feedback_rx),
         _audio_thread: Arc::new(audio_thread),
+        window: w_id,
+        settings: Settings {
+            volume: 1.0,
+            dt: 0.02,
+            friction: 0.1,
+            mass: 1.0,
+            radius: 0.3,
+            collision_radius: 0.1,
+            collision_strength: 15.0,
+            max_force_strength: 1.0,
+            copy_radius: 0.2,
+            copy_cos_sim_threshold: 0.2,
+            copy_probability: 0.001,
+        },
         time: 0.0,
         frame_count: 0,
         map_x0,
@@ -958,7 +1040,25 @@ fn key_pressed(_app: &App, model: &mut Model, key: KeyCode) {
     }
 }
 
-fn update(_app: &App, model: &mut Model) {
+fn update(app: &App, model: &mut Model) {
+    // egui UI for settings
+    let mut egui_ctx = app.egui_for_window(model.window);
+    let ctx = egui_ctx.get_mut();
+
+    egui::Window::new("Settings").show(&ctx, |ui| {
+        ui.add(egui::Slider::new(&mut model.settings.volume, 0.0..=2.0).text("volume"));
+        ui.add(egui::Slider::new(&mut model.settings.dt, 0.001..=0.1).text("dt"));
+        ui.add(egui::Slider::new(&mut model.settings.friction, 0.0..=1.0).text("friction"));
+        ui.add(egui::Slider::new(&mut model.settings.mass, 0.1..=10.0).text("mass"));
+        ui.add(egui::Slider::new(&mut model.settings.radius, 0.01..=1.0).text("radius"));
+        ui.add(egui::Slider::new(&mut model.settings.collision_radius, 0.01..=0.5).text("collision radius"));
+        ui.add(egui::Slider::new(&mut model.settings.collision_strength, 0.0..=20.0).text("collision strength"));
+        ui.add(egui::Slider::new(&mut model.settings.max_force_strength, 0.0..=10.0).text("max force strength"));
+        ui.add(egui::Slider::new(&mut model.settings.copy_radius, 0.01..=0.5).text("copy radius"));
+        ui.add(egui::Slider::new(&mut model.settings.copy_cos_sim_threshold, 0.0..=1.0).text("copy cos sim threshold"));
+        ui.add(egui::Slider::new(&mut model.settings.copy_probability, 0.0..=0.1).text("copy probability"));
+    });
+
     // Process audio feedback - use the latest min buffer level from audio thread
     let mut latest_feedback = None;
     let mut had_underrun = false;
@@ -1075,11 +1175,11 @@ fn render(_app: &RenderApp, model: &Model, frame: Frame) {
 
     // Update sim params
     let sim_params = SimParams {
-        dt: 0.01,
+        dt: model.settings.dt,
         time: model.time,
         num_particles: NUM_PARTICLES,
-        friction: 0.1,
-        mass: 1.0,
+        friction: model.settings.friction,
+        mass: model.settings.mass,
         map_x0: model.map_x0,
         map_x1: model.map_x1,
         map_y0: model.map_y0,
@@ -1087,13 +1187,13 @@ fn render(_app: &RenderApp, model: &Model, frame: Frame) {
         bin_size: BIN_SIZE,
         num_bins_x,
         num_bins_y,
-        radius: 0.2,
-        collision_radius: 0.08,
-        collision_strength: 2.0,
-        max_force_strength: 1.0,
-        copy_radius: 0.1,
-        copy_cos_sim_threshold: 0.5,
-        copy_probability: 0.1,
+        radius: model.settings.radius,
+        collision_radius: model.settings.collision_radius,
+        collision_strength: model.settings.collision_strength,
+        max_force_strength: model.settings.max_force_strength,
+        copy_radius: model.settings.copy_radius,
+        copy_cos_sim_threshold: model.settings.copy_cos_sim_threshold,
+        copy_probability: model.settings.copy_probability,
         _pad: 0.0
     };
     let sim_params_bytes = bytemuck::bytes_of(&sim_params);
@@ -1108,7 +1208,7 @@ fn render(_app: &RenderApp, model: &Model, frame: Frame) {
         sample_rate: SAMPLE_RATE as f32,
         num_particles: NUM_PARTICLES,
         chunk_size: CHUNK_SIZE,
-        volume: 1.0,
+        volume: model.settings.volume,
         current_x: [model.current_x0, model.current_x1],
         current_y: [model.current_y0, model.current_y1],
         map_x0: model.map_x0,

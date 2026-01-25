@@ -5,8 +5,8 @@ edition = "2021"
 
 [dependencies]
 bevy = "0.18.0-rc.1"
-nannou = { git = "https://github.com/nannou-org/nannou", branch = "bevy-refactor" }
-nannou_audio = { git = "https://github.com/nannou-org/nannou", branch = "bevy-refactor" }
+nannou = { path = "/home/ben/Projects/personal/repos/nannou/nannou", features = ["egui"] }
+nannou_audio = { path = "/home/ben/Projects/personal/repos/nannou/nannou_audio" }
 ringbuf = "0.4"
 bytemuck = { version = "1.14", features = ["derive"] }
 futures = "0.3"

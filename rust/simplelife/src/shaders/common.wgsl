@@ -55,12 +55,16 @@ struct SimParams {
 
 fn compute_frequency(p: Particle, t: f32) -> f32 {
     let base_freq = 100.0 + tanh(p.energy) * 10.0;
-    return 100.0 + p.species.x * sin(TAU * base_freq * 2.0 * t) + p.species.y * cos(TAU * base_freq * 3.0 * t);
+    let mod1 = smoothstep(0.0, 1.0, p.species.x);
+    let mod2 = smoothstep(0.0, 1.0, p.species.y);
+    let mod3 = smoothstep(0.0, 1.0, -p.species.x);
+    let mod4 = smoothstep(0.0, 1.0, -p.species.y);
+    return 100.0 + mod1 * sin(TAU * base_freq * 2.0 * t) + mod2 * sin(TAU * base_freq * 3.0 * t) + mod3 * sin(TAU * base_freq * 5.0 * t) + mod4 * sin(TAU * base_freq * 7.0 * t);
 }
 
 fn compute_amplitude(p: Particle) -> f32 {
     let speed = length(p.vel);
-    return -tanh(p.energy) * 0.1 + 0.8 + 0.1 * speed;
+    return -tanh(p.energy) * 0.3 + 0.5 + 1.0 * speed;
 }
 
 fn compute_oscillator(phase: f32) -> f32 {

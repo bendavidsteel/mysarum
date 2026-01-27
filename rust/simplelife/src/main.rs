@@ -9,10 +9,11 @@ use std::collections::VecDeque;
 use crossbeam_channel::{self, Receiver};
 use ringbuf::{traits::{Consumer, Producer, Split, Observer}, HeapRb};
 
-const NUM_PARTICLES: u32 = 4096;
+const NUM_PARTICLES: u32 = 16_384;
 const NUM_CHANNELS: u32 = 2;
-const SAMPLE_RATE: u32 = 22050;
+const SAMPLE_RATE: u32 = 44100;
 const CHUNK_SIZE: u32 = 2048;
+const NUM_AUDIO_STAGING_BUFS: usize = 4; // Triple-buffered to avoid "buffer still mapped" race
 const CHUNK_FLOATS: u32 = CHUNK_SIZE * NUM_CHANNELS;
 const INITIAL_REQUEST_THRESHOLD: u32 = CHUNK_FLOATS * 2;
 const MIN_REQUEST_THRESHOLD: u32 = CHUNK_FLOATS;
@@ -174,8 +175,8 @@ struct Compute {
     particle_pipeline: Arc<wgpu::ComputePipeline>,
 
     audio_out_buf: Arc<wgpu::Buffer>,
-    // Double-buffered staging for audio readback
-    audio_staging_bufs: [Arc<wgpu::Buffer>; 2],
+    // Multi-buffered staging for audio readback (avoids "buffer still mapped" race in release builds)
+    audio_staging_bufs: Vec<Arc<wgpu::Buffer>>,
     audio_params_buf: Arc<wgpu::Buffer>,
     // Dual bind groups for ping-pong [A, B]
     audio_bind_groups: [Arc<wgpu::BindGroup>; 2],
@@ -316,10 +317,10 @@ fn model(app: &App) -> Model {
         }
     });
 
-    let map_x0 = -4.0;
-    let map_x1 = 4.0;
-    let map_y0 = -4.0;
-    let map_y1 = 4.0;
+    let map_x0 = -8.0;
+    let map_x1 = 8.0;
+    let map_y0 = -8.0;
+    let map_y1 = 8.0;
 
     let current_x0 = map_x0;
     let current_x1 = map_x1;
@@ -425,19 +426,17 @@ fn model(app: &App) -> Model {
         mapped_at_creation: false,
     });
 
-    // Double-buffered staging for audio readback
-    let audio_staging_buf_0 = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("audio_staging_0"),
-        size: (CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let audio_staging_buf_1 = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("audio_staging_1"),
-        size: (CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    // Multi-buffered staging for audio readback
+    let audio_staging_bufs: Vec<Arc<wgpu::Buffer>> = (0..NUM_AUDIO_STAGING_BUFS)
+        .map(|i| {
+            Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("audio_staging_{}", i)),
+                size: (CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }))
+        })
+        .collect();
 
     let audio_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("audio_params"),
@@ -852,7 +851,7 @@ fn model(app: &App) -> Model {
         particle_bind_groups: [Arc::new(particle_bind_group_a), Arc::new(particle_bind_group_b)],
         particle_pipeline: Arc::new(particle_pipeline),
         audio_out_buf: Arc::new(audio_out_buf),
-        audio_staging_bufs: [Arc::new(audio_staging_buf_0), Arc::new(audio_staging_buf_1)],
+        audio_staging_bufs,
         audio_params_buf: Arc::new(audio_params_buf),
         audio_bind_groups: [Arc::new(audio_bind_group_a), Arc::new(audio_bind_group_b)],
         audio_pipeline: Arc::new(audio_pipeline),
@@ -1417,7 +1416,11 @@ fn render(_app: &RenderApp, model: &Model, frame: Frame) {
             pass.dispatch_workgroups((NUM_PARTICLES + 63) / 64, 1, 1);
         }
 
-        let write_idx = if prev_staging_idx == 0 { 1usize } else { 0usize };
+        let write_idx = if prev_staging_idx < 0 {
+            0
+        } else {
+            (prev_staging_idx as usize + 1) % NUM_AUDIO_STAGING_BUFS
+        };
 
         encoder.copy_buffer_to_buffer(
             &*model.compute.audio_out_buf,

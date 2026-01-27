@@ -80,14 +80,22 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
+    // Normalize by visible particle count and apply volume
+    var norm: f32;
+    if (visible_count > 0u) {
+        norm = 1.0 / f32(visible_count);
+    } else {
+        norm = 1.0;
+    }
+
     // add compression
     let compression_threshold = 0.8;
-
-    // Normalize by visible particle count and apply volume
-    if (visible_count > 0u) {
-        let norm = 1.0 / log(f32(visible_count) + 1.0);
-        audio_out[sample_idx] = vec2<f32>(left, right) * norm * params.volume;
-    } else {
-        audio_out[sample_idx] = vec2<f32>(0.0, 0.0);
+    if abs(left) > compression_threshold {
+        left = sign(left) * (compression_threshold + (abs(left) - compression_threshold) * 0.2);
     }
+    if abs(right) > compression_threshold {
+        right = sign(right) * (compression_threshold + (abs(right) - compression_threshold) * 0.2);
+    }
+
+    audio_out[sample_idx] = vec2<f32>(left, right) * norm * params.volume;
 }

@@ -51,27 +51,57 @@ struct SimParams {
     _pad: f32
 }
 
+fn normalize_energy(energy: f32, energy_scale: f32) -> f32 {
+    return clamp(energy / energy_scale, -1.0, 1.0);
+}
+
 // Waveform functions for audio synthesis
 
-fn compute_frequency(p: Particle, t: f32) -> f32 {
-    let base_freq = 100.0 + tanh(p.energy) * 10.0;
+fn compute_frequency(p: Particle, t: f32, energy_scale: f32) -> f32 {
+    let energy_normalized = normalize_energy(p.energy, energy_scale);
+    let base_freq = 200.0 + energy_normalized * 100.0;
     let mod1 = smoothstep(0.0, 1.0, p.species.x);
     let mod2 = smoothstep(0.0, 1.0, p.species.y);
     let mod3 = smoothstep(0.0, 1.0, -p.species.x);
     let mod4 = smoothstep(0.0, 1.0, -p.species.y);
-    return 100.0 + mod1 * sin(TAU * base_freq * 2.0 * t) + mod2 * sin(TAU * base_freq * 3.0 * t) + mod3 * sin(TAU * base_freq * 5.0 * t) + mod4 * sin(TAU * base_freq * 7.0 * t);
+    return base_freq + mod1 * sin(TAU * base_freq * 2.0 * t) + mod2 * sin(TAU * base_freq * 3.0 * t) + mod3 * sin(TAU * base_freq * 5.0 * t) + mod4 * sin(TAU * base_freq * 7.0 * t);
 }
 
-fn compute_amplitude(p: Particle) -> f32 {
+fn compute_amplitude(p: Particle, max_speed: f32, energy_scale: f32) -> f32 {
     let speed = length(p.vel);
-    return -tanh(p.energy) * 0.3 + 0.5 + 1.0 * speed;
+    // Normalize speed to 0-1 range
+    let speed_normalized = clamp(speed / max_speed, 0.0, 1.0);
+    // Normalize energy to -1 to 1 range (negative = attractive/stable, positive = repulsive)
+    let energy_normalized = normalize_energy(p.energy, energy_scale);
+    // Lower energy = louder (invert so stable clusters are louder)
+    // Faster movement = louder
+    let energy_contrib = (1.0 - energy_normalized) * 0.5;  // 0 to 1
+    let speed_contrib = speed_normalized;                   // 0 to 1
+    return clamp(0.2 + energy_contrib * 0.3 + speed_contrib * 0.5, 0.0, 1.0);
 }
 
 fn compute_oscillator(phase: f32) -> f32 {
     return sin(phase);
 }
 
-fn compute_phase(p: Particle, t: f32) -> f32 {
-    let freq = compute_frequency(p, t);
+fn compute_phase(p: Particle, t: f32, energy_scale: f32) -> f32 {
+    let freq = compute_frequency(p, t, energy_scale);
     return p.phase + TAU * freq * t;
+}
+
+struct AudioParams {
+    sample_rate: f32,
+    num_particles: u32,
+    chunk_size: u32,
+    volume: f32,
+    current_x: vec2<f32>,  // Current viewport x (min, max)
+    current_y: vec2<f32>,  // Current viewport y (min, max)
+    map_x0: f32,
+    map_y0: f32,
+    bin_size: f32,
+    num_bins_x: u32,
+    num_bins_y: u32,
+    max_speed: f32,        // Expected max particle speed for normalization
+    energy_scale: f32,     // Expected energy scale for normalization
+    _pad: u32,
 }

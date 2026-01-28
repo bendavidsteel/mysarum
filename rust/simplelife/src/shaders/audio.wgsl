@@ -1,18 +1,3 @@
-struct AudioParams {
-    sample_rate: f32,
-    num_particles: u32,
-    chunk_size: u32,
-    volume: f32,
-    current_x: vec2<f32>,  // Current viewport x (min, max)
-    current_y: vec2<f32>,  // Current viewport y (min, max)
-    map_x0: f32,
-    map_y0: f32,
-    bin_size: f32,
-    num_bins_x: u32,
-    num_bins_y: u32,
-    _pad: u32,
-}
-
 @group(0) @binding(0) var<storage, read> particles: array<Particle>;
 @group(0) @binding(1) var<storage, read_write> audio_out: array<vec2<f32>>;
 @group(0) @binding(2) var<uniform> params: AudioParams;
@@ -29,7 +14,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     var left = 0.0;
     var right = 0.0;
-    var visible_count = 0u;
+    var visible_amp = 0.0;
 
     // Viewport bounds
     let view_left = params.current_x.x;
@@ -62,16 +47,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     continue;
                 }
 
-                visible_count += 1u;
-
                 // Normalize position within viewport (0 to 1)
                 let norm_x = (p.pos.x - view_left) / view_width;
                 let norm_y = (p.pos.y - view_bottom) / view_height;
 
                 // Compute waveform
-                let phase = compute_phase(p, t);
+                let phase = compute_phase(p, t, params.energy_scale);
                 let osc = compute_oscillator(phase);
-                let amp = compute_amplitude(p);
+                let amp = compute_amplitude(p, params.max_speed, params.energy_scale);
+
+                visible_amp += amp;
 
                 // Stereo pan based on x position within viewport
                 left += osc * amp * (1.0 - norm_x);
@@ -82,20 +67,20 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     // Normalize by visible particle count and apply volume
     var norm: f32;
-    if (visible_count > 0u) {
-        norm = 1.0 / f32(visible_count);
+    if (visible_amp > 0.0) {
+        norm = 1.0 / visible_amp;
     } else {
         norm = 1.0;
     }
 
     // add compression
-    let compression_threshold = 0.8;
-    if abs(left) > compression_threshold {
-        left = sign(left) * (compression_threshold + (abs(left) - compression_threshold) * 0.2);
-    }
-    if abs(right) > compression_threshold {
-        right = sign(right) * (compression_threshold + (abs(right) - compression_threshold) * 0.2);
-    }
+    // let compression_threshold = 0.8;
+    // if abs(left) > compression_threshold {
+    //     left = sign(left) * (compression_threshold + (abs(left) - compression_threshold) * 0.2);
+    // }
+    // if abs(right) > compression_threshold {
+    //     right = sign(right) * (compression_threshold + (abs(right) - compression_threshold) * 0.2);
+    // }
 
     audio_out[sample_idx] = vec2<f32>(left, right) * norm * params.volume;
 }

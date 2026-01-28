@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use crossbeam_channel::{self, Receiver};
 use ringbuf::{traits::{Consumer, Producer, Split, Observer}, HeapRb};
 
-const NUM_PARTICLES: u32 = 16_384;
+const NUM_PARTICLES: u32 = 8192;
 const NUM_CHANNELS: u32 = 2;
 const SAMPLE_RATE: u32 = 44100;
 const CHUNK_SIZE: u32 = 2048;
@@ -86,15 +86,8 @@ struct AudioParams {
     bin_size: f32,
     num_bins_x: u32,
     num_bins_y: u32,
-    _pad: u32,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct PhaseUpdateParams {
-    sample_rate: f32,
-    num_particles: u32,
-    chunk_size: u32,
+    max_speed: f32,       // Expected max particle speed for normalization
+    energy_scale: f32,    // Expected energy scale for normalization
     _pad: u32,
 }
 
@@ -182,8 +175,7 @@ struct Compute {
     audio_bind_groups: [Arc<wgpu::BindGroup>; 2],
     audio_pipeline: Arc<wgpu::ComputePipeline>,
 
-    phase_update_params_buf: Arc<wgpu::Buffer>,
-    // Dual bind groups for ping-pong [A, B]
+    // Dual bind groups for ping-pong [A, B] - uses audio_params_buf for uniforms
     phase_update_bind_groups: [Arc<wgpu::BindGroup>; 2],
     phase_update_pipeline: Arc<wgpu::ComputePipeline>,
 
@@ -458,14 +450,6 @@ fn model(app: &App) -> Model {
         source: wgpu::ShaderSource::Wgsl(PHASE_UPDATE_SHADER.into()),
     });
 
-    // Phase update params buffer
-    let phase_update_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("phase_update_params"),
-        size: std::mem::size_of::<PhaseUpdateParams>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
     let phase_update_bind_group_layout = wgpu::BindGroupLayoutBuilder::new()
         .storage_buffer(wgpu::ShaderStages::COMPUTE, false, false) // particles read-write
         .uniform_buffer(wgpu::ShaderStages::COMPUTE, false)
@@ -474,7 +458,7 @@ fn model(app: &App) -> Model {
     // Create bind group A here (B is created after particles_sorted_buf)
     let phase_update_bind_group_a = wgpu::BindGroupBuilder::new()
         .buffer_bytes(&particles_buf, 0, std::num::NonZeroU64::new(particles_buf_size))
-        .buffer::<PhaseUpdateParams>(&phase_update_params_buf, 0..1)
+        .buffer::<AudioParams>(&audio_params_buf, 0..1)
         .build(&device, &phase_update_bind_group_layout);
 
     let phase_update_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -491,18 +475,6 @@ fn model(app: &App) -> Model {
         compilation_options: Default::default(),
         cache: None,
     });
-
-    // Write initial phase update params
-    queue.write_buffer(
-        &phase_update_params_buf,
-        0,
-        bytemuck::bytes_of(&PhaseUpdateParams {
-            sample_rate: SAMPLE_RATE as f32,
-            num_particles: NUM_PARTICLES,
-            chunk_size: CHUNK_SIZE,
-            _pad: 0,
-        }),
-    );
 
     // ==================== Spatial Hashing Setup ====================
     let num_bins_x = ((map_x1 - map_x0) / BIN_SIZE).ceil() as u32;
@@ -545,7 +517,7 @@ fn model(app: &App) -> Model {
     // Create phase_update_bind_group_b now that particles_sorted_buf exists
     let phase_update_bind_group_b = wgpu::BindGroupBuilder::new()
         .buffer_bytes(&particles_sorted_buf, 0, std::num::NonZeroU64::new(particles_buf_size))
-        .buffer::<PhaseUpdateParams>(&phase_update_params_buf, 0..1)
+        .buffer::<AudioParams>(&audio_params_buf, 0..1)
         .build(&device, &phase_update_bind_group_layout);
 
     // Prefix sum step size uniform
@@ -820,6 +792,11 @@ fn model(app: &App) -> Model {
             bin_size: BIN_SIZE,
             num_bins_x,
             num_bins_y,
+            // Use default settings values for initial params
+            // avg_neighbors ≈ 20, max_speed = 20 * 2 * 1.0 * 0.1 / 1.0 = 4.0
+            max_speed: 4.0,
+            // energy_scale = 20 * 1.0 * (0.3 - 0.1) = 4.0
+            energy_scale: 4.0,
             _pad: 0,
         }),
     );
@@ -855,7 +832,6 @@ fn model(app: &App) -> Model {
         audio_params_buf: Arc::new(audio_params_buf),
         audio_bind_groups: [Arc::new(audio_bind_group_a), Arc::new(audio_bind_group_b)],
         audio_pipeline: Arc::new(audio_pipeline),
-        phase_update_params_buf: Arc::new(phase_update_params_buf),
         phase_update_bind_groups: [Arc::new(phase_update_bind_group_a), Arc::new(phase_update_bind_group_b)],
         phase_update_pipeline: Arc::new(phase_update_pipeline),
         spatial_hash,
@@ -1202,6 +1178,14 @@ fn render(_app: &RenderApp, model: &Model, frame: Frame) {
         usage: wgpu::BufferUsages::COPY_SRC,
     });
 
+    // Compute audio normalization parameters from simulation settings
+    // Assumes ~20 average neighbors within interaction radius
+    let avg_neighbors = 20.0_f32;
+    // Terminal velocity: v ≈ F * friction / mass, where F ≈ avg_neighbors * 2 * max_force
+    let max_speed = avg_neighbors * 2.0 * model.settings.max_force_strength * model.settings.friction / model.settings.mass;
+    // Energy per neighbor ≈ max_force * (radius - collision_radius), summed over neighbors
+    let energy_scale = avg_neighbors * model.settings.max_force_strength * (model.settings.radius - model.settings.collision_radius);
+
     // Update audio params with current viewport
     let audio_params = AudioParams {
         sample_rate: SAMPLE_RATE as f32,
@@ -1215,6 +1199,8 @@ fn render(_app: &RenderApp, model: &Model, frame: Frame) {
         bin_size: BIN_SIZE,
         num_bins_x,
         num_bins_y,
+        max_speed,
+        energy_scale,
         _pad: 0,
     };
     let audio_params_bytes = bytemuck::bytes_of(&audio_params);

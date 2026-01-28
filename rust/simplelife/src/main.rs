@@ -929,7 +929,7 @@ fn model(app: &App) -> Model {
         window: w_id,
         settings: Settings {
             volume: 1.0,
-            dt: 0.01,
+            dt: 0.035,
             friction: 0.1,
             mass: 1.0,
             radius: 0.3,

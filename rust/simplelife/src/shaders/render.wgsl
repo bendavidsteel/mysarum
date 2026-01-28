@@ -57,7 +57,7 @@ fn vs_main(
     var out: VertexOutput;
     out.clip_position = vec4<f32>(pos, 0.0, 1.0);
     out.uv = vertex.uv;
-    out.hue = particle.species.x;
+    out.hue = (particle.species.x + 1.0) * 0.5;  // Map [-1, 1] to [0, 1] for HSL
     out.energy = particle.energy;
 
     return out;

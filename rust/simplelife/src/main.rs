@@ -45,6 +45,8 @@ struct Particle {
     species: [f32; 2],
     alpha: [f32; 2],
     interaction: [f32; 2],
+    amp_phase: f32,
+    _pad: f32,
 }
 
 #[repr(C)]
@@ -325,8 +327,9 @@ fn model(app: &App) -> Model {
     let initial_velocity = 0.1;
 
     // Calculate grid dimensions for initialization bins
-    let grid_size_x = ((map_x1 - map_x0) / BIN_SIZE).ceil() as u32;
-    let grid_size_y = ((map_y1 - map_y0) / BIN_SIZE).ceil() as u32;
+    let bin_size = 2.0;
+    let grid_size_x = ((map_x1 - map_x0) / bin_size).ceil() as u32;
+    let grid_size_y = ((map_y1 - map_y0) / bin_size).ceil() as u32;
     let bin_count = grid_size_x * grid_size_y;
 
     // Species definition for a bin
@@ -381,6 +384,8 @@ fn model(app: &App) -> Model {
                     species: [species.sx, species.sy],
                     alpha: [species.ax, species.ay],
                     interaction: [0.0; 2],
+                    amp_phase: random_f32(),
+                    _pad: 0.0,
                 });
             }
         }
@@ -924,7 +929,7 @@ fn model(app: &App) -> Model {
         window: w_id,
         settings: Settings {
             volume: 1.0,
-            dt: 0.02,
+            dt: 0.01,
             friction: 0.1,
             mass: 1.0,
             radius: 0.3,

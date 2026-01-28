@@ -49,6 +49,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     var totalForce = vec2f(0.0, 0.0);
     var totalEnergy = 0.0;
+    var totalInteraction = vec2f(0.0, 0.0);
+    var numInteractions = 0u;
 
     let copyBinXRand = random3(vec3f(params.time, particle.pos.x, particle.pos.y));
     let copyBinYRand = random4(vec4f(params.time, particle.pos.y, particle.pos.x, particle.vel.x));
@@ -103,6 +105,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
                     totalForce += f * n;
                     totalEnergy += e;
+
+                    totalInteraction += 0.01 * (other.species - particle.species);
                 }
 
                 if (binX == i32(binInfo.binX) + copyBinXOffset && binY == i32(binInfo.binY) + copyBinYOffset) {
@@ -139,6 +143,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     // Update energy based on energy func
     particle.energy = totalEnergy;
+
+    // Update interaction
+    particle.interaction = totalInteraction;
 
     particles[id.x] = particle;
 }

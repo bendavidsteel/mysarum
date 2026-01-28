@@ -54,13 +54,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 // Compute waveform
                 let phase = compute_phase(p, t, params.energy_scale);
                 let osc = compute_oscillator(phase);
-                let amp = compute_amplitude(p, params.max_speed, params.energy_scale);
+                let amp = compute_amplitude(p, t, params.max_speed, params.energy_scale);
+                let amp_mod = 0.2 + 0.8 * compute_oscillator(compute_amp_phase(p, t, params.energy_scale));
+                let amp_final = amp * amp_mod;
 
                 visible_amp += amp;
 
                 // Stereo pan based on x position within viewport
-                left += osc * amp * (1.0 - norm_x);
-                right += osc * amp * norm_x;
+                left += osc * amp_final * (1.0 - norm_x);
+                right += osc * amp_final * norm_x;
             }
         }
     }

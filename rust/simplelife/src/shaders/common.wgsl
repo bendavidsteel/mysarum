@@ -8,6 +8,8 @@ struct Particle {
     species: vec2<f32>,
     alpha: vec2<f32>,
     interaction: vec2<f32>,
+    amp_phase: f32,
+    _pad: f32,
 }
 
 const PI: f32 = 3.14159265359;
@@ -58,8 +60,10 @@ fn normalize_energy(energy: f32, energy_scale: f32) -> f32 {
 // Waveform functions for audio synthesis
 
 fn compute_frequency(p: Particle, t: f32, energy_scale: f32) -> f32 {
-    let energy_normalized = normalize_energy(p.energy, energy_scale);
-    let base_freq = 200.0 + energy_normalized * 100.0;
+    // the less energy, the higher the frequency
+    let energy_normalized = -1 * normalize_energy(p.energy, energy_scale) + 1.0;
+    let base_freq = 80.0 + energy_normalized * 50.0;
+    // TODO low pass filter if particles are further from centre of screen
     let mod1 = smoothstep(0.0, 1.0, p.species.x);
     let mod2 = smoothstep(0.0, 1.0, p.species.y);
     let mod3 = smoothstep(0.0, 1.0, -p.species.x);
@@ -67,7 +71,7 @@ fn compute_frequency(p: Particle, t: f32, energy_scale: f32) -> f32 {
     return base_freq + mod1 * sin(TAU * base_freq * 2.0 * t) + mod2 * sin(TAU * base_freq * 3.0 * t) + mod3 * sin(TAU * base_freq * 5.0 * t) + mod4 * sin(TAU * base_freq * 7.0 * t);
 }
 
-fn compute_amplitude(p: Particle, max_speed: f32, energy_scale: f32) -> f32 {
+fn compute_amplitude(p: Particle, t: f32, max_speed: f32, energy_scale: f32) -> f32 {
     let speed = length(p.vel);
     // Normalize speed to 0-1 range
     let speed_normalized = clamp(speed / max_speed, 0.0, 1.0);
@@ -77,7 +81,7 @@ fn compute_amplitude(p: Particle, max_speed: f32, energy_scale: f32) -> f32 {
     // Faster movement = louder
     let energy_contrib = (1.0 - energy_normalized) * 0.5;  // 0 to 1
     let speed_contrib = speed_normalized;                   // 0 to 1
-    return clamp(0.2 + energy_contrib * 0.3 + speed_contrib * 0.5, 0.0, 1.0);
+    return clamp(0.05 + energy_contrib * 0.35 + speed_contrib * 0.6, 0.0, 1.0);
 }
 
 fn compute_oscillator(phase: f32) -> f32 {
@@ -87,6 +91,14 @@ fn compute_oscillator(phase: f32) -> f32 {
 fn compute_phase(p: Particle, t: f32, energy_scale: f32) -> f32 {
     let freq = compute_frequency(p, t, energy_scale);
     return p.phase + TAU * freq * t;
+}
+
+fn compute_amp_phase(p: Particle, t: f32, energy_scale: f32) -> f32 {
+    // TODO particles with low energy should have complex and higher frequency LFOs
+    let energy_normalized = (1.0 - normalize_energy(p.energy, energy_scale)) * 0.5;  // 0 to 1
+    var lfo_freq = 0.005 + energy_normalized * (0.1 * p.interaction.x + 0.2 * sin(TAU * p.interaction.y * 0.1)); // base LFO frequency influenced by interaction
+    lfo_freq = min(lfo_freq, 5.0); // maximum LFO frequency
+    return p.amp_phase + TAU * lfo_freq * t;
 }
 
 struct AudioParams {

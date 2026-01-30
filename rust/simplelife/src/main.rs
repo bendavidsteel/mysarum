@@ -1124,6 +1124,23 @@ fn audio_fn(audio: &mut AudioModel, buffer: &mut Buffer) {
     }).ok();
 }
 
+/// Helper to update a GPU buffer via staging buffer copy.
+/// Returns the staging buffer which must be kept alive until the encoder is submitted.
+fn update_buffer<T: bytemuck::Pod>(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    dest: &wgpu::Buffer,
+    data: &T,
+) {
+    let bytes = bytemuck::bytes_of(data);
+    let staging = device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("staging"),
+        contents: bytes,
+        usage: wgpu::BufferUsages::COPY_SRC,
+    });
+    encoder.copy_buffer_to_buffer(&staging, 0, dest, 0, bytes.len() as u64);
+}
+
 fn render(_app: &RenderApp, model: &Model, frame: Frame) {
     let device = frame.device();
 
@@ -1132,6 +1149,8 @@ fn render(_app: &RenderApp, model: &Model, frame: Frame) {
     // dst_idx = destination buffer (where sorted data will go, and where simulation runs)
     let src_idx = model.current_buffer_idx.load(Ordering::Relaxed);
     let dst_idx = 1 - src_idx;
+
+    let mut encoder = frame.command_encoder();
 
     // Update render params with current viewport
     let render_params = RenderParams {
@@ -1142,12 +1161,7 @@ fn render(_app: &RenderApp, model: &Model, frame: Frame) {
         particle_size: PARTICLE_SIZE,
         num_particles: NUM_PARTICLES,
     };
-    let render_params_bytes = bytemuck::bytes_of(&render_params);
-    let new_render_params_buf = device.create_buffer_init(&BufferInitDescriptor {
-        label: Some("render-params-transfer"),
-        contents: render_params_bytes,
-        usage: wgpu::BufferUsages::COPY_SRC,
-    });
+    update_buffer(device, &mut encoder, &*model.render.render_params_buf, &render_params);
 
     // Calculate bin counts
     let num_bins_x = ((model.map_x1 - model.map_x0) / BIN_SIZE).ceil() as u32;
@@ -1176,12 +1190,7 @@ fn render(_app: &RenderApp, model: &Model, frame: Frame) {
         copy_probability: model.settings.copy_probability,
         _pad: 0.0
     };
-    let sim_params_bytes = bytemuck::bytes_of(&sim_params);
-    let new_sim_params_buf = device.create_buffer_init(&BufferInitDescriptor {
-        label: Some("sim-params-transfer"),
-        contents: sim_params_bytes,
-        usage: wgpu::BufferUsages::COPY_SRC,
-    });
+    update_buffer(device, &mut encoder, &*model.compute.sim_params_buf, &sim_params);
 
     // Compute audio normalization parameters from simulation settings
     // Assumes ~20 average neighbors within interaction radius
@@ -1208,39 +1217,9 @@ fn render(_app: &RenderApp, model: &Model, frame: Frame) {
         energy_scale,
         _pad: 0,
     };
-    let audio_params_bytes = bytemuck::bytes_of(&audio_params);
-    let new_audio_params_buf = device.create_buffer_init(&BufferInitDescriptor {
-        label: Some("audio-params-transfer"),
-        contents: audio_params_bytes,
-        usage: wgpu::BufferUsages::COPY_SRC,
-    });
+    update_buffer(device, &mut encoder, &*model.compute.audio_params_buf, &audio_params);
 
     let audio_buf_size = (CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64;
-
-    let mut encoder = frame.command_encoder();
-
-    // Copy new params
-    encoder.copy_buffer_to_buffer(
-        &new_render_params_buf,
-        0,
-        &*model.render.render_params_buf,
-        0,
-        std::mem::size_of::<RenderParams>() as u64,
-    );
-    encoder.copy_buffer_to_buffer(
-        &new_sim_params_buf,
-        0,
-        &*model.compute.sim_params_buf,
-        0,
-        std::mem::size_of::<SimParams>() as u64,
-    );
-    encoder.copy_buffer_to_buffer(
-        &new_audio_params_buf,
-        0,
-        &*model.compute.audio_params_buf,
-        0,
-        std::mem::size_of::<AudioParams>() as u64,
-    );
 
     // ==================== Spatial Hashing Passes ====================
     // Sort particles from src_idx buffer to dst_idx buffer
@@ -1278,19 +1257,7 @@ fn render(_app: &RenderApp, model: &Model, frame: Frame) {
 
     for i in 0..num_prefix_sum_steps {
         let step_size = 1u32 << i;
-
-        let step_size_buf = device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("prefix_sum_step_transfer"),
-            contents: bytemuck::bytes_of(&step_size),
-            usage: wgpu::BufferUsages::COPY_SRC,
-        });
-        encoder.copy_buffer_to_buffer(
-            &step_size_buf,
-            0,
-            &*sh.prefix_sum_step_buf,
-            0,
-            std::mem::size_of::<u32>() as u64,
-        );
+        update_buffer(device, &mut encoder, &*sh.prefix_sum_step_buf, &step_size);
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

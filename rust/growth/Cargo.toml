@@ -1,0 +1,9 @@
+[package]
+name = "growth"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = "0.18.0-rc.1"
+nannou = { git = "https://github.com/nannou-org/nannou", branch = "bevy-refactor" }
+nannou_audio = { git = "https://github.com/nannou-org/nannou", branch = "bevy-refactor" }

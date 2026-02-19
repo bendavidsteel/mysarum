@@ -8,3 +8,5 @@ bevy = "0.17"
 nannou = { path = "/home/ben/Projects/personal/repos/nannou/nannou", features = ["egui"] }
 nannou_audio = { path = "/home/ben/Projects/personal/repos/nannou/nannou_audio" }
 bevy_nannou = { path = "/home/ben/Projects/personal/repos/nannou/bevy_nannou" }
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"

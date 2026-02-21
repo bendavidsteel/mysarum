@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use nannou::prelude::*;
-use bevy::camera::ScalingMode;
 use bytemuck::{Pod, Zeroable};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -25,6 +25,7 @@ fn gaussian(x: f32, mu: f32, sigma: f32) -> f32 {
 
 // ── Half-edge mesh (structure-of-arrays, heap-allocated) ───────────────────────
 
+#[derive(Clone)]
 struct HalfEdgeMesh {
     // Face arrays
     face_idx: [i32; MAX_FACES],
@@ -1346,6 +1347,7 @@ const INTEGRATE_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), includ
 const CHEBYSHEV_INIT_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/chebyshev_init.wgsl"));
 const CHEBYSHEV_STEP_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/chebyshev_step.wgsl"));
 const GROWTH_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/growth.wgsl"));
+const MESH_RENDER_WGSL: &str = include_str!("shaders/mesh_render.wgsl");
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -1370,10 +1372,20 @@ struct GpuSimParams {
     _pad0: u32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct RenderUniforms {
+    view_proj: [[f32; 4]; 4],
+    center: [f32; 4],       // xyz = mesh center, w = scale
+    light: [f32; 4],        // xyz = direction, w = ambient
+    render_mode: [f32; 4],  // x = mode, yzw unused
+}
+
 fn dispatch_count(n: u32) -> u32 {
     (n + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE
 }
 
+#[derive(Clone)]
 struct GpuCompute {
     // Vertex buffers
     vertex_pos_buf: wgpu::Buffer,
@@ -1443,6 +1455,11 @@ struct GpuCompute {
     cheb_step_params_bg: wgpu::BindGroup,
     growth_data_bg: wgpu::BindGroup,
     growth_params_bg: wgpu::BindGroup,
+
+    // Render buffers (read by vertex shader directly)
+    render_index_buf: wgpu::Buffer,
+    render_uniform_buf: wgpu::Buffer,
+    num_render_tris: u32,
 
     // Config
     max_bins: u32,
@@ -1520,6 +1537,19 @@ fn create_gpu_compute(device: &wgpu::Device) -> GpuCompute {
     let sim_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("sim_params"), size: std::mem::size_of::<GpuSimParams>() as u64, usage: uniform, mapped_at_creation: false,
     });
+    // Render buffers: index buffer (3 u32 per face) + uniform buffer
+    let render_index_buf_size = (MAX_FACES * 3 * 4) as u64;
+    let render_index_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("render_index"), size: render_index_buf_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let render_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("render_uniform"), size: std::mem::size_of::<RenderUniforms>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
     let pos_readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("pos_readback"), size: pos_buf_size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
     });
@@ -1888,6 +1918,8 @@ fn create_gpu_compute(device: &wgpu::Device) -> GpuCompute {
         cheb_init_data_bg, cheb_init_params_bg,
         cheb_step_data_bgs, cheb_step_params_bg,
         growth_data_bg, growth_params_bg,
+        render_index_buf, render_uniform_buf,
+        num_render_tris: 0,
         max_bins,
         topology_dirty: true,
     }
@@ -1967,6 +1999,63 @@ fn readback_from_gpu(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &mut GpuCo
         mesh.vertex_u[..n].copy_from_slice(&floats[..n]);
     }
     gpu.u_readback_buf.unmap();
+}
+
+fn rebuild_render_indices(queue: &wgpu::Queue, gpu: &mut GpuCompute, mesh: &HalfEdgeMesh) {
+    let mut indices: Vec<u32> = Vec::with_capacity(mesh.next_face * 3);
+    for f in 0..mesh.next_face {
+        if mesh.face_idx[f] < 0 { continue; }
+        let he0 = mesh.face_half_edge[f];
+        if he0 < 0 { continue; }
+        let he0 = he0 as usize;
+        let he1 = mesh.half_edge_next[he0];
+        if he1 < 0 { continue; }
+        let he1 = he1 as usize;
+        let he2 = mesh.half_edge_next[he1];
+        if he2 < 0 { continue; }
+        let he2 = he2 as usize;
+
+        let v0 = mesh.half_edge_dest[he0];
+        let v1 = mesh.half_edge_dest[he1];
+        let v2 = mesh.half_edge_dest[he2];
+        if v0 < 0 || v1 < 0 || v2 < 0 { continue; }
+        if mesh.vertex_idx[v0 as usize] < 0
+            || mesh.vertex_idx[v1 as usize] < 0
+            || mesh.vertex_idx[v2 as usize] < 0
+        {
+            continue;
+        }
+        indices.push(v0 as u32);
+        indices.push(v1 as u32);
+        indices.push(v2 as u32);
+    }
+    gpu.num_render_tris = (indices.len() / 3) as u32;
+    queue.write_buffer(&gpu.render_index_buf, 0, bytemuck::cast_slice(&indices));
+}
+
+fn update_render_uniforms(
+    queue: &wgpu::Queue,
+    gpu: &GpuCompute,
+    center: Vec3,
+    scale: f32,
+    yaw: f32,
+    pitch: f32,
+    render_mode: u32,
+    aspect: f32,
+) {
+    let rot = Mat4::from_rotation_x(pitch) * Mat4::from_rotation_y(yaw);
+    let half_h = 10.0; // matches FixedVertical(20.0)
+    let half_w = half_h * aspect;
+    let proj = Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, -1000.0, 1000.0);
+    let view_proj = proj * rot;
+
+    let uniforms = RenderUniforms {
+        view_proj: view_proj.to_cols_array_2d(),
+        center: [center.x, center.y, center.z, scale],
+        light: [0.3, 0.4, 1.0, 0.2],
+        render_mode: [render_mode as f32, 0.0, 0.0, 0.0],
+    };
+    queue.write_buffer(&gpu.render_uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 }
 
 fn gpu_dispatch_frame(
@@ -2147,12 +2236,36 @@ fn gpu_dispatch_frame(
     queue.submit(Some(encoder.finish()));
 }
 
+// ── Render state (shared between main + render worlds via Arc) ─────────────────
+
+struct RenderState {
+    pipeline: Option<wgpu::RenderPipeline>,
+    bind_group_layout: Option<wgpu::BindGroupLayout>,
+    bind_group: Option<wgpu::BindGroup>,
+    depth_view: Option<wgpu::TextureViewHandle>,
+    depth_size: [u32; 2],
+}
+
+impl Default for RenderState {
+    fn default() -> Self {
+        Self {
+            pipeline: None, bind_group_layout: None, bind_group: None,
+            depth_view: None, depth_size: [0, 0],
+        }
+    }
+}
+
 // ── Model ──────────────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct Model {
     window: Entity,
-    mesh: Box<HalfEdgeMesh>,
+    mesh: Arc<HalfEdgeMesh>,
     gpu: Option<GpuCompute>,
+    render_state: Arc<Mutex<RenderState>>,
+    // Cached bounding box for rendering (updated on readback frames)
+    cached_center: Vec3,
+    cached_scale: f32,
     spring_len: f32,
     elastic_constant: f32,
     repulsion_distance: f32,
@@ -2213,37 +2326,18 @@ fn randomize_params(model: &mut Model) {
     recompute_cheb_coeffs(model);
 }
 
-// ── Lit mesh shader model ───────────────────────────────────────────────────────
-
-#[shader_model(fragment = "lit_mesh.wgsl")]
-struct LitMesh {
-    #[uniform(0)]
-    light: Vec4, // xyz = light direction, w = ambient
-    #[uniform(1)]
-    render_mode: Vec4, // x = mode (0=lit+wire, 1=normal map), yzw unused
-}
-
 // ── App ────────────────────────────────────────────────────────────────────────
 
 fn main() {
     nannou::app(model)
         .update(update)
-        .shader_model::<LitMesh>()
+        .render(render)
         .run();
 }
 
 fn model(app: &App) -> Model {
-    let cam = app.new_camera()
-        .projection(OrthographicProjection {
-            scaling_mode: ScalingMode::FixedVertical { viewport_height: 20.0 },
-            ..OrthographicProjection::default_3d()
-        })
-        .build();
-
     let w_id = app.new_window()
         .size(1000, 1000)
-        .camera(cam)
-        .view(view)
         .key_pressed(key_pressed)
         .mouse_pressed(mouse_pressed)
         .mouse_released(mouse_released)
@@ -2252,8 +2346,11 @@ fn model(app: &App) -> Model {
 
     let mut m = Model {
         window: w_id,
-        mesh: HalfEdgeMesh::new(),
+        mesh: Arc::from(HalfEdgeMesh::new()),
         gpu: None,
+        render_state: Arc::new(Mutex::new(RenderState::default())),
+        cached_center: Vec3::ZERO,
+        cached_scale: 1.0,
         spring_len: 30.0,
         elastic_constant: 0.1,
         repulsion_distance: 150.0,
@@ -2277,7 +2374,7 @@ fn model(app: &App) -> Model {
         render_mode: 0,
     };
     randomize_params(&mut m);
-    m.mesh = make_circle(m.spring_len, N_RINGS, SEGMENTS_INNER);
+    m.mesh = Arc::from(make_circle(m.spring_len, N_RINGS, SEGMENTS_INNER));
     m
 }
 
@@ -2385,71 +2482,67 @@ fn update(app: &App, model: &mut Model) {
         );
     }
 
-    // Readback every frame (needed for rendering) but topology ops only every 10/20 frames
-    let needs_topology_ops = model.frame % 10 == 0 || model.frame % 20 == 0;
+    // Readback + topology ops only every 10/20 frames (rendering reads GPU buffers directly)
+    let needs_topology_ops = model.frame % 10 == 0;
     if needs_topology_ops || model.frame <= 1 {
         let window = app.window(model.window);
         let device = window.device();
         let queue = window.queue();
         let gpu = model.gpu.as_mut().unwrap();
-        readback_from_gpu(&device, &queue, gpu, &mut model.mesh);
-    } else {
-        // Lightweight readback: just positions for rendering
-        let window = app.window(model.window);
-        let device = window.device();
-        let queue = window.queue();
-        let gpu = model.gpu.as_mut().unwrap();
-        let pos_size = (MAX_VERTICES * 16) as u64;
-        let state_size = (MAX_VERTICES * 4) as u64;
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("readback_encoder"),
-        });
-        encoder.copy_buffer_to_buffer(&gpu.vertex_pos_buf, 0, &gpu.pos_readback_buf, 0, pos_size);
-        encoder.copy_buffer_to_buffer(&gpu.vertex_state_buf, 0, &gpu.state_readback_buf, 0, state_size);
-        queue.submit(Some(encoder.finish()));
+        let mesh = Arc::make_mut(&mut model.mesh);
+        readback_from_gpu(&device, &queue, gpu, mesh);
 
-        let pos_slice = gpu.pos_readback_buf.slice(..);
-        pos_slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::PollType::Wait).unwrap();
-        {
-            let data = pos_slice.get_mapped_range();
-            let floats: &[[f32; 4]] = bytemuck::cast_slice(&data);
-            let n = model.mesh.next_vertex;
-            for v in 0..n {
-                model.mesh.vertex_pos[v] = Vec3::new(floats[v][0], floats[v][1], floats[v][2]);
+        // Update cached bounding box for render uniforms
+        let mut min_pos = Vec3::splat(f32::INFINITY);
+        let mut max_pos = Vec3::splat(f32::NEG_INFINITY);
+        let mut any_active = false;
+        for v in 0..mesh.next_vertex {
+            if mesh.vertex_idx[v] < 0 { continue; }
+            any_active = true;
+            min_pos = min_pos.min(mesh.vertex_pos[v]);
+            max_pos = max_pos.max(mesh.vertex_pos[v]);
+        }
+        if any_active {
+            model.cached_center = (min_pos + max_pos) * 0.5;
+            let mut max_radius = 0.0f32;
+            for v in 0..mesh.next_vertex {
+                if mesh.vertex_idx[v] < 0 { continue; }
+                let r = (mesh.vertex_pos[v] - model.cached_center).length();
+                max_radius = max_radius.max(r);
             }
+            max_radius *= 1.15;
+            model.cached_scale = 8.0 / max_radius.max(1.0);
         }
-        gpu.pos_readback_buf.unmap();
 
-        let state_slice = gpu.state_readback_buf.slice(..);
-        state_slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::PollType::Wait).unwrap();
-        {
-            let data = state_slice.get_mapped_range();
-            let floats: &[f32] = bytemuck::cast_slice(&data);
-            let n = model.mesh.next_vertex;
-            model.mesh.vertex_state[..n].copy_from_slice(&floats[..n]);
+        // Growth (every 10 frames)
+        generate_new_triangles(mesh, model.split_threshold);
+
+        // Mesh refinement (every 20 frames)
+        if model.frame % 20 == 0 {
+            mesh.refine_mesh();
         }
-        gpu.state_readback_buf.unmap();
+
+        // Upload new mesh data to GPU immediately so render indices stay in sync
+        upload_mesh_to_gpu(&queue, gpu, mesh);
+        gpu.topology_dirty = false;
+
+        // Rebuild render index buffer
+        rebuild_render_indices(&queue, gpu, mesh);
     }
 
-    // Growth (every 10 frames) - CPU, modifies topology
-    if model.frame % 10 == 0 {
-        generate_new_triangles(
-            &mut model.mesh,
-            model.split_threshold,
+    // Update render uniforms every frame (camera may have changed)
+    {
+        let window = app.window(model.window);
+        let queue = window.queue();
+        let gpu = model.gpu.as_ref().unwrap();
+        let sz = window.size_pixels();
+        let aspect = sz.x as f32 / sz.y.max(1) as f32;
+        update_render_uniforms(
+            &queue, gpu,
+            model.cached_center, model.cached_scale,
+            model.camera_yaw, model.camera_pitch,
+            model.render_mode, aspect,
         );
-        if let Some(ref mut gpu) = model.gpu {
-            gpu.topology_dirty = true;
-        }
-    }
-
-    // Mesh refinement (every 20 frames) - CPU, modifies topology
-    if model.frame % 20 == 0 {
-        model.mesh.refine_mesh();
-        if let Some(ref mut gpu) = model.gpu {
-            gpu.topology_dirty = true;
-        }
     }
 
     #[cfg(debug_assertions)]
@@ -2458,121 +2551,207 @@ fn update(app: &App, model: &mut Model) {
     }
 }
 
-fn view(app: &App, model: &Model) {
-    let draw = app.draw();
-    draw.background().color(BLACK);
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-    let mesh = &model.mesh;
+fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32, msaa_samples: u32) -> wgpu::TextureViewHandle {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("depth"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: msaa_samples,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
 
-    // Compute bounding box of active vertices
-    let mut min_pos = Vec3::splat(f32::INFINITY);
-    let mut max_pos = Vec3::splat(f32::NEG_INFINITY);
-    let mut any_active = false;
+fn init_render_state(
+    device: &wgpu::Device,
+    gpu: &GpuCompute,
+    rs: &mut RenderState,
+    texture_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+    texture_size: [u32; 2],
+) {
+    let vs = wgpu::ShaderStages::VERTEX;
+    let fs = wgpu::ShaderStages::VERTEX_FRAGMENT;
 
-    for v in 0..mesh.next_vertex {
-        if mesh.vertex_idx[v] < 0 {
-            continue;
-        }
-        any_active = true;
-        let p = mesh.vertex_pos[v];
-        min_pos = min_pos.min(p);
-        max_pos = max_pos.max(p);
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("render_bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: vs,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: vs,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: vs,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: fs,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("render_bg"),
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: gpu.vertex_pos_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: gpu.vertex_state_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: gpu.render_index_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: gpu.render_uniform_buf.as_entire_binding() },
+        ],
+    });
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("mesh_render"),
+        source: wgpu::ShaderSource::Wgsl(MESH_RENDER_WGSL.into()),
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("render_pl"),
+        bind_group_layouts: &[&layout],
+        push_constant_ranges: &[],
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("mesh_render"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: texture_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None, // double-sided, use front_facing in shader
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: msaa_samples,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        multiview: None,
+        cache: None,
+    });
+
+    let depth_view = create_depth_texture(device, texture_size[0], texture_size[1], msaa_samples);
+
+    rs.bind_group_layout = Some(layout);
+    rs.bind_group = Some(bind_group);
+    rs.pipeline = Some(pipeline);
+    rs.depth_view = Some(depth_view);
+    rs.depth_size = texture_size;
+}
+
+fn render(_render_app: &RenderApp, model: &Model, mut frame: Frame) {
+    frame.clear(Color::BLACK);
+
+    let Some(ref gpu) = model.gpu else { return; };
+    if gpu.num_render_tris == 0 { return; }
+
+    let mut rs = model.render_state.lock().unwrap();
+    let texture_size = frame.texture_size();
+    let msaa_samples = frame.texture_msaa_samples();
+
+    if rs.pipeline.is_none() {
+        let device = frame.device();
+        let texture_format = frame.texture_format();
+        init_render_state(device, gpu, &mut rs, texture_format, msaa_samples, texture_size);
     }
 
-    if !any_active {
-        return;
+    // Recreate depth texture on resize
+    if rs.depth_size != texture_size {
+        let device = frame.device();
+        rs.depth_view = Some(create_depth_texture(device, texture_size[0], texture_size[1], msaa_samples));
+        rs.depth_size = texture_size;
     }
 
-    let center = (min_pos + max_pos) * 0.5;
+    let pipeline = rs.pipeline.as_ref().unwrap();
+    let bind_group = rs.bind_group.as_ref().unwrap();
+    let depth_view = rs.depth_view.as_ref().unwrap();
+    let num_verts = gpu.num_render_tris * 3;
 
-    // Scale to fit bounding sphere within camera's clip range (camera at z=10, far=1000)
-    let mut max_radius = 0.0f32;
-    for v in 0..mesh.next_vertex {
-        if mesh.vertex_idx[v] < 0 {
-            continue;
-        }
-        let r = (mesh.vertex_pos[v] - center).length();
-        max_radius = max_radius.max(r);
-    }
-    max_radius *= 1.15; // padding
-    let scale = 8.0 / max_radius.max(1.0);
+    let texture_view = frame.texture_view();
+    let mut encoder = frame.command_encoder();
 
-    // Barycentric coords for each vertex in a triangle
-    let bary = [
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(0.0, 1.0, 0.0),
-        Vec3::new(0.0, 0.0, 1.0),
-    ];
-
-    // Build non-indexed triangle list with barycentric coords in color RGB, state in alpha
-    let mut tris: Vec<(Vec3, Color)> = Vec::new();
-
-    for f in 0..mesh.next_face {
-        if mesh.face_idx[f] < 0 {
-            continue;
-        }
-        let he0 = mesh.face_half_edge[f];
-        if he0 < 0 {
-            continue;
-        }
-        let he0 = he0 as usize;
-        let he1 = mesh.half_edge_next[he0];
-        if he1 < 0 {
-            continue;
-        }
-        let he1 = he1 as usize;
-        let he2 = mesh.half_edge_next[he1];
-        if he2 < 0 {
-            continue;
-        }
-        let he2 = he2 as usize;
-
-        let verts = [
-            mesh.half_edge_dest[he0] as usize,
-            mesh.half_edge_dest[he1] as usize,
-            mesh.half_edge_dest[he2] as usize,
-        ];
-
-        if verts.iter().any(|&v| mesh.vertex_idx[v] < 0) {
-            continue;
-        }
-
-        for (i, &vi) in verts.iter().enumerate() {
-            let p = mesh.vertex_pos[vi];
-            let sp = Vec3::new(
-                (p.x - center.x) * scale,
-                (p.y - center.y) * scale,
-                p.z * scale,
-            );
-            let b = bary[i];
-            let color = Color::linear_rgba(b.x, b.y, b.z, mesh.vertex_state[vi]);
-            tris.push((sp, color));
-        }
-
-        // Back face (reversed winding)
-        for &i in &[0, 2, 1] {
-            let vi = verts[i];
-            let p = mesh.vertex_pos[vi];
-            let sp = Vec3::new(
-                (p.x - center.x) * scale,
-                (p.y - center.y) * scale,
-                p.z * scale,
-            );
-            let b = bary[i];
-            let color = Color::linear_rgba(b.x, b.y, b.z, mesh.vertex_state[vi]);
-            tris.push((sp, color));
-        }
-    }
-
-    if !tris.is_empty() {
-        let lit_draw = draw
-            .y_radians(model.camera_yaw)
-            .x_radians(model.camera_pitch)
-            .shader_model(LitMesh {
-                light: Vec4::new(0.3, 0.4, 1.0, 0.2),
-                render_mode: Vec4::new(model.render_mode as f32, 0.0, 0.0, 0.0),
-            });
-        lit_draw.mesh().points_colored(tris);
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("mesh_render"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: texture_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.draw(0..num_verts, 0..1);
     }
 }
 
@@ -2586,7 +2765,7 @@ fn key_pressed(app: &App, model: &mut Model, key: KeyCode) {
     }
     if key == KeyCode::KeyR {
         randomize_params(model);
-        model.mesh = make_circle(model.spring_len, N_RINGS, SEGMENTS_INNER);
+        model.mesh = Arc::from(make_circle(model.spring_len, N_RINGS, SEGMENTS_INNER));
         model.frame = 0;
         model.camera_yaw = 0.0;
         model.camera_pitch = 0.0;
@@ -2595,7 +2774,7 @@ fn key_pressed(app: &App, model: &mut Model, key: KeyCode) {
         }
     }
     if key == KeyCode::KeyT {
-        model.mesh = make_circle(model.spring_len, N_RINGS, SEGMENTS_INNER);
+        model.mesh = Arc::from(make_circle(model.spring_len, N_RINGS, SEGMENTS_INNER));
         model.frame = 0;
         model.camera_yaw = 0.0;
         model.camera_pitch = 0.0;

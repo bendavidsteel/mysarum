@@ -18,14 +18,14 @@ A growing mesh simulation using **Nannou** (bevy-refactor branch) + **Bevy 0.17*
 ## Dependencies
 
 - `nannou` / `bevy_nannou` from git (`bevy-refactor` branch) — requires Bevy 0.17, NOT 0.18
-- Custom WGSL fragment shader at `assets/lit_mesh.wgsl` using `#[shader_model]` macro
+- Custom WGSL render shader at `src/shaders/mesh_render.wgsl` (vertex pulling + fragment lighting)
 
 ## Architecture
 
-Single-file app (`src/main.rs`, ~1480 lines) with Nannou's `app(model).update(update).run()` pattern.
+Single-file app (`src/main.rs`) with Nannou's `app(model).update(update).render(render).run()` pattern.
 
 ### Half-Edge Mesh (structure-of-arrays)
-- `HalfEdgeMesh` — fixed-size arrays (MAX_VERTICES=2000, MAX_HALF_EDGES=12000, MAX_FACES=4000) with `-1` sentinel for inactive/null indices
+- `HalfEdgeMesh` — fixed-size arrays (MAX_VERTICES=8000, MAX_HALF_EDGES=48000, MAX_FACES=16000) with `-1` sentinel for inactive/null indices
 - Uses `i32` indices throughout (not `Option<usize>`) — check `>= 0` before use
 - Allocation via watermark counters (`next_vertex`, `next_face`, `next_half_edge`)
 - Three growth operations: `add_external_triangle` (boundary), `add_internal_edge_triangle` (one side boundary), `add_internal_triangles` (fully internal edge split)
@@ -37,10 +37,13 @@ Single-file app (`src/main.rs`, ~1480 lines) with Nannou's `app(model).update(up
 3. **Mesh growth** (every 10 frames) — vertices with high growth potential split adjacent edges
 4. **Mesh refinement** (every 20 frames) — edge flips to regularize valences
 
-### Rendering (`view()`)
-- Auto-fits mesh to window via bounding box
-- Encodes barycentric coords in vertex color RGB, vertex state in alpha
-- Fragment shader (`lit_mesh.wgsl`) does: flat-shaded Lambert lighting via `dpdx`/`dpdy` normals, HSV state→color mapping, barycentric wireframe overlay
+### Rendering (`render()` — GPU-direct)
+- Custom wgpu render pipeline bypasses Nannou's draw API — no per-frame GPU→CPU readback
+- Vertex shader pulls positions/states directly from GPU compute storage buffers via vertex index
+- Index buffer rebuilt only on topology-change frames (every 10/20); bounding box cached
+- Fragment shader (`mesh_render.wgsl`) does: flat-shaded Lambert lighting via `dpdx`/`dpdy` normals, HSV state→color mapping, barycentric wireframe overlay
+- `RenderState` (pipeline, bind group) initialized lazily on first render frame via `Arc<Mutex<...>>`
+- Model wrapped in `Arc<HalfEdgeMesh>` for efficient clone to Bevy render world
 
 ## Controls
 

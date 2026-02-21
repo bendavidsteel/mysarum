@@ -45,5 +45,6 @@ Single-file app (`src/main.rs`, ~1480 lines) with Nannou's `app(model).update(up
 ## Controls
 
 - **R** — Randomize parameters and reset mesh
+- **T** — Reset mesh (keep current parameters)
 - **S** — Save screenshot
 - Debug mesh validation runs every 100 frames in debug builds (`#[cfg(debug_assertions)]`)

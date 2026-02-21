@@ -8,11 +8,11 @@ use bytemuck::{Pod, Zeroable};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
-const MAX_VERTICES: usize = 2000;
+const MAX_VERTICES: usize = 8000;
 const MAX_HALF_EDGES: usize = MAX_VERTICES * 6;
 const MAX_FACES: usize = MAX_VERTICES * 2;
 const EPSILON: f32 = 1e-6;
-const N_RINGS: usize = 6;
+const N_RINGS: usize = 24;
 const SEGMENTS_INNER: usize = 6;
 const MAX_BINS_PER_DIM: u32 = 256;
 const WORKGROUP_SIZE: u32 = 64;
@@ -2175,6 +2175,7 @@ struct Model {
     camera_pitch: f32,
     dragging: bool,
     last_mouse: Vec2,
+    render_mode: u32,
 }
 
 fn recompute_cheb_coeffs(model: &mut Model) {
@@ -2202,13 +2203,13 @@ fn randomize_params(model: &mut Model) {
     model.dt = 0.05 + random_f32() * 0.15;
     model.damping = 0.5;
     // Lenia-style params
-    model.kernel_mu = 1.0 + random_f32() * 4.0;
+    model.kernel_mu = 4.0 + random_f32() * 5.0;
     model.kernel_sigma = 0.5 + random_f32() * 2.0;
     model.growth_mu = random_f32();
     model.growth_sigma = 0.1 + random_f32() * 0.5;
     model.split_threshold = 0.5 + random_f32() * 0.4;
 
-    model.cheb_order = 3 + (random_f32() * 6.0) as usize; // 3–8
+    model.cheb_order = 8 + (random_f32() * 3.0) as usize; // 8–10
     recompute_cheb_coeffs(model);
 }
 
@@ -2218,6 +2219,8 @@ fn randomize_params(model: &mut Model) {
 struct LitMesh {
     #[uniform(0)]
     light: Vec4, // xyz = light direction, w = ambient
+    #[uniform(1)]
+    render_mode: Vec4, // x = mode (0=lit+wire, 1=normal map), yzw unused
 }
 
 // ── App ────────────────────────────────────────────────────────────────────────
@@ -2259,18 +2262,19 @@ fn model(app: &App) -> Model {
         planar_strength: 0.1,
         dt: 0.1,
         damping: 0.5,
-        kernel_mu: 2.0,
+        kernel_mu: 8.0,
         kernel_sigma: 1.0,
         growth_mu: 0.5,
         growth_sigma: 0.3,
         split_threshold: 0.7,
-        cheb_order: 5,
+        cheb_order: 10,
         cheb_coeffs: [0.2; 10],
         frame: 0,
         camera_yaw: 0.0,
         camera_pitch: 0.0,
         dragging: false,
         last_mouse: Vec2::ZERO,
+        render_mode: 0,
     };
     randomize_params(&mut m);
     m.mesh = make_circle(m.spring_len, N_RINGS, SEGMENTS_INNER);
@@ -2566,6 +2570,7 @@ fn view(app: &App, model: &Model) {
             .x_radians(model.camera_pitch)
             .shader_model(LitMesh {
                 light: Vec4::new(0.3, 0.4, 1.0, 0.2),
+                render_mode: Vec4::new(model.render_mode as f32, 0.0, 0.0, 0.0),
             });
         lit_draw.mesh().points_colored(tris);
     }
@@ -2576,8 +2581,20 @@ fn key_pressed(app: &App, model: &mut Model, key: KeyCode) {
         app.window(model.window)
             .save_screenshot(app.exe_name().unwrap() + ".png");
     }
+    if key == KeyCode::KeyM {
+        model.render_mode = (model.render_mode + 1) % 2;
+    }
     if key == KeyCode::KeyR {
         randomize_params(model);
+        model.mesh = make_circle(model.spring_len, N_RINGS, SEGMENTS_INNER);
+        model.frame = 0;
+        model.camera_yaw = 0.0;
+        model.camera_pitch = 0.0;
+        if let Some(ref mut gpu) = model.gpu {
+            gpu.topology_dirty = true;
+        }
+    }
+    if key == KeyCode::KeyT {
         model.mesh = make_circle(model.spring_len, N_RINGS, SEGMENTS_INNER);
         model.frame = 0;
         model.camera_yaw = 0.0;

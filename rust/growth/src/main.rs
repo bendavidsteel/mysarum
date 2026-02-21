@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use nannou::prelude::*;
+use bevy::input::mouse::MouseWheel;
 use bytemuck::{Pod, Zeroable};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -2040,11 +2041,12 @@ fn update_render_uniforms(
     scale: f32,
     yaw: f32,
     pitch: f32,
+    zoom: f32,
     render_mode: u32,
     aspect: f32,
 ) {
     let rot = Mat4::from_rotation_x(pitch) * Mat4::from_rotation_y(yaw);
-    let half_h = 10.0; // matches FixedVertical(20.0)
+    let half_h = 10.0 / zoom;
     let half_w = half_h * aspect;
     let proj = Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, -1000.0, 1000.0);
     let view_proj = proj * rot;
@@ -2286,6 +2288,7 @@ struct Model {
     // Camera rotation
     camera_yaw: f32,
     camera_pitch: f32,
+    zoom: f32,
     dragging: bool,
     last_mouse: Vec2,
     render_mode: u32,
@@ -2342,6 +2345,7 @@ fn model(app: &App) -> Model {
         .mouse_pressed(mouse_pressed)
         .mouse_released(mouse_released)
         .mouse_moved(mouse_moved)
+        .mouse_wheel(mouse_wheel)
         .build();
 
     let mut m = Model {
@@ -2369,6 +2373,7 @@ fn model(app: &App) -> Model {
         frame: 0,
         camera_yaw: 0.0,
         camera_pitch: 0.0,
+        zoom: 1.0,
         dragging: false,
         last_mouse: Vec2::ZERO,
         render_mode: 0,
@@ -2541,7 +2546,7 @@ fn update(app: &App, model: &mut Model) {
             &queue, gpu,
             model.cached_center, model.cached_scale,
             model.camera_yaw, model.camera_pitch,
-            model.render_mode, aspect,
+            model.zoom, model.render_mode, aspect,
         );
     }
 
@@ -2769,6 +2774,7 @@ fn key_pressed(app: &App, model: &mut Model, key: KeyCode) {
         model.frame = 0;
         model.camera_yaw = 0.0;
         model.camera_pitch = 0.0;
+        model.zoom = 1.0;
         if let Some(ref mut gpu) = model.gpu {
             gpu.topology_dirty = true;
         }
@@ -2778,6 +2784,7 @@ fn key_pressed(app: &App, model: &mut Model, key: KeyCode) {
         model.frame = 0;
         model.camera_yaw = 0.0;
         model.camera_pitch = 0.0;
+        model.zoom = 1.0;
         if let Some(ref mut gpu) = model.gpu {
             gpu.topology_dirty = true;
         }
@@ -2803,6 +2810,11 @@ fn mouse_moved(_app: &App, model: &mut Model, pos: Vec2) {
         model.camera_pitch += delta.y * 0.005;
     }
     model.last_mouse = pos;
+}
+
+fn mouse_wheel(_app: &App, model: &mut Model, wheel: MouseWheel) {
+    let factor = 1.0 + wheel.y * 0.1;
+    model.zoom = (model.zoom * factor).clamp(0.1, 20.0);
 }
 
 // ── Debug validation ───────────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-// Chebyshev step k >= 2: t_next = 2*L(t_curr) - t_prev, result += coeff * t_next
+// Chebyshev step k >= 2: t_next = 2*W(t_curr) - t_prev, result += coeff * t_next
 // he_packed[i] = vec4<i32>(dest, twin, next, face)
 
 @group(0) @binding(0) var<storage, read> t_curr: array<f32>;
@@ -16,7 +16,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     let curr_v = t_curr[id.x];
 
-    // Compute L(t_curr) via fan walk
+    // Compute W(t_curr) = avg_neighbors(t_curr) via half-edge fan walk
     let start_he = vertex_he[id.x];
     var avg = curr_v;
 
@@ -48,8 +48,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         }
     }
 
-    let l_curr = (curr_v - avg) * 0.5;
-    let t_next_val = 2.0 * l_curr - t_prev[id.x];
+    // Averaging operator W(f) = avg_neighbors(f) for Lenia-style ring kernel
+    let t_next_val = 2.0 * avg - t_prev[id.x];
     t_next[id.x] = t_next_val;
     result[id.x] += coeff * t_next_val;
 }

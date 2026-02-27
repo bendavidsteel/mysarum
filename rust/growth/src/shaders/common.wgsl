@@ -16,7 +16,7 @@ struct SimParams {
     growth_sigma: f32,
     cheb_order: u32,
     repulsion_strength: f32,
-    _pad0: u32,
+    state_dt: f32,
 }
 
 const EPSILON: f32 = 1e-6;

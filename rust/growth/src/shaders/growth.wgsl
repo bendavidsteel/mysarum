@@ -18,9 +18,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     let x = r - params.growth_mu;
     let sigma = params.growth_sigma + EPSILON;
-    let g = exp(-0.5 * (x * x) / (sigma * sigma));
+    let g = 2.0 * exp(-0.5 * (x * x) / (sigma * sigma)) - 1.0;
 
-    var s = vertex_state[id.x] + params.dt * 0.1 * g;
+    var s = vertex_state[id.x] + params.state_dt * g;
     s = clamp(s, 0.0, 1.0);
     vertex_state[id.x] = s;
 }

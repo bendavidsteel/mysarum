@@ -72,7 +72,7 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @loca
         final_color = normal * 0.5 + 0.5;
     } else {
         // Default: lit + state color + wireframe
-        let hue = mix(180.0 / 360.0, 250.0 / 360.0, state);
+        let hue = mix(0.0 / 360.0, 360.0 / 360.0, state);
         let base_color = hsv2rgb(hue, 0.8, 0.9);
 
         let light_dir = normalize(uniforms.light.xyz);

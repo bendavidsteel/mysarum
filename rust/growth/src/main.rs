@@ -1,60 +1,57 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+mod mesh_builders;
+
 use std::sync::{Arc, Mutex};
 
 use nannou::prelude::*;
 use bevy::input::mouse::MouseWheel;
 use bytemuck::{Pod, Zeroable};
 
+use mesh_builders::{StartShape, make_start_mesh};
+
 // ── Constants ──────────────────────────────────────────────────────────────────
 
-const MAX_VERTICES: usize = 8000;
-const MAX_HALF_EDGES: usize = MAX_VERTICES * 6;
-const MAX_FACES: usize = MAX_VERTICES * 2;
+pub(crate) const MAX_VERTICES: usize = 8000;
+pub(crate) const MAX_HALF_EDGES: usize = MAX_VERTICES * 6;
+pub(crate) const MAX_FACES: usize = MAX_VERTICES * 2;
 const EPSILON: f32 = 1e-6;
-const N_RINGS: usize = 24;
-const SEGMENTS_INNER: usize = 6;
+pub(crate) const N_RINGS: usize = 24;
+pub(crate) const SEGMENTS_INNER: usize = 6;
 const MAX_BINS_PER_DIM: u32 = 256;
 const WORKGROUP_SIZE: u32 = 64;
-
-// ── Gaussian helper ────────────────────────────────────────────────────────────
-
-fn gaussian(x: f32, mu: f32, sigma: f32) -> f32 {
-    (-0.5 * ((x - mu) / (sigma + EPSILON)).powi(2)).exp()
-}
 
 // ── Half-edge mesh (structure-of-arrays, heap-allocated) ───────────────────────
 
 #[derive(Clone)]
-struct HalfEdgeMesh {
+pub(crate) struct HalfEdgeMesh {
     // Face arrays
-    face_idx: [i32; MAX_FACES],
-    face_half_edge: [i32; MAX_FACES],
+    pub(crate) face_idx: [i32; MAX_FACES],
+    pub(crate) face_half_edge: [i32; MAX_FACES],
 
     // Vertex arrays
-    vertex_idx: [i32; MAX_VERTICES],
-    vertex_half_edge: [i32; MAX_VERTICES],
-    vertex_pos: [Vec3; MAX_VERTICES],
-    vertex_state: [f32; MAX_VERTICES],
-    vertex_u: [f32; MAX_VERTICES],
+    pub(crate) vertex_idx: [i32; MAX_VERTICES],
+    pub(crate) vertex_half_edge: [i32; MAX_VERTICES],
+    pub(crate) vertex_pos: [Vec3; MAX_VERTICES],
+    pub(crate) vertex_state: [f32; MAX_VERTICES],
+    pub(crate) vertex_u: [f32; MAX_VERTICES],
 
     // Half-edge arrays
-    half_edge_idx: [i32; MAX_HALF_EDGES],
-    half_edge_twin: [i32; MAX_HALF_EDGES],
-    half_edge_dest: [i32; MAX_HALF_EDGES],
-    half_edge_face: [i32; MAX_HALF_EDGES],
-    half_edge_next: [i32; MAX_HALF_EDGES],
-    half_edge_prev: [i32; MAX_HALF_EDGES],
+    pub(crate) half_edge_idx: [i32; MAX_HALF_EDGES],
+    pub(crate) half_edge_twin: [i32; MAX_HALF_EDGES],
+    pub(crate) half_edge_dest: [i32; MAX_HALF_EDGES],
+    pub(crate) half_edge_face: [i32; MAX_HALF_EDGES],
+    pub(crate) half_edge_next: [i32; MAX_HALF_EDGES],
+    pub(crate) half_edge_prev: [i32; MAX_HALF_EDGES],
 
     // Allocation watermarks
-    next_vertex: usize,
-    next_face: usize,
-    next_half_edge: usize,
+    pub(crate) next_vertex: usize,
+    pub(crate) next_face: usize,
+    pub(crate) next_half_edge: usize,
 }
 
 impl HalfEdgeMesh {
-    fn new() -> Box<Self> {
+    pub(crate) fn new() -> Box<Self> {
         let mut mesh = Box::new(HalfEdgeMesh {
             face_idx: [-1; MAX_FACES],
             face_half_edge: [-1; MAX_FACES],
@@ -80,7 +77,7 @@ impl HalfEdgeMesh {
         mesh
     }
 
-    fn alloc_vertex(&mut self) -> Option<usize> {
+    pub(crate) fn alloc_vertex(&mut self) -> Option<usize> {
         if self.next_vertex >= MAX_VERTICES {
             return None;
         }
@@ -90,7 +87,7 @@ impl HalfEdgeMesh {
         Some(idx)
     }
 
-    fn alloc_face(&mut self) -> Option<usize> {
+    pub(crate) fn alloc_face(&mut self) -> Option<usize> {
         if self.next_face >= MAX_FACES {
             return None;
         }
@@ -100,7 +97,7 @@ impl HalfEdgeMesh {
         Some(idx)
     }
 
-    fn alloc_half_edge(&mut self) -> Option<usize> {
+    pub(crate) fn alloc_half_edge(&mut self) -> Option<usize> {
         if self.next_half_edge >= MAX_HALF_EDGES {
             return None;
         }
@@ -694,591 +691,9 @@ impl HalfEdgeMesh {
     }
 }
 
-// ── make_circle: build initial circular disc mesh ──────────────────────────────
-
-fn make_circle(spring_len: f32, n_rings: usize, segments_inner: usize) -> Box<HalfEdgeMesh> {
-    let mut mesh = HalfEdgeMesh::new();
-
-    // Center vertex
-    let center = mesh.alloc_vertex().unwrap();
-    mesh.vertex_pos[center] = Vec3::ZERO;
-
-    // Ring vertices
-    let mut ring_vertex_counts = Vec::new();
-    let mut ring_starts = Vec::new();
-
-    for ring_idx in 0..n_rings {
-        let radius = spring_len * (ring_idx + 1) as f32;
-        let n_segments = segments_inner * (ring_idx + 1);
-        ring_vertex_counts.push(n_segments);
-        let ring_start = mesh.next_vertex;
-        ring_starts.push(ring_start);
-
-        for seg in 0..n_segments {
-            let angle = 2.0 * std::f32::consts::PI * seg as f32 / n_segments as f32;
-            let v = mesh.alloc_vertex().unwrap();
-            mesh.vertex_pos[v] = Vec3::new(radius * angle.cos(), radius * angle.sin(), 0.0);
-        }
-    }
-
-    let get_vertex_idx = |ring: i32, segment: usize| -> usize {
-        if ring < 0 {
-            return 0; // center
-        }
-        let ring = ring as usize;
-        ring_starts[ring] + (segment % ring_vertex_counts[ring])
-    };
-
-    // Build faces
-    let mut faces_list: Vec<[usize; 3]> = Vec::new();
-
-    // Center to first ring
-    let n_seg0 = ring_vertex_counts[0];
-    for i in 0..n_seg0 {
-        let v0 = 0;
-        let v1 = get_vertex_idx(0, i);
-        let v2 = get_vertex_idx(0, i + 1);
-        faces_list.push([v0, v1, v2]);
-    }
-
-    // Ring-to-ring
-    for ring_idx in 0..n_rings - 1 {
-        let n_inner = ring_vertex_counts[ring_idx];
-        let n_outer = ring_vertex_counts[ring_idx + 1];
-
-        let mut inner_idx = 0usize;
-        let mut outer_idx = 0usize;
-
-        while inner_idx < n_inner || outer_idx < n_outer {
-            let v_inner_curr = get_vertex_idx(ring_idx as i32, inner_idx);
-            let v_inner_next = get_vertex_idx(ring_idx as i32, inner_idx + 1);
-            let v_outer_curr = get_vertex_idx(ring_idx as i32 + 1, outer_idx);
-            let v_outer_next = get_vertex_idx(ring_idx as i32 + 1, outer_idx + 1);
-
-            let inner_angle_next = (inner_idx + 1) as f32 / n_inner as f32;
-            let outer_angle_curr = outer_idx as f32 / n_outer as f32;
-            let outer_angle_next = (outer_idx + 1) as f32 / n_outer as f32;
-
-            if outer_angle_next < inner_angle_next {
-                faces_list.push([v_inner_curr, v_outer_curr, v_outer_next]);
-                outer_idx += 1;
-            } else {
-                faces_list.push([v_inner_curr, v_outer_curr, v_inner_next]);
-                if outer_angle_curr < inner_angle_next {
-                    faces_list.push([v_inner_next, v_outer_curr, v_outer_next]);
-                    outer_idx += 1;
-                }
-                inner_idx += 1;
-            }
-        }
-    }
-
-    // Build half-edge structure from face list
-    let mut edge_dict: HashMap<(usize, usize), usize> = HashMap::new();
-
-    struct HalfEdgeData {
-        dest: usize,
-        face: i32,
-        twin: i32,
-        next: i32,
-        prev: i32,
-    }
-
-    let mut half_edge_list: Vec<HalfEdgeData> = Vec::new();
-
-    for (face_i, face) in faces_list.iter().enumerate() {
-        let [v0, v1, v2] = *face;
-        let face_edges = [(v0, v1), (v1, v2), (v2, v0)];
-        let mut face_half_edges = [0usize; 3];
-
-        for (j, &(v_from, v_to)) in face_edges.iter().enumerate() {
-            let he_idx = half_edge_list.len();
-            half_edge_list.push(HalfEdgeData {
-                dest: v_to,
-                face: face_i as i32,
-                twin: -1,
-                next: -1,
-                prev: -1,
-            });
-            edge_dict.insert((v_from, v_to), he_idx);
-            face_half_edges[j] = he_idx;
-        }
-
-        // Set next/prev within face
-        for j in 0..3 {
-            half_edge_list[face_half_edges[j]].next = face_half_edges[(j + 1) % 3] as i32;
-            half_edge_list[face_half_edges[j]].prev = face_half_edges[(j + 2) % 3] as i32;
-        }
-    }
-
-    // Create boundary half-edges and set twins
-    let edge_dict_snapshot: Vec<((usize, usize), usize)> = edge_dict.iter().map(|(&k, &v)| (k, v)).collect();
-    let mut boundary_half_edges: Vec<(usize, usize, usize)> = Vec::new();
-
-    for ((v_from, v_to), he_idx) in &edge_dict_snapshot {
-        let twin_key = (*v_to, *v_from);
-        if let Some(&twin_he) = edge_dict.get(&twin_key) {
-            half_edge_list[*he_idx].twin = twin_he as i32;
-        } else {
-            let boundary_he_idx = half_edge_list.len();
-            half_edge_list.push(HalfEdgeData {
-                dest: *v_from,
-                face: -1,
-                twin: *he_idx as i32,
-                next: -1,
-                prev: -1,
-            });
-            half_edge_list[*he_idx].twin = boundary_he_idx as i32;
-            boundary_half_edges.push((*v_to, *v_from, boundary_he_idx));
-        }
-    }
-
-    // Connect boundary half-edges
-    let boundary_dict: HashMap<(usize, usize), usize> = boundary_half_edges
-        .iter()
-        .map(|&(vf, vt, he)| ((vf, vt), he))
-        .collect();
-
-    for &(_v_from, _v_to, he_idx) in &boundary_half_edges {
-        // Find next boundary half-edge (the one starting at this one's destination = v_from's dest)
-        let dest = half_edge_list[he_idx].dest;
-        for (&(bnf, _bnt), &bhe) in boundary_dict.iter() {
-            if bnf == dest {
-                half_edge_list[he_idx].next = bhe as i32;
-                half_edge_list[bhe].prev = he_idx as i32;
-                break;
-            }
-        }
-    }
-
-    // Copy into mesh arrays
-    let n_half_edges = half_edge_list.len();
-    mesh.next_half_edge = n_half_edges;
-    for (i, he) in half_edge_list.iter().enumerate() {
-        mesh.half_edge_idx[i] = i as i32;
-        mesh.half_edge_dest[i] = he.dest as i32;
-        mesh.half_edge_face[i] = he.face;
-        mesh.half_edge_twin[i] = he.twin;
-        mesh.half_edge_next[i] = he.next;
-        mesh.half_edge_prev[i] = he.prev;
-    }
-
-    // Set vertex half-edges
-    for v in 0..mesh.next_vertex {
-        for (&(vf, _vt), &he_idx) in &edge_dict {
-            if vf == v {
-                mesh.vertex_half_edge[v] = he_idx as i32;
-                break;
-            }
-        }
-    }
-
-    // Set face data
-    let n_faces = faces_list.len();
-    mesh.next_face = n_faces;
-    for (f, face) in faces_list.iter().enumerate() {
-        mesh.face_idx[f] = f as i32;
-        let he_idx = edge_dict[&(face[0], face[1])];
-        mesh.face_half_edge[f] = he_idx as i32;
-    }
-
-    mesh
-}
-
-// ── Spatial hash for O(n*k) neighbor queries ────────────────────────────────────
-
-struct SpatialHash2D {
-    bin_size: f32,
-    grid_width: usize,
-    origin_x: f32,
-    origin_y: f32,
-    bin_offsets: Vec<u32>,
-    sorted_indices: Vec<u32>,
-}
-
-impl SpatialHash2D {
-    fn build(positions: &[Vec3], vertex_idx: &[i32], next_vertex: usize, bin_size: f32) -> Self {
-        let mut min_x = f32::INFINITY;
-        let mut min_y = f32::INFINITY;
-        let mut max_x = f32::NEG_INFINITY;
-        let mut max_y = f32::NEG_INFINITY;
-
-        for v in 0..next_vertex {
-            if vertex_idx[v] < 0 { continue; }
-            min_x = min_x.min(positions[v].x);
-            min_y = min_y.min(positions[v].y);
-            max_x = max_x.max(positions[v].x);
-            max_y = max_y.max(positions[v].y);
-        }
-
-        let origin_x = min_x - bin_size;
-        let origin_y = min_y - bin_size;
-        let grid_width = ((max_x - origin_x) / bin_size).ceil() as usize + 2;
-        let grid_height = ((max_y - origin_y) / bin_size).ceil() as usize + 2;
-        let num_bins = grid_width * grid_height;
-
-        let mut bin_counts = vec![0u32; num_bins];
-        for v in 0..next_vertex {
-            if vertex_idx[v] < 0 { continue; }
-            let bx = ((positions[v].x - origin_x) / bin_size) as usize;
-            let by = ((positions[v].y - origin_y) / bin_size) as usize;
-            bin_counts[by * grid_width + bx] += 1;
-        }
-
-        let mut bin_offsets = vec![0u32; num_bins + 1];
-        for i in 0..num_bins {
-            bin_offsets[i + 1] = bin_offsets[i] + bin_counts[i];
-        }
-
-        let total = bin_offsets[num_bins] as usize;
-        let mut sorted_indices = vec![0u32; total];
-        let mut write_pos = bin_offsets[..num_bins].to_vec();
-        for v in 0..next_vertex {
-            if vertex_idx[v] < 0 { continue; }
-            let bx = ((positions[v].x - origin_x) / bin_size) as usize;
-            let by = ((positions[v].y - origin_y) / bin_size) as usize;
-            let bi = by * grid_width + bx;
-            sorted_indices[write_pos[bi] as usize] = v as u32;
-            write_pos[bi] += 1;
-        }
-
-        Self { bin_size, grid_width, origin_x, origin_y, bin_offsets, sorted_indices }
-    }
-}
-
-// ── Force calculations ─────────────────────────────────────────────────────────
-
-fn calculate_spring_force(mesh: &HalfEdgeMesh, spring_len: f32, elastic_constant: f32) -> Vec<Vec3> {
-    let mut forces = vec![Vec3::ZERO; mesh.next_vertex];
-
-    for he in 0..mesh.next_half_edge {
-        if mesh.half_edge_idx[he] < 0 {
-            continue;
-        }
-        let dest = mesh.half_edge_dest[he];
-        if dest < 0 {
-            continue;
-        }
-        let prev = mesh.half_edge_prev[he];
-        if prev < 0 {
-            continue;
-        }
-        let src = mesh.half_edge_dest[prev as usize];
-        if src < 0 {
-            continue;
-        }
-
-        let dest = dest as usize;
-        let src = src as usize;
-
-        let edge_vec = mesh.vertex_pos[dest] - mesh.vertex_pos[src];
-        let length = edge_vec.length();
-        let safe_len = length.max(EPSILON);
-        let force = -1.0 * (length - spring_len) * elastic_constant * (edge_vec / safe_len);
-
-        forces[dest] += force;
-        forces[src] -= force;
-    }
-
-    forces
-}
-
-fn calculate_repulsion_force(mesh: &HalfEdgeMesh, repulsion_distance: f32) -> Vec<Vec3> {
-    let mut forces = vec![Vec3::ZERO; mesh.next_vertex];
-
-    if mesh.next_vertex == 0 {
-        return forces;
-    }
-
-    let hash = SpatialHash2D::build(
-        &mesh.vertex_pos,
-        &mesh.vertex_idx,
-        mesh.next_vertex,
-        repulsion_distance,
-    );
-
-    let gw = hash.grid_width as i32;
-    let gh = (hash.bin_offsets.len() - 1) as i32 / gw;
-
-    for i in 0..mesh.next_vertex {
-        if mesh.vertex_idx[i] < 0 {
-            continue;
-        }
-        let bx = ((mesh.vertex_pos[i].x - hash.origin_x) / hash.bin_size) as i32;
-        let by = ((mesh.vertex_pos[i].y - hash.origin_y) / hash.bin_size) as i32;
-
-        for dy in -1..=1i32 {
-            for dx in -1..=1i32 {
-                let nx = bx + dx;
-                let ny = by + dy;
-                if nx < 0 || ny < 0 || nx >= gw || ny >= gh {
-                    continue;
-                }
-                let bi = (ny * gw + nx) as usize;
-                let start = hash.bin_offsets[bi] as usize;
-                let end = hash.bin_offsets[bi + 1] as usize;
-
-                for k in start..end {
-                    let j = hash.sorted_indices[k] as usize;
-                    if j <= i {
-                        continue;
-                    }
-                    let diff = mesh.vertex_pos[i] - mesh.vertex_pos[j];
-                    let dist = (diff.length_squared() + EPSILON).sqrt();
-
-                    if dist < repulsion_distance {
-                        let ratio = ((repulsion_distance - dist) / repulsion_distance).max(0.0);
-                        let force = ratio * ratio * (diff / dist);
-                        forces[i] += force;
-                        forces[j] -= force;
-                    }
-                }
-            }
-        }
-    }
-
-    forces
-}
-
-fn calculate_planar_force(mesh: &HalfEdgeMesh) -> Vec<Vec3> {
-    let mut forces = vec![Vec3::ZERO; mesh.next_vertex];
-
-    for v in 0..mesh.next_vertex {
-        if mesh.vertex_idx[v] < 0 {
-            continue;
-        }
-        let start_he = mesh.vertex_half_edge[v];
-        if start_he < 0 {
-            continue;
-        }
-        let start = start_he as usize;
-        let start_dest = mesh.half_edge_dest[start];
-
-        let mut sum = Vec3::ZERO;
-        let mut count = 0;
-        let mut he = start;
-        let mut first = true;
-
-        loop {
-            let dest = mesh.half_edge_dest[he];
-            if dest >= 0 {
-                sum += mesh.vertex_pos[dest as usize];
-                count += 1;
-            }
-
-            let twin = mesh.half_edge_twin[he];
-            if twin < 0 {
-                break;
-            }
-            let next = mesh.half_edge_next[twin as usize];
-            if next < 0 {
-                break;
-            }
-            he = next as usize;
-            if mesh.half_edge_dest[he] == start_dest && !first {
-                break;
-            }
-            first = false;
-        }
-
-        if count > 0 {
-            let avg = sum / count as f32;
-            forces[v] = avg - mesh.vertex_pos[v];
-        }
-    }
-
-    forces
-}
-
-fn calculate_bulge_force(mesh: &HalfEdgeMesh) -> Vec<Vec3> {
-    let mut forces = vec![Vec3::ZERO; mesh.next_vertex];
-
-    for he in 0..mesh.next_half_edge {
-        if mesh.half_edge_idx[he] < 0 {
-            continue;
-        }
-        // Only boundary half-edges (face == -1)
-        if mesh.half_edge_face[he] != -1 {
-            continue;
-        }
-
-        let twin = mesh.half_edge_twin[he];
-        if twin < 0 {
-            continue;
-        }
-        let twin = twin as usize;
-
-        // Edge vertices: src → dest of the boundary he
-        let src_i = mesh.half_edge_dest[mesh.half_edge_twin[he] as usize];
-        let dest_i = mesh.half_edge_dest[he];
-        if src_i < 0 || dest_i < 0 {
-            continue;
-        }
-        let src = src_i as usize;
-        let dest = dest_i as usize;
-
-        let edge_vec = mesh.vertex_pos[dest] - mesh.vertex_pos[src];
-
-        // Next edge in the internal twin's face
-        let twin_next = mesh.half_edge_next[twin];
-        if twin_next < 0 {
-            continue;
-        }
-        let next_dest_i = mesh.half_edge_dest[twin_next as usize];
-        if next_dest_i < 0 {
-            continue;
-        }
-        let next_dest = next_dest_i as usize;
-        let next_edge_vec = mesh.vertex_pos[next_dest] - mesh.vertex_pos[src];
-
-        // Cross products for outward normal
-        let surface_normal = edge_vec.cross(next_edge_vec);
-        let edge_normal = edge_vec.cross(surface_normal);
-        let norm = edge_normal.length();
-        if norm < EPSILON {
-            continue;
-        }
-        let edge_normal = edge_normal / norm;
-
-        forces[src] += edge_normal;
-        forces[dest] += edge_normal;
-    }
-
-    // Normalize per-vertex
-    for v in 0..mesh.next_vertex {
-        let norm = forces[v].length();
-        if norm > EPSILON {
-            forces[v] /= norm;
-        }
-    }
-
-    forces
-}
-
-// ── Position update ────────────────────────────────────────────────────────────
-
-fn update_positions(
-    mesh: &mut HalfEdgeMesh,
-    spring_len: f32,
-    elastic_constant: f32,
-    repulsion_distance: f32,
-    repulsion_strength: f32,
-    bulge_strength: f32,
-    planar_strength: f32,
-    dt: f32,
-    damping: f32,
-) {
-    let spring = calculate_spring_force(mesh, spring_len, elastic_constant);
-    let repulsion = calculate_repulsion_force(mesh, repulsion_distance);
-    let bulge = calculate_bulge_force(mesh);
-    let planar = calculate_planar_force(mesh);
-
-    for v in 0..mesh.next_vertex {
-        if mesh.vertex_idx[v] < 0 {
-            continue;
-        }
-        let total = spring[v]
-            + repulsion_strength * repulsion[v]
-            + bulge_strength * bulge[v]
-            + planar_strength * planar[v];
-
-        mesh.vertex_pos[v] += dt * total;
-    }
-
-    // Damping (applied to implicit velocity = position change)
-    // Since we have no explicit velocity, we just move with dt*force each frame.
-    // The damping factor is embedded in the dt.
-    let _ = damping; // damping is implicit in dt scaling
-}
-
-// ── State evolution ────────────────────────────────────────────────────────────
-
-fn laplacian_pass(mesh: &HalfEdgeMesh, x: &[f32]) -> Vec<f32> {
-    let n = mesh.next_vertex;
-    let mut avg = vec![0.0f32; n];
-    let mut deg = vec![0usize; n];
-
-    for he in 0..mesh.next_half_edge {
-        if mesh.half_edge_idx[he] < 0 {
-            continue;
-        }
-        let dest = mesh.half_edge_dest[he];
-        let prev = mesh.half_edge_prev[he];
-        if dest < 0 || prev < 0 {
-            continue;
-        }
-        let src = mesh.half_edge_dest[prev as usize];
-        if src < 0 {
-            continue;
-        }
-        avg[dest as usize] += x[src as usize];
-        deg[dest as usize] += 1;
-    }
-
-    // L_scaled = (I - D^{-1}A) / 2, eigenvalues in [-1, 1] for Chebyshev stability
-    let mut out = vec![0.0f32; n];
-    for v in 0..n {
-        if mesh.vertex_idx[v] < 0 {
-            continue;
-        }
-        let neighbor_avg = if deg[v] > 0 { avg[v] / deg[v] as f32 } else { x[v] };
-        out[v] = (x[v] - neighbor_avg) * 0.5;
-    }
-    out
-}
-
-fn update_vertex_state(
-    mesh: &mut HalfEdgeMesh,
-    cheb_order: usize,
-    cheb_coeffs: &[f32; 10],
-    growth_mu: f32,
-    growth_sigma: f32,
-    dt: f32,
-) {
-    let n = mesh.next_vertex;
-    let state: Vec<f32> = mesh.vertex_state[..n].to_vec();
-
-    // T_0 = state
-    let t_prev_init = state.clone();
-    // T_1 = L_scaled * state
-    let t_curr_init = laplacian_pass(mesh, &state);
-
-    // Accumulate: result = c[0]*T_0 + c[1]*T_1
-    let mut result = vec![0.0f32; n];
-    for v in 0..n {
-        result[v] = cheb_coeffs[0] * t_prev_init[v] + cheb_coeffs[1] * t_curr_init[v];
-    }
-
-    let mut t_prev = t_prev_init;
-    let mut t_curr = t_curr_init;
-
-    for k in 2..cheb_order {
-        let l_curr = laplacian_pass(mesh, &t_curr);
-        let mut t_next = vec![0.0f32; n];
-        for v in 0..n {
-            t_next[v] = 2.0 * l_curr[v] - t_prev[v];
-        }
-        for v in 0..n {
-            result[v] += cheb_coeffs[k] * t_next[v];
-        }
-        t_prev = t_curr;
-        t_curr = t_next;
-    }
-
-    // Apply growth function
-    for v in 0..n {
-        if mesh.vertex_idx[v] < 0 {
-            continue;
-        }
-        mesh.vertex_u[v] = result[v];
-        mesh.vertex_state[v] += dt * gaussian(result[v], growth_mu, growth_sigma);
-        mesh.vertex_state[v] = mesh.vertex_state[v].clamp(0.0, 1.0);
-    }
-}
-
 // ── Growth: generate new triangles ─────────────────────────────────────────────
 
-fn generate_new_triangles(mesh: &mut HalfEdgeMesh, split_threshold: f32) {
+fn generate_new_triangles(mesh: &mut HalfEdgeMesh, split_threshold: f32, split_chance: f32) {
     // Collect vertices that want to split
     let mut splits: Vec<(usize, usize, bool, bool)> = Vec::new();
 
@@ -1286,7 +701,7 @@ fn generate_new_triangles(mesh: &mut HalfEdgeMesh, split_threshold: f32) {
         if mesh.vertex_idx[v] < 0 {
             continue;
         }
-        if mesh.vertex_state[v] < split_threshold || random_f32() > 0.05 {
+        if mesh.vertex_state[v] < split_threshold || random_f32() > split_chance {
             continue;
         }
 
@@ -1348,6 +763,7 @@ const INTEGRATE_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), includ
 const CHEBYSHEV_INIT_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/chebyshev_init.wgsl"));
 const CHEBYSHEV_STEP_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/chebyshev_step.wgsl"));
 const GROWTH_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/growth.wgsl"));
+const BBOX_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/bbox.wgsl"));
 const MESH_RENDER_WGSL: &str = include_str!("shaders/mesh_render.wgsl");
 
 #[repr(C)]
@@ -1370,7 +786,7 @@ struct GpuSimParams {
     growth_sigma: f32,
     cheb_order: u32,
     repulsion_strength: f32,
-    _pad0: u32,
+    state_dt: f32,
 }
 
 #[repr(C)]
@@ -1420,7 +836,14 @@ struct GpuCompute {
     // Readback
     pos_readback_buf: wgpu::Buffer,
     state_readback_buf: wgpu::Buffer,
-    u_readback_buf: wgpu::Buffer,
+
+    // Bounding box reduction
+    bbox_atomic_buf: wgpu::Buffer,
+    bbox_readback_buf: wgpu::Buffer,
+    bbox_clear_pipeline: wgpu::ComputePipeline,
+    bbox_reduce_pipeline: wgpu::ComputePipeline,
+    bbox_data_bg: wgpu::BindGroup,
+    bbox_params_bg: wgpu::BindGroup,
 
     // Pipelines
     clear_bins_pipeline: wgpu::ComputePipeline,
@@ -1557,8 +980,11 @@ fn create_gpu_compute(device: &wgpu::Device) -> GpuCompute {
     let state_readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("state_readback"), size: state_buf_size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
     });
-    let u_readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("u_readback"), size: state_buf_size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+    let bbox_atomic_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bbox_atomic"), size: 16, usage: storage_rw, mapped_at_creation: false,
+    });
+    let bbox_readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bbox_readback"), size: 16, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
     });
 
     // Create shader modules
@@ -1588,6 +1014,9 @@ fn create_gpu_compute(device: &wgpu::Device) -> GpuCompute {
     });
     let growth_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("growth"), source: wgpu::ShaderSource::Wgsl(GROWTH_WGSL.into()),
+    });
+    let bbox_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("bbox"), source: wgpu::ShaderSource::Wgsl(BBOX_WGSL.into()),
     });
 
     let cs = wgpu::ShaderStages::COMPUTE;
@@ -1681,6 +1110,12 @@ fn create_gpu_compute(device: &wgpu::Device) -> GpuCompute {
         .storage_buffer(cs, false, true)   // vertex_pos (active check)
         .build(device);
 
+    // bbox: group0=pos(R)+bbox_atomic(RW), group1=params(U)
+    let bbox_data_layout = wgpu::BindGroupLayoutBuilder::new()
+        .storage_buffer(cs, false, true)   // vertex_pos
+        .storage_buffer(cs, false, false)  // bbox_atomic
+        .build(device);
+
     // ── Pipeline layouts ────────────────────────────────────────────────────
 
     let fill_bins_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1728,6 +1163,11 @@ fn create_gpu_compute(device: &wgpu::Device) -> GpuCompute {
         bind_group_layouts: &[&growth_data_layout, &params_layout],
         push_constant_ranges: &[],
     });
+    let bbox_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("bbox_pl"),
+        bind_group_layouts: &[&bbox_data_layout, &params_layout],
+        push_constant_ranges: &[],
+    });
 
     // ── Compute pipelines ───────────────────────────────────────────────────
 
@@ -1753,6 +1193,8 @@ fn create_gpu_compute(device: &wgpu::Device) -> GpuCompute {
     let chebyshev_init_pipeline = make_pipeline("cheb_init", &cheb_init_pl, &cheb_init_shader, "main");
     let chebyshev_step_pipeline = make_pipeline("cheb_step", &cheb_step_pl, &cheb_step_shader, "main");
     let growth_pipeline = make_pipeline("growth", &growth_pl, &growth_shader, "main");
+    let bbox_clear_pipeline = make_pipeline("bbox_clear", &bbox_pl, &bbox_shader, "bbox_clear");
+    let bbox_reduce_pipeline = make_pipeline("bbox_reduce", &bbox_pl, &bbox_shader, "bbox_reduce");
 
     // ── Bind groups ─────────────────────────────────────────────────────────
 
@@ -1898,6 +1340,15 @@ fn create_gpu_compute(device: &wgpu::Device) -> GpuCompute {
         .buffer_bytes(&sim_params_buf, 0, None)
         .build(device, &params_layout);
 
+    // bbox bind groups
+    let bbox_data_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&vertex_pos_buf, 0, None)
+        .buffer_bytes(&bbox_atomic_buf, 0, None)
+        .build(device, &bbox_data_layout);
+    let bbox_params_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&sim_params_buf, 0, None)
+        .build(device, &params_layout);
+
     GpuCompute {
         vertex_pos_buf, vertex_force_buf,
         bin_size_buf, bin_offset_buf, bin_offset_tmp_buf, sorted_idx_buf, prefix_sum_step_buf,
@@ -1906,7 +1357,10 @@ fn create_gpu_compute(device: &wgpu::Device) -> GpuCompute {
         cheb_a_buf, cheb_b_buf, cheb_c_buf, cheb_result_buf,
         cheb_coeff_buf, cheb_c0_buf, cheb_c1_buf,
         sim_params_buf,
-        pos_readback_buf, state_readback_buf, u_readback_buf,
+        pos_readback_buf, state_readback_buf,
+        bbox_atomic_buf, bbox_readback_buf,
+        bbox_clear_pipeline, bbox_reduce_pipeline,
+        bbox_data_bg, bbox_params_bg,
         clear_bins_pipeline, fill_bins_pipeline, prefix_sum_pipeline,
         sort_clear_pipeline, sort_vertices_pipeline,
         repulsion_pipeline, topo_forces_pipeline, integrate_pipeline,
@@ -1954,24 +1408,36 @@ fn upload_mesh_to_gpu(queue: &wgpu::Queue, gpu: &GpuCompute, mesh: &HalfEdgeMesh
     queue.write_buffer(&gpu.vertex_he_buf, 0, bytemuck::cast_slice(&mesh.vertex_half_edge[..MAX_VERTICES]));
 }
 
-fn readback_from_gpu(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &mut GpuCompute, mesh: &mut HalfEdgeMesh) {
+fn sortable_to_float(s: u32) -> f32 {
+    let mask = if (s & 0x80000000) == 0 { 0xFFFFFFFFu32 } else { 0x80000000u32 };
+    f32::from_bits(s ^ mask)
+}
+
+/// Read back positions, states, and GPU-computed bounding box.
+/// Returns [min_x, min_y, max_x, max_y] from the GPU bbox reduction.
+fn readback_from_gpu(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &mut GpuCompute, mesh: &mut HalfEdgeMesh) -> [f32; 4] {
     let n = mesh.next_vertex;
     let pos_size = (MAX_VERTICES * 16) as u64;
     let state_size = (MAX_VERTICES * 4) as u64;
 
-    // Copy GPU buffers to staging
+    // Copy GPU buffers to staging (bbox was already copied in gpu_dispatch_frame)
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("readback_encoder"),
     });
     encoder.copy_buffer_to_buffer(&gpu.vertex_pos_buf, 0, &gpu.pos_readback_buf, 0, pos_size);
     encoder.copy_buffer_to_buffer(&gpu.vertex_state_buf, 0, &gpu.state_readback_buf, 0, state_size);
-    encoder.copy_buffer_to_buffer(&gpu.vertex_u_buf, 0, &gpu.u_readback_buf, 0, state_size);
     queue.submit(Some(encoder.finish()));
 
-    // Synchronous readback
+    // Map all readback buffers, then poll once
     let pos_slice = gpu.pos_readback_buf.slice(..);
     pos_slice.map_async(wgpu::MapMode::Read, |_| {});
+    let state_slice = gpu.state_readback_buf.slice(..);
+    state_slice.map_async(wgpu::MapMode::Read, |_| {});
+    let bbox_slice = gpu.bbox_readback_buf.slice(..);
+    bbox_slice.map_async(wgpu::MapMode::Read, |_| {});
     device.poll(wgpu::PollType::Wait).unwrap();
+
+    // Read positions
     {
         let data = pos_slice.get_mapped_range();
         let floats: &[[f32; 4]] = bytemuck::cast_slice(&data);
@@ -1981,9 +1447,7 @@ fn readback_from_gpu(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &mut GpuCo
     }
     gpu.pos_readback_buf.unmap();
 
-    let state_slice = gpu.state_readback_buf.slice(..);
-    state_slice.map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::PollType::Wait).unwrap();
+    // Read states
     {
         let data = state_slice.get_mapped_range();
         let floats: &[f32] = bytemuck::cast_slice(&data);
@@ -1991,15 +1455,20 @@ fn readback_from_gpu(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &mut GpuCo
     }
     gpu.state_readback_buf.unmap();
 
-    let u_slice = gpu.u_readback_buf.slice(..);
-    u_slice.map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::PollType::Wait).unwrap();
-    {
-        let data = u_slice.get_mapped_range();
-        let floats: &[f32] = bytemuck::cast_slice(&data);
-        mesh.vertex_u[..n].copy_from_slice(&floats[..n]);
-    }
-    gpu.u_readback_buf.unmap();
+    // Read bounding box (sortable uint → float conversion)
+    let bbox = {
+        let data = bbox_slice.get_mapped_range();
+        let uints: &[u32] = bytemuck::cast_slice(&data);
+        [
+            sortable_to_float(uints[0]),
+            sortable_to_float(uints[1]),
+            sortable_to_float(uints[2]),
+            sortable_to_float(uints[3]),
+        ]
+    };
+    gpu.bbox_readback_buf.unmap();
+
+    bbox
 }
 
 fn rebuild_render_indices(queue: &wgpu::Queue, gpu: &mut GpuCompute, mesh: &HalfEdgeMesh) {
@@ -2067,7 +1536,7 @@ fn gpu_dispatch_frame(
     mesh: &HalfEdgeMesh,
     params: &GpuSimParams,
     cheb_order: usize,
-    cheb_coeffs: &[f32; 10],
+    cheb_coeffs: &[f32; 20],
 ) {
     let n = params.num_vertices;
     let num_bins_total = params.num_bins_x * params.num_bins_y + 1;
@@ -2235,6 +1704,30 @@ fn gpu_dispatch_frame(
         pass.dispatch_workgroups(dispatch_count(n), 1, 1);
     }
 
+    // ── Bounding box reduction (for next frame's spatial hash) ───────────
+
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("bbox_clear"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.bbox_clear_pipeline);
+        pass.set_bind_group(0, &gpu.bbox_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.bbox_params_bg, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("bbox_reduce"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.bbox_reduce_pipeline);
+        pass.set_bind_group(0, &gpu.bbox_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.bbox_params_bg, &[]);
+        pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+    }
+
+    // Copy bbox atomics to readback staging buffer
+    encoder.copy_buffer_to_buffer(&gpu.bbox_atomic_buf, 0, &gpu.bbox_readback_buf, 0, 16);
+
     queue.submit(Some(encoder.finish()));
 }
 
@@ -2268,6 +1761,8 @@ struct Model {
     // Cached bounding box for rendering (updated on readback frames)
     cached_center: Vec3,
     cached_scale: f32,
+    // Cached spatial hash bounding box from GPU reduction [min_x, min_y, max_x, max_y]
+    cached_spatial_bbox: [f32; 4],
     spring_len: f32,
     elastic_constant: f32,
     repulsion_distance: f32,
@@ -2275,6 +1770,7 @@ struct Model {
     bulge_strength: f32,
     planar_strength: f32,
     dt: f32,
+    state_dt: f32,
     damping: f32,
     // Lenia-style params
     kernel_mu: f32,
@@ -2282,8 +1778,9 @@ struct Model {
     growth_mu: f32,
     growth_sigma: f32,
     split_threshold: f32,
+    split_chance: f32,
     cheb_order: usize,
-    cheb_coeffs: [f32; 10],
+    cheb_coeffs: [f32; 20],
     frame: u64,
     // Camera rotation
     camera_yaw: f32,
@@ -2292,19 +1789,44 @@ struct Model {
     dragging: bool,
     last_mouse: Vec2,
     render_mode: u32,
+    start_shape: StartShape,
+    ico_nu: usize,
 }
 
 fn recompute_cheb_coeffs(model: &mut Model) {
+    const MAX_ORDER: usize = 20;
+
+    // Compute all raw Gaussian coefficients
+    let mut raw = [0.0f32; MAX_ORDER];
+    let mut total = 0.0f32;
+    for k in 0..MAX_ORDER {
+        let c = (-((k as f32 - model.kernel_mu).powi(2)) / (2.0 * model.kernel_sigma * model.kernel_sigma)).exp();
+        raw[k] = c;
+        total += c;
+    }
+
+    // Auto-select order: smallest N capturing >= 95% of total mass
+    let threshold = 0.95 * total;
+    let mut cumsum = 0.0f32;
+    let mut order = MAX_ORDER;
+    for k in 0..MAX_ORDER {
+        cumsum += raw[k];
+        if cumsum >= threshold {
+            order = k + 1;
+            break;
+        }
+    }
+    model.cheb_order = order.max(2);
+
+    // Normalize the used coefficients
     let mut sum = 0.0f32;
     for k in 0..model.cheb_order {
-        let c = (-((k as f32 - model.kernel_mu).powi(2)) / (2.0 * model.kernel_sigma * model.kernel_sigma)).exp();
-        model.cheb_coeffs[k] = c;
-        sum += c;
+        sum += raw[k];
     }
     for k in 0..model.cheb_order {
-        model.cheb_coeffs[k] /= sum;
+        model.cheb_coeffs[k] = raw[k] / sum;
     }
-    for k in model.cheb_order..10 {
+    for k in model.cheb_order..MAX_ORDER {
         model.cheb_coeffs[k] = 0.0;
     }
 }
@@ -2317,6 +1839,7 @@ fn randomize_params(model: &mut Model) {
     model.bulge_strength = 5.0 + random_f32() * 15.0;
     model.planar_strength = 0.05 + random_f32() * 0.15;
     model.dt = 0.05 + random_f32() * 0.15;
+    model.state_dt = 0.05 + random_f32() * 0.15;
     model.damping = 0.5;
     // Lenia-style params
     model.kernel_mu = 4.0 + random_f32() * 5.0;
@@ -2324,8 +1847,8 @@ fn randomize_params(model: &mut Model) {
     model.growth_mu = random_f32();
     model.growth_sigma = 0.1 + random_f32() * 0.5;
     model.split_threshold = 0.5 + random_f32() * 0.4;
+    model.split_chance = 0.01 + random_f32() * 0.09;
 
-    model.cheb_order = 8 + (random_f32() * 3.0) as usize; // 8–10
     recompute_cheb_coeffs(model);
 }
 
@@ -2355,21 +1878,24 @@ fn model(app: &App) -> Model {
         render_state: Arc::new(Mutex::new(RenderState::default())),
         cached_center: Vec3::ZERO,
         cached_scale: 1.0,
+        cached_spatial_bbox: [f32::NEG_INFINITY; 4],
         spring_len: 30.0,
         elastic_constant: 0.1,
         repulsion_distance: 150.0,
-        repulsion_strength: 2.0,
+        repulsion_strength: 8.0,
         bulge_strength: 10.0,
-        planar_strength: 0.1,
-        dt: 0.1,
+        planar_strength: 0.4,
+        dt: 0.05,
+        state_dt: 0.05,
         damping: 0.5,
         kernel_mu: 8.0,
         kernel_sigma: 1.0,
         growth_mu: 0.5,
         growth_sigma: 0.3,
         split_threshold: 0.7,
+        split_chance: 0.05,
         cheb_order: 10,
-        cheb_coeffs: [0.2; 10],
+        cheb_coeffs: [0.0; 20],
         frame: 0,
         camera_yaw: 0.0,
         camera_pitch: 0.0,
@@ -2377,9 +1903,11 @@ fn model(app: &App) -> Model {
         dragging: false,
         last_mouse: Vec2::ZERO,
         render_mode: 0,
+        start_shape: StartShape::Circle,
+        ico_nu: 4,
     };
     randomize_params(&mut m);
-    m.mesh = Arc::from(make_circle(m.spring_len, N_RINGS, SEGMENTS_INNER));
+    m.mesh = Arc::from(make_start_mesh(m.start_shape, m.spring_len, m.ico_nu));
     m
 }
 
@@ -2389,11 +1917,34 @@ fn update(app: &App, model: &mut Model) {
     let ctx = egui_ctx.get_mut();
 
     let mut kernel_changed = false;
+    let mut shape_changed = false;
     egui::Window::new("Settings").show(&ctx, |ui| {
+        ui.label("Start shape");
+        let prev_shape = model.start_shape;
+        egui::ComboBox::from_id_salt("start_shape")
+            .selected_text(match model.start_shape {
+                StartShape::Circle => "Circle",
+                StartShape::Sphere => "Sphere",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut model.start_shape, StartShape::Circle, "Circle");
+                ui.selectable_value(&mut model.start_shape, StartShape::Sphere, "Sphere");
+            });
+        if model.start_shape == StartShape::Sphere {
+            let prev_nu = model.ico_nu;
+            ui.add(egui::Slider::new(&mut model.ico_nu, 2..=8).text("subdivisions"));
+            if model.ico_nu != prev_nu {
+                shape_changed = true;
+            }
+        }
+        if model.start_shape != prev_shape {
+            shape_changed = true;
+        }
+        ui.separator();
         ui.label("Kernel (ring)");
-        kernel_changed |= ui.add(egui::Slider::new(&mut model.kernel_mu, 0.0..=8.0).text("mu")).changed();
+        kernel_changed |= ui.add(egui::Slider::new(&mut model.kernel_mu, 0.0..=18.0).text("mu")).changed();
         kernel_changed |= ui.add(egui::Slider::new(&mut model.kernel_sigma, 0.1..=4.0).text("sigma")).changed();
-        kernel_changed |= ui.add(egui::Slider::new(&mut model.cheb_order, 2..=10).text("order")).changed();
+        ui.label(format!("order: {} (auto)", model.cheb_order));
         ui.separator();
         ui.label("Growth function");
         ui.add(egui::Slider::new(&mut model.growth_mu, 0.0..=1.0).text("mu"));
@@ -2401,6 +1952,7 @@ fn update(app: &App, model: &mut Model) {
         ui.separator();
         ui.label("Split");
         ui.add(egui::Slider::new(&mut model.split_threshold, 0.0..=1.0).text("threshold"));
+        ui.add(egui::Slider::new(&mut model.split_chance, 0.001..=0.5).text("chance"));
         ui.separator();
         ui.label("Physics");
         ui.add(egui::Slider::new(&mut model.spring_len, 5.0..=80.0).text("spring len"));
@@ -2408,12 +1960,33 @@ fn update(app: &App, model: &mut Model) {
         ui.add(egui::Slider::new(&mut model.repulsion_strength, 0.0..=10.0).text("repulsion"));
         ui.add(egui::Slider::new(&mut model.bulge_strength, 0.0..=30.0).text("bulge"));
         ui.add(egui::Slider::new(&mut model.planar_strength, 0.0..=0.5).text("planar"));
-        ui.add(egui::Slider::new(&mut model.dt, 0.01..=0.3).text("dt"));
+        ui.add(egui::Slider::new(&mut model.dt, 0.01..=0.3).text("force dt"));
+        ui.add(egui::Slider::new(&mut model.state_dt, 0.01..=0.5).text("state dt"));
+        ui.separator();
+        ui.label("Controls");
+        ui.label("R — Randomize params & reset");
+        ui.label("T — Reset mesh (keep params)");
+        ui.label("S — Save screenshot");
+        ui.label("M — Toggle render mode");
+        ui.label("Drag — Rotate camera");
+        ui.label("Scroll — Zoom");
     });
     drop(egui_ctx);
 
     if kernel_changed {
         recompute_cheb_coeffs(model);
+    }
+
+    if shape_changed {
+        model.mesh = Arc::from(make_start_mesh(model.start_shape, model.spring_len, model.ico_nu));
+        model.frame = 0;
+        model.camera_yaw = 0.0;
+        model.camera_pitch = 0.0;
+        model.zoom = 1.0;
+        model.cached_spatial_bbox = [f32::NEG_INFINITY; 4];
+        if let Some(ref mut gpu) = model.gpu {
+            gpu.topology_dirty = true;
+        }
     }
 
     model.frame += 1;
@@ -2430,24 +2003,35 @@ fn update(app: &App, model: &mut Model) {
         }
     }
 
-    // Compute bounding box for spatial hash grid
+    // Spatial hash grid params from cached GPU bounding box (updated on readback frames)
     let mesh = &model.mesh;
-    let mut min_x = f32::INFINITY;
-    let mut min_y = f32::INFINITY;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
-    for v in 0..mesh.next_vertex {
-        if mesh.vertex_idx[v] < 0 { continue; }
-        min_x = min_x.min(mesh.vertex_pos[v].x);
-        min_y = min_y.min(mesh.vertex_pos[v].y);
-        max_x = max_x.max(mesh.vertex_pos[v].x);
-        max_y = max_y.max(mesh.vertex_pos[v].y);
-    }
     let bin_size = model.repulsion_distance;
-    let origin_x = min_x - bin_size;
-    let origin_y = min_y - bin_size;
-    let num_bins_x = (((max_x - origin_x) / bin_size).ceil() as u32 + 2).min(MAX_BINS_PER_DIM);
-    let num_bins_y = (((max_y - origin_y) / bin_size).ceil() as u32 + 2).min(MAX_BINS_PER_DIM);
+    let bbox = model.cached_spatial_bbox;
+    let (origin_x, origin_y, num_bins_x, num_bins_y) = if bbox[0].is_finite() {
+        let ox = bbox[0] - bin_size;
+        let oy = bbox[1] - bin_size;
+        let nbx = (((bbox[2] - ox) / bin_size).ceil() as u32 + 2).min(MAX_BINS_PER_DIM);
+        let nby = (((bbox[3] - oy) / bin_size).ceil() as u32 + 2).min(MAX_BINS_PER_DIM);
+        (ox, oy, nbx, nby)
+    } else {
+        // First frame: compute from CPU mesh (GPU bbox not yet available)
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for v in 0..mesh.next_vertex {
+            if mesh.vertex_idx[v] < 0 { continue; }
+            min_x = min_x.min(mesh.vertex_pos[v].x);
+            min_y = min_y.min(mesh.vertex_pos[v].y);
+            max_x = max_x.max(mesh.vertex_pos[v].x);
+            max_y = max_y.max(mesh.vertex_pos[v].y);
+        }
+        let ox = min_x - bin_size;
+        let oy = min_y - bin_size;
+        let nbx = (((max_x - ox) / bin_size).ceil() as u32 + 2).min(MAX_BINS_PER_DIM);
+        let nby = (((max_y - oy) / bin_size).ceil() as u32 + 2).min(MAX_BINS_PER_DIM);
+        (ox, oy, nbx, nby)
+    };
 
     let gpu_params = GpuSimParams {
         num_vertices: mesh.next_vertex as u32,
@@ -2467,7 +2051,7 @@ fn update(app: &App, model: &mut Model) {
         growth_sigma: model.growth_sigma,
         cheb_order: model.cheb_order as u32,
         repulsion_strength: model.repulsion_strength,
-        _pad0: 0,
+        state_dt: model.state_dt,
     };
 
     // GPU dispatch: physics + state evolution
@@ -2495,7 +2079,8 @@ fn update(app: &App, model: &mut Model) {
         let queue = window.queue();
         let gpu = model.gpu.as_mut().unwrap();
         let mesh = Arc::make_mut(&mut model.mesh);
-        readback_from_gpu(&device, &queue, gpu, mesh);
+        let bbox = readback_from_gpu(&device, &queue, gpu, mesh);
+        model.cached_spatial_bbox = bbox;
 
         // Update cached bounding box for render uniforms
         let mut min_pos = Vec3::splat(f32::INFINITY);
@@ -2520,7 +2105,7 @@ fn update(app: &App, model: &mut Model) {
         }
 
         // Growth (every 10 frames)
-        generate_new_triangles(mesh, model.split_threshold);
+        generate_new_triangles(mesh, model.split_threshold, model.split_chance);
 
         // Mesh refinement (every 20 frames)
         if model.frame % 20 == 0 {
@@ -2770,21 +2355,23 @@ fn key_pressed(app: &App, model: &mut Model, key: KeyCode) {
     }
     if key == KeyCode::KeyR {
         randomize_params(model);
-        model.mesh = Arc::from(make_circle(model.spring_len, N_RINGS, SEGMENTS_INNER));
+        model.mesh = Arc::from(make_start_mesh(model.start_shape, model.spring_len, model.ico_nu));
         model.frame = 0;
         model.camera_yaw = 0.0;
         model.camera_pitch = 0.0;
         model.zoom = 1.0;
+        model.cached_spatial_bbox = [f32::NEG_INFINITY; 4];
         if let Some(ref mut gpu) = model.gpu {
             gpu.topology_dirty = true;
         }
     }
     if key == KeyCode::KeyT {
-        model.mesh = Arc::from(make_circle(model.spring_len, N_RINGS, SEGMENTS_INNER));
+        model.mesh = Arc::from(make_start_mesh(model.start_shape, model.spring_len, model.ico_nu));
         model.frame = 0;
         model.camera_yaw = 0.0;
         model.camera_pitch = 0.0;
         model.zoom = 1.0;
+        model.cached_spatial_bbox = [f32::NEG_INFINITY; 4];
         if let Some(ref mut gpu) = model.gpu {
             gpu.topology_dirty = true;
         }

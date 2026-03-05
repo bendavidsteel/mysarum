@@ -48,6 +48,9 @@ pub(crate) struct HalfEdgeMesh {
     pub(crate) next_vertex: usize,
     pub(crate) next_face: usize,
     pub(crate) next_half_edge: usize,
+
+    // Cached active count (incremented on alloc, currently never decremented)
+    pub(crate) num_active_vertices: usize,
 }
 
 impl HalfEdgeMesh {
@@ -69,6 +72,7 @@ impl HalfEdgeMesh {
             next_vertex: 0,
             next_face: 0,
             next_half_edge: 0,
+            num_active_vertices: 0,
         });
         // initialise vertex_state with random values
         for s in mesh.vertex_state.iter_mut() {
@@ -84,6 +88,7 @@ impl HalfEdgeMesh {
         let idx = self.next_vertex;
         self.next_vertex += 1;
         self.vertex_idx[idx] = idx as i32;
+        self.num_active_vertices += 1;
         Some(idx)
     }
 
@@ -120,9 +125,7 @@ impl HalfEdgeMesh {
     }
 
     fn active_vertex_count(&self) -> usize {
-        (0..self.next_vertex)
-            .filter(|&i| self.vertex_idx[i] >= 0)
-            .count()
+        self.num_active_vertices
     }
 
     // ── Get half-edge from vertex a to vertex b ────────────────────────────

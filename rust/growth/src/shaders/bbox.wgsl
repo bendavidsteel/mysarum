@@ -1,4 +1,4 @@
-// Bounding box reduction via atomic min/max
+// Bounding box reduction via atomic min/max (3D: min_x, min_y, max_x, max_y, min_z, max_z)
 // Uses float-to-sortable-uint encoding for correct float ordering with integer atomics
 
 @group(0) @binding(0) var<storage, read> vertex_pos: array<vec4<f32>>;
@@ -19,6 +19,8 @@ fn bbox_clear(@builtin(global_invocation_id) id: vec3u) {
         atomicStore(&bbox_atomic[1], 0xFFFFFFFFu); // min_y: init to max sortable
         atomicStore(&bbox_atomic[2], 0u);           // max_x: init to min sortable
         atomicStore(&bbox_atomic[3], 0u);           // max_y: init to min sortable
+        atomicStore(&bbox_atomic[4], 0xFFFFFFFFu); // min_z: init to max sortable
+        atomicStore(&bbox_atomic[5], 0u);           // max_z: init to min sortable
     }
 }
 
@@ -29,8 +31,11 @@ fn bbox_reduce(@builtin(global_invocation_id) id: vec3u) {
     if pos.w < 0.0 { return; }
     let sx = float_to_sortable(pos.x);
     let sy = float_to_sortable(pos.y);
+    let sz = float_to_sortable(pos.z);
     atomicMin(&bbox_atomic[0], sx);
     atomicMin(&bbox_atomic[1], sy);
     atomicMax(&bbox_atomic[2], sx);
     atomicMax(&bbox_atomic[3], sy);
+    atomicMin(&bbox_atomic[4], sz);
+    atomicMax(&bbox_atomic[5], sz);
 }

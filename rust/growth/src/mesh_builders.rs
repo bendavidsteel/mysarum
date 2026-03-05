@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use nannou::prelude::*;
 
-use crate::{HalfEdgeMesh, N_RINGS, SEGMENTS_INNER};
+use crate::mesh::{HalfEdgeMesh, N_RINGS, SEGMENTS_INNER};
 
 // ── Shared half-edge builder from face list ─────────────────────────────────
 

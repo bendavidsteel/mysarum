@@ -3,7 +3,7 @@ use nannou::prelude::*;
 
 use crate::mesh::{HalfEdgeMesh, MAX_VERTICES, MAX_HALF_EDGES, MAX_FACES};
 
-const MAX_BINS_PER_DIM: u32 = 256;
+const MAX_BINS_PER_DIM: u32 = 64;
 pub(crate) const WORKGROUP_SIZE: u32 = 64;
 
 // Shader sources (loaded at compile time, common prepended)
@@ -32,14 +32,18 @@ pub(crate) struct GpuSimParams {
     pub(crate) dt: f32,
     pub(crate) origin_x: f32,
     pub(crate) origin_y: f32,
+    pub(crate) origin_z: f32,
     pub(crate) bin_size: f32,
     pub(crate) num_bins_x: u32,
     pub(crate) num_bins_y: u32,
+    pub(crate) num_bins_z: u32,
     pub(crate) growth_mu: f32,
     pub(crate) growth_sigma: f32,
     pub(crate) cheb_order: u32,
     pub(crate) repulsion_strength: f32,
     pub(crate) state_dt: f32,
+    pub(crate) damping: f32,
+    pub(crate) _pad: [f32; 3],
 }
 
 #[repr(C)]
@@ -129,7 +133,7 @@ pub(crate) struct GpuCompute {
     cheb_init_data_bg: wgpu::BindGroup,
     cheb_init_params_bg: wgpu::BindGroup,
     cheb_step_data_bgs: [wgpu::BindGroup; 3], // rotating A→B→C
-    cheb_step_params_bg: wgpu::BindGroup,
+    cheb_step_params_bgs: Vec<wgpu::BindGroup>,
     growth_data_bg: wgpu::BindGroup,
     growth_params_bg: wgpu::BindGroup,
 
@@ -157,7 +161,7 @@ pub(crate) struct GpuCompute {
 pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> GpuCompute {
     let pos_buf_size = (MAX_VERTICES * 16) as u64;   // vec4<f32>
     let force_buf_size = pos_buf_size;
-    let max_bins = MAX_BINS_PER_DIM * MAX_BINS_PER_DIM;
+    let max_bins = MAX_BINS_PER_DIM * MAX_BINS_PER_DIM * MAX_BINS_PER_DIM;
     let bin_buf_size = ((max_bins + 1) * 4) as u64;   // u32 per bin + 1
     let idx_buf_size = (MAX_VERTICES * 4) as u64;      // u32 per vertex
     let he_packed_size = (MAX_HALF_EDGES * 16) as u64; // vec4<i32>
@@ -611,10 +615,14 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
             .buffer_bytes(&vertex_he_buf, 0, None)
             .build(device, &cheb_step_data_layout),
     ];
-    let cheb_step_params_bg = wgpu::BindGroupBuilder::new()
-        .buffer_bytes(&sim_params_buf, 0, None)
-        .buffer_bytes(&cheb_coeff_buf, 0, None)
-        .build(device, &cheb_step_params_layout);
+    let cheb_step_params_bgs: Vec<wgpu::BindGroup> = cheb_coeff_bufs.iter()
+        .map(|coeff_buf| {
+            wgpu::BindGroupBuilder::new()
+                .buffer_bytes(&sim_params_buf, 0, None)
+                .buffer_bytes(coeff_buf, 0, None)
+                .build(device, &cheb_step_params_layout)
+        })
+        .collect();
 
     // growth bind groups
     let growth_data_bg = wgpu::BindGroupBuilder::new()
@@ -658,7 +666,7 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
         topo_data_bg, topo_params_bg,
         integrate_data_bg, integrate_params_bg,
         cheb_init_data_bg, cheb_init_params_bg,
-        cheb_step_data_bgs, cheb_step_params_bg,
+        cheb_step_data_bgs, cheb_step_params_bgs,
         growth_data_bg, growth_params_bg,
         render_index_buf, render_uniform_buf,
         num_render_tris: 0,
@@ -704,6 +712,28 @@ pub(crate) fn upload_mesh_to_gpu(queue: &wgpu::Queue, gpu: &mut GpuCompute, mesh
 fn sortable_to_float(s: u32) -> f32 {
     let mask = if (s & 0x80000000) == 0 { 0xFFFFFFFFu32 } else { 0x80000000u32 };
     f32::from_bits(s ^ mask)
+}
+
+/// Read back only the bounding box (24 bytes) — cheap enough to run every frame.
+pub(crate) fn readback_bbox_only(device: &wgpu::Device, gpu: &GpuCompute) -> [f32; 6] {
+    let bbox_slice = gpu.bbox_readback_buf.slice(..);
+    bbox_slice.map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::PollType::Wait).unwrap();
+
+    let bbox = {
+        let data = bbox_slice.get_mapped_range();
+        let uints: &[u32] = bytemuck::cast_slice(&data);
+        [
+            sortable_to_float(uints[0]),
+            sortable_to_float(uints[1]),
+            sortable_to_float(uints[2]),
+            sortable_to_float(uints[3]),
+            sortable_to_float(uints[4]),
+            sortable_to_float(uints[5]),
+        ]
+    };
+    gpu.bbox_readback_buf.unmap();
+    bbox
 }
 
 /// Read back positions, states, and GPU-computed bounding box.
@@ -808,6 +838,7 @@ pub(crate) fn update_render_uniforms(
     pitch: f32,
     zoom: f32,
     render_mode: u32,
+    show_wireframe: bool,
     aspect: f32,
 ) {
     let rot = Mat4::from_rotation_x(pitch) * Mat4::from_rotation_y(yaw);
@@ -820,7 +851,7 @@ pub(crate) fn update_render_uniforms(
         view_proj: view_proj.to_cols_array_2d(),
         center: [center.x, center.y, center.z, scale],
         light: [0.3, 0.4, 1.0, 0.2],
-        render_mode: [render_mode as f32, 0.0, 0.0, 0.0],
+        render_mode: [render_mode as f32, if show_wireframe { 1.0 } else { 0.0 }, 0.0, 0.0],
     };
     queue.write_buffer(&gpu.render_uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 }
@@ -835,7 +866,7 @@ pub(crate) fn gpu_dispatch_frame(
     cheb_coeffs: &[f32; 20],
 ) {
     let n = params.num_vertices;
-    let num_bins_total = params.num_bins_x * params.num_bins_y + 1;
+    let num_bins_total = params.num_bins_x * params.num_bins_y * params.num_bins_z + 1;
 
     // Upload sim params
     queue.write_buffer(&gpu.sim_params_buf, 0, bytemuck::bytes_of(params));
@@ -974,14 +1005,13 @@ pub(crate) fn gpu_dispatch_frame(
         pass.dispatch_workgroups(dispatch_count(n), 1, 1);
     }
 
-    // Chebyshev steps k=2..cheb_order — pre-upload coefficients to avoid per-step write_buffer
+    // Chebyshev steps k=2..cheb_order — upload coefficients to per-step buffers
     for k in 2..cheb_order {
         if k < gpu.cheb_coeff_bufs.len() {
             queue.write_buffer(&gpu.cheb_coeff_bufs[k], 0, bytemuck::bytes_of(&cheb_coeffs[k]));
         }
     }
     for k in 2..cheb_order {
-        queue.write_buffer(&gpu.cheb_coeff_buf, 0, bytemuck::bytes_of(&cheb_coeffs[k]));
         let bg_idx = (k - 2) % 3;
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -989,7 +1019,7 @@ pub(crate) fn gpu_dispatch_frame(
             });
             pass.set_pipeline(&gpu.chebyshev_step_pipeline);
             pass.set_bind_group(0, &gpu.cheb_step_data_bgs[bg_idx], &[]);
-            pass.set_bind_group(1, &gpu.cheb_step_params_bg, &[]);
+            pass.set_bind_group(1, &gpu.cheb_step_params_bgs[k], &[]);
             pass.dispatch_workgroups(dispatch_count(n), 1, 1);
         }
     }

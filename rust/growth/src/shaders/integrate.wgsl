@@ -8,6 +8,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     var p = vertex_pos[id.x];
     if p.w < 0.0 { return; }
     let f = vertex_force[id.x].xyz;
-    p = vec4f(p.xyz + params.dt * f, p.w);
+    var displacement = params.dt * f;
+    // Clamp max displacement to half a spring length to prevent overshooting
+    let max_step = params.spring_len * 0.5;
+    let disp_len = length(displacement);
+    if disp_len > max_step {
+        displacement = displacement * (max_step / disp_len);
+    }
+    p = vec4f(p.xyz + params.damping * displacement, p.w);
     vertex_pos[id.x] = p;
 }

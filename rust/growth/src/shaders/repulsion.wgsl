@@ -15,32 +15,35 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         return;
     }
 
-    let info = get_bin_info(pos.x, pos.y, params);
+    let info = get_bin_info(pos.x, pos.y, pos.z, params);
     var force = vec3f(0.0);
 
-    for (var dy: i32 = -1; dy <= 1; dy += 1) {
-        for (var dx: i32 = -1; dx <= 1; dx += 1) {
-            let nx = i32(info.bin_x) + dx;
+    for (var dz: i32 = -1; dz <= 1; dz += 1) {
+        let nz = i32(info.bin_z) + dz;
+        if nz < 0 || u32(nz) >= params.num_bins_z { continue; }
+        for (var dy: i32 = -1; dy <= 1; dy += 1) {
             let ny = i32(info.bin_y) + dy;
-            if nx < 0 || ny < 0 || u32(nx) >= params.num_bins_x || u32(ny) >= params.num_bins_y {
-                continue;
-            }
-            let bi = u32(ny) * params.num_bins_x + u32(nx);
-            let start = bin_offset[bi];
-            let end = bin_offset[bi + 1u];
+            if ny < 0 || u32(ny) >= params.num_bins_y { continue; }
+            for (var dx: i32 = -1; dx <= 1; dx += 1) {
+                let nx = i32(info.bin_x) + dx;
+                if nx < 0 || u32(nx) >= params.num_bins_x { continue; }
+                let bi = (u32(nz) * params.num_bins_y + u32(ny)) * params.num_bins_x + u32(nx);
+                let start = bin_offset[bi];
+                let end = bin_offset[bi + 1u];
 
-            for (var k = start; k < end; k += 1u) {
-                let j = sorted_idx[k];
-                if j == id.x { continue; }
+                for (var k = start; k < end; k += 1u) {
+                    let j = sorted_idx[k];
+                    if j == id.x { continue; }
 
-                let other = vertex_pos[j];
-                let diff = pos.xyz - other.xyz;
-                let dist_sq = dot(diff, diff) + EPSILON;
-                let dist = sqrt(dist_sq);
+                    let other = vertex_pos[j];
+                    let diff = pos.xyz - other.xyz;
+                    let dist_sq = dot(diff, diff) + EPSILON;
+                    let dist = sqrt(dist_sq);
 
-                if dist < params.repulsion_distance {
-                    let ratio = (params.repulsion_distance - dist) / params.repulsion_distance;
-                    force += ratio * ratio * (diff / dist);
+                    if dist < params.repulsion_distance {
+                        let ratio = (params.repulsion_distance - dist) / params.repulsion_distance;
+                        force += ratio * ratio * (diff / dist);
+                    }
                 }
             }
         }

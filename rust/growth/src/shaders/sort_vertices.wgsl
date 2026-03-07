@@ -19,7 +19,7 @@ fn sort_vertices(@builtin(global_invocation_id) id: vec3u) {
     }
     let pos = vertex_pos[id.x];
     if pos.w < 0.0 { return; }
-    let info = get_bin_info(pos.x, pos.y, params);
+    let info = get_bin_info(pos.x, pos.y, pos.z, params);
     let offset = bin_offset[info.bin_index] + atomicAdd(&bin_counter[info.bin_index], 1u);
     sorted_idx[offset] = id.x;
 }

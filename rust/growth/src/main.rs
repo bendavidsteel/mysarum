@@ -13,10 +13,10 @@ use bevy::input::mouse::MouseWheel;
 use mesh::HalfEdgeMesh;
 use mesh_builders::{StartShape, make_start_mesh};
 use gpu::{GpuCompute, GpuSimParams, create_gpu_compute, upload_mesh_to_gpu, readback_from_gpu,
-          rebuild_render_indices, update_render_uniforms, gpu_dispatch_frame};
+          readback_bbox_only, rebuild_render_indices, update_render_uniforms, gpu_dispatch_frame};
 use render::RenderState;
 
-const MAX_BINS_PER_DIM: u32 = 256;
+const MAX_BINS_PER_DIM: u32 = 64;
 
 // ── Model ──────────────────────────────────────────────────────────────────────
 
@@ -57,6 +57,7 @@ struct Model {
     dragging: bool,
     last_mouse: Vec2,
     render_mode: u32,
+    show_wireframe: bool,
     start_shape: StartShape,
     ico_nu: usize,
 }
@@ -100,22 +101,11 @@ fn recompute_cheb_coeffs(model: &mut Model) {
 }
 
 fn randomize_params(model: &mut Model) {
-    model.spring_len = 20.0 + random_f32() * 30.0;
-    model.elastic_constant = 0.05 + random_f32() * 0.15;
-    model.repulsion_distance = model.spring_len * (3.0 + random_f32() * 4.0);
-    model.repulsion_strength = 1.0 + random_f32() * 4.0;
-    model.bulge_strength = 5.0 + random_f32() * 15.0;
-    model.planar_strength = 0.05 + random_f32() * 0.15;
-    model.dt = 0.05 + random_f32() * 0.15;
-    model.state_dt = 0.05 + random_f32() * 0.15;
-    model.damping = 0.5;
     // Lenia-style params
     model.kernel_mu = 4.0 + random_f32() * 5.0;
     model.kernel_sigma = 0.5 + random_f32() * 2.0;
     model.growth_mu = random_f32();
     model.growth_sigma = 0.1 + random_f32() * 0.5;
-    model.split_threshold = 0.5 + random_f32() * 0.4;
-    model.split_chance = 0.01 + random_f32() * 0.09;
 
     recompute_cheb_coeffs(model);
 }
@@ -148,7 +138,7 @@ fn model(app: &App) -> Model {
         cached_scale: 1.0,
         cached_spatial_bbox: [f32::NEG_INFINITY; 6],
         spring_len: 30.0,
-        elastic_constant: 0.1,
+        elastic_constant: 0.01,
         repulsion_distance: 150.0,
         repulsion_strength: 8.0,
         bulge_strength: 10.0,
@@ -160,8 +150,8 @@ fn model(app: &App) -> Model {
         kernel_sigma: 1.0,
         growth_mu: 0.5,
         growth_sigma: 0.3,
-        split_threshold: 0.7,
-        split_chance: 0.05,
+        split_threshold: 0.95,
+        split_chance: 0.001,
         cheb_order: 10,
         cheb_coeffs: [0.0; 20],
         frame: 0,
@@ -171,8 +161,9 @@ fn model(app: &App) -> Model {
         dragging: false,
         last_mouse: Vec2::ZERO,
         render_mode: 0,
-        start_shape: StartShape::Circle,
-        ico_nu: 4,
+        show_wireframe: false,
+        start_shape: StartShape::Sphere,
+        ico_nu: 32,
     };
     randomize_params(&mut m);
     m.mesh = Arc::from(make_start_mesh(m.start_shape, m.spring_len, m.ico_nu));
@@ -200,7 +191,7 @@ fn update(app: &App, model: &mut Model) {
             });
         if model.start_shape == StartShape::Sphere {
             let prev_nu = model.ico_nu;
-            ui.add(egui::Slider::new(&mut model.ico_nu, 2..=8).text("subdivisions"));
+            ui.add(egui::Slider::new(&mut model.ico_nu, 2..=64).text("subdivisions"));
             if model.ico_nu != prev_nu {
                 shape_changed = true;
             }
@@ -220,22 +211,26 @@ fn update(app: &App, model: &mut Model) {
         ui.separator();
         ui.label("Split");
         ui.add(egui::Slider::new(&mut model.split_threshold, 0.0..=1.0).text("threshold"));
-        ui.add(egui::Slider::new(&mut model.split_chance, 0.001..=0.5).text("chance"));
+        ui.add(egui::Slider::new(&mut model.split_chance, 0.0..=0.1).text("chance").logarithmic(true));
         ui.separator();
         ui.label("Physics");
-        ui.add(egui::Slider::new(&mut model.spring_len, 5.0..=80.0).text("spring len"));
         ui.add(egui::Slider::new(&mut model.elastic_constant, 0.01..=0.5).text("elastic"));
         ui.add(egui::Slider::new(&mut model.repulsion_strength, 0.0..=10.0).text("repulsion"));
         ui.add(egui::Slider::new(&mut model.bulge_strength, 0.0..=30.0).text("bulge"));
         ui.add(egui::Slider::new(&mut model.planar_strength, 0.0..=0.5).text("planar"));
         ui.add(egui::Slider::new(&mut model.dt, 0.01..=0.3).text("force dt"));
+        ui.add(egui::Slider::new(&mut model.damping, 0.01..=1.0).text("damping"));
         ui.add(egui::Slider::new(&mut model.state_dt, 0.01..=0.5).text("state dt"));
+        ui.separator();
+        ui.label("Render");
+        ui.checkbox(&mut model.show_wireframe, "Wireframe");
         ui.separator();
         ui.label("Controls");
         ui.label("R — Randomize params & reset");
         ui.label("T — Reset mesh (keep params)");
         ui.label("S — Save screenshot");
         ui.label("M — Toggle render mode");
+        ui.label("W — Toggle wireframe");
         ui.label("Drag — Rotate camera");
         ui.label("Scroll — Zoom");
     });
@@ -272,34 +267,42 @@ fn update(app: &App, model: &mut Model) {
         }
     }
 
-    // Spatial hash grid params from cached GPU bounding box (updated on readback frames)
+    // Spatial hash grid params from cached GPU bounding box (3D)
     let mesh = &model.mesh;
     let bin_size = model.repulsion_distance;
-    let bbox = model.cached_spatial_bbox;
-    let (origin_x, origin_y, num_bins_x, num_bins_y) = if bbox[0].is_finite() {
+    let bbox = model.cached_spatial_bbox; // [min_x, min_y, max_x, max_y, min_z, max_z]
+    let (origin_x, origin_y, origin_z, num_bins_x, num_bins_y, num_bins_z) = if bbox[0].is_finite() {
         let ox = bbox[0] - bin_size;
         let oy = bbox[1] - bin_size;
+        let oz = bbox[4] - bin_size;
         let nbx = (((bbox[2] - ox) / bin_size).ceil() as u32 + 2).min(MAX_BINS_PER_DIM);
         let nby = (((bbox[3] - oy) / bin_size).ceil() as u32 + 2).min(MAX_BINS_PER_DIM);
-        (ox, oy, nbx, nby)
+        let nbz = (((bbox[5] - oz) / bin_size).ceil() as u32 + 2).min(MAX_BINS_PER_DIM);
+        (ox, oy, oz, nbx, nby, nbz)
     } else {
         // First frame: compute from CPU mesh (GPU bbox not yet available)
         let mut min_x = f32::INFINITY;
         let mut min_y = f32::INFINITY;
+        let mut min_z = f32::INFINITY;
         let mut max_x = f32::NEG_INFINITY;
         let mut max_y = f32::NEG_INFINITY;
+        let mut max_z = f32::NEG_INFINITY;
         for v in 0..mesh.next_vertex {
             if mesh.vertex_idx[v] < 0 { continue; }
             min_x = min_x.min(mesh.vertex_pos[v].x);
             min_y = min_y.min(mesh.vertex_pos[v].y);
+            min_z = min_z.min(mesh.vertex_pos[v].z);
             max_x = max_x.max(mesh.vertex_pos[v].x);
             max_y = max_y.max(mesh.vertex_pos[v].y);
+            max_z = max_z.max(mesh.vertex_pos[v].z);
         }
         let ox = min_x - bin_size;
         let oy = min_y - bin_size;
+        let oz = min_z - bin_size;
         let nbx = (((max_x - ox) / bin_size).ceil() as u32 + 2).min(MAX_BINS_PER_DIM);
         let nby = (((max_y - oy) / bin_size).ceil() as u32 + 2).min(MAX_BINS_PER_DIM);
-        (ox, oy, nbx, nby)
+        let nbz = (((max_z - oz) / bin_size).ceil() as u32 + 2).min(MAX_BINS_PER_DIM);
+        (ox, oy, oz, nbx, nby, nbz)
     };
 
     let gpu_params = GpuSimParams {
@@ -313,14 +316,18 @@ fn update(app: &App, model: &mut Model) {
         dt: model.dt,
         origin_x,
         origin_y,
+        origin_z,
         bin_size,
         num_bins_x,
         num_bins_y,
+        num_bins_z,
         growth_mu: model.growth_mu,
         growth_sigma: model.growth_sigma,
         cheb_order: model.cheb_order as u32,
         repulsion_strength: model.repulsion_strength,
         state_dt: model.state_dt,
+        damping: model.damping,
+        _pad: [0.0; 3],
     };
 
     // GPU dispatch: physics + state evolution
@@ -340,15 +347,12 @@ fn update(app: &App, model: &mut Model) {
         );
     }
 
-    // Readback + topology ops only every 10/20 frames (rendering reads GPU buffers directly)
-    let needs_topology_ops = model.frame % 10 == 0;
-    if needs_topology_ops || model.frame <= 1 {
+    // Read bbox every frame so spatial hash grid stays current
+    {
         let window = app.window(model.window);
         let device = window.device();
-        let queue = window.queue();
-        let gpu = model.gpu.as_mut().unwrap();
-        let mesh = Arc::make_mut(&mut model.mesh);
-        let bbox = readback_from_gpu(&device, &queue, gpu, mesh);
+        let gpu = model.gpu.as_ref().unwrap();
+        let bbox = readback_bbox_only(&device, gpu);
         model.cached_spatial_bbox = bbox;
 
         // Update cached bounding box for render uniforms using 3D bbox from GPU
@@ -360,6 +364,17 @@ fn update(app: &App, model: &mut Model) {
             let max_radius = half_extent.length() * 1.15;
             model.cached_scale = 8.0 / max_radius.max(1.0);
         }
+    }
+
+    // Full readback + topology ops only every 10/20 frames
+    let needs_topology_ops = model.frame % 10 == 0;
+    if needs_topology_ops || model.frame <= 1 {
+        let window = app.window(model.window);
+        let device = window.device();
+        let queue = window.queue();
+        let gpu = model.gpu.as_mut().unwrap();
+        let mesh = Arc::make_mut(&mut model.mesh);
+        readback_from_gpu(&device, &queue, gpu, mesh);
 
         // Growth (every 10 frames)
         mesh::generate_new_triangles(mesh, model.split_threshold, model.split_chance);
@@ -388,7 +403,7 @@ fn update(app: &App, model: &mut Model) {
             &queue, gpu,
             model.cached_center, model.cached_scale,
             model.camera_yaw, model.camera_pitch,
-            model.zoom, model.render_mode, aspect,
+            model.zoom, model.render_mode, model.show_wireframe, aspect,
         );
     }
 
@@ -405,6 +420,9 @@ fn key_pressed(app: &App, model: &mut Model, key: KeyCode) {
     }
     if key == KeyCode::KeyM {
         model.render_mode = (model.render_mode + 1) % 2;
+    }
+    if key == KeyCode::KeyW {
+        model.show_wireframe = !model.show_wireframe;
     }
     if key == KeyCode::KeyR {
         randomize_params(model);

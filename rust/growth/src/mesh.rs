@@ -2,7 +2,7 @@ use nannou::prelude::*;
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
-pub(crate) const MAX_VERTICES: usize = 8000;
+pub(crate) const MAX_VERTICES: usize = 16000;
 pub(crate) const MAX_HALF_EDGES: usize = MAX_VERTICES * 6;
 pub(crate) const MAX_FACES: usize = MAX_VERTICES * 2;
 pub(crate) const EPSILON: f32 = 1e-6;
@@ -696,7 +696,7 @@ impl HalfEdgeMesh {
 
 // ── Growth: generate new triangles ─────────────────────────────────────────────
 
-pub(crate) fn generate_new_triangles(mesh: &mut HalfEdgeMesh, split_threshold: f32, split_chance: f32) {
+pub(crate) fn generate_new_triangles(mesh: &mut HalfEdgeMesh, split_threshold: f32, split_chance: f32) -> bool {
     // Collect vertices that want to split
     mesh.scratch_splits.clear();
 
@@ -738,8 +738,10 @@ pub(crate) fn generate_new_triangles(mesh: &mut HalfEdgeMesh, split_threshold: f
     // Need to iterate over a copy since we mutate mesh
     let splits: Vec<(usize, usize, bool, bool)> = mesh.scratch_splits.clone();
 
+    let mut hit_max = false;
     for (src, dest, he_on_boundary, twin_on_boundary) in splits {
         if mesh.active_vertex_count() >= MAX_VERTICES - 5 {
+            hit_max = true;
             break;
         }
 
@@ -754,6 +756,7 @@ pub(crate) fn generate_new_triangles(mesh: &mut HalfEdgeMesh, split_threshold: f
             mesh.add_internal_triangles(src, dest);
         }
     }
+    hit_max
 }
 
 // ── Debug validation ───────────────────────────────────────────────────────────

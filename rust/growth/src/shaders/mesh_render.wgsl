@@ -64,6 +64,7 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @loca
     let bary = in.bary;
     let state = in.state;
     let render_mode = u32(uniforms.render_mode.x);
+    let show_wireframe = uniforms.render_mode.y > 0.5;
 
     var final_color: vec3<f32>;
 
@@ -71,7 +72,7 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @loca
         // Normal map visualization
         final_color = normal * 0.5 + 0.5;
     } else {
-        // Default: lit + state color + wireframe
+        // Default: lit + state color
         let blue = vec3<f32>(0.1, 0.3, 0.9);
         let orange = vec3<f32>(1.0, 0.55, 0.1);
         let base_color = mix(blue, orange, state);
@@ -81,16 +82,24 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @loca
         let ambient = uniforms.light.w;
         let brightness = ambient + (1.0 - ambient) * n_dot_l;
 
-        let lit_color = base_color * brightness;
+        // Screen-space curvature ambient occlusion
+        let ao_strength = 8.0;
+        let dn = vec3<f32>(fwidth(normal.x), fwidth(normal.y), fwidth(normal.z));
+        let curvature = length(dn);
+        let ao = 1.0 - saturate(curvature * ao_strength);
 
-        // Wireframe
-        let edge_width = 1.5;
-        let d = min(bary.x, min(bary.y, bary.z));
-        let edge_fw = fwidth(d);
-        let edge = 1.0 - smoothstep(0.0, edge_fw * edge_width, d);
+        final_color = base_color * brightness * ao;
 
-        let wire_color = vec3<f32>(1.0, 1.0, 1.0);
-        final_color = mix(lit_color, wire_color, edge * 0.6);
+        // Wireframe overlay
+        if show_wireframe {
+            let edge_width = 1.5;
+            let d = min(bary.x, min(bary.y, bary.z));
+            let edge_fw = fwidth(d);
+            let edge = 1.0 - smoothstep(0.0, edge_fw * edge_width, d);
+
+            let wire_color = vec3<f32>(1.0, 1.0, 1.0);
+            final_color = mix(final_color, wire_color, edge * 0.6);
+        }
     }
 
     return vec4<f32>(final_color, 1.0);

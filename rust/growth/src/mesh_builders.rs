@@ -434,7 +434,7 @@ pub fn make_start_mesh(start_shape: StartShape, spring_len: f32, ico_nu: usize) 
     match start_shape {
         StartShape::Circle => make_circle(spring_len, N_RINGS, SEGMENTS_INNER),
         StartShape::Sphere => {
-            let radius = spring_len * N_RINGS as f32 * 0.5;
+            let radius = spring_len * ico_nu as f32;
             make_icosphere(radius, ico_nu)
         }
     }

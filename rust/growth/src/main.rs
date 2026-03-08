@@ -60,6 +60,7 @@ struct Model {
     show_wireframe: bool,
     start_shape: StartShape,
     ico_nu: usize,
+    hit_max_vertices: bool,
 }
 
 fn recompute_cheb_coeffs(model: &mut Model) {
@@ -164,6 +165,7 @@ fn model(app: &App) -> Model {
         show_wireframe: false,
         start_shape: StartShape::Sphere,
         ico_nu: 32,
+        hit_max_vertices: false,
     };
     randomize_params(&mut m);
     m.mesh = Arc::from(make_start_mesh(m.start_shape, m.spring_len, m.ico_nu));
@@ -211,7 +213,12 @@ fn update(app: &App, model: &mut Model) {
         ui.separator();
         ui.label("Split");
         ui.add(egui::Slider::new(&mut model.split_threshold, 0.0..=1.0).text("threshold"));
-        ui.add(egui::Slider::new(&mut model.split_chance, 0.0..=0.1).text("chance").logarithmic(true));
+        ui.add(egui::Slider::new(&mut model.split_chance, 0.001..=1.0).text("chance").logarithmic(true));
+        let n_verts = model.mesh.active_vertex_count();
+        ui.label(format!("vertices: {} / {}", n_verts, mesh::MAX_VERTICES));
+        if model.hit_max_vertices {
+            ui.colored_label(egui::Color32::YELLOW, "⚠ Max vertices reached — no more splits");
+        }
         ui.separator();
         ui.label("Physics");
         ui.add(egui::Slider::new(&mut model.elastic_constant, 0.01..=0.5).text("elastic"));
@@ -243,6 +250,7 @@ fn update(app: &App, model: &mut Model) {
     if shape_changed {
         model.mesh = Arc::from(make_start_mesh(model.start_shape, model.spring_len, model.ico_nu));
         model.frame = 0;
+        model.hit_max_vertices = false;
         model.camera_yaw = 0.0;
         model.camera_pitch = 0.0;
         model.zoom = 1.0;
@@ -377,7 +385,9 @@ fn update(app: &App, model: &mut Model) {
         readback_from_gpu(&device, &queue, gpu, mesh);
 
         // Growth (every 10 frames)
-        mesh::generate_new_triangles(mesh, model.split_threshold, model.split_chance);
+        if mesh::generate_new_triangles(mesh, model.split_threshold, model.split_chance) {
+            model.hit_max_vertices = true;
+        }
 
         // Mesh refinement (every 20 frames)
         if model.frame % 20 == 0 {
@@ -428,6 +438,7 @@ fn key_pressed(app: &App, model: &mut Model, key: KeyCode) {
         randomize_params(model);
         model.mesh = Arc::from(make_start_mesh(model.start_shape, model.spring_len, model.ico_nu));
         model.frame = 0;
+        model.hit_max_vertices = false;
         model.camera_yaw = 0.0;
         model.camera_pitch = 0.0;
         model.zoom = 1.0;
@@ -439,6 +450,7 @@ fn key_pressed(app: &App, model: &mut Model, key: KeyCode) {
     if key == KeyCode::KeyT {
         model.mesh = Arc::from(make_start_mesh(model.start_shape, model.spring_len, model.ico_nu));
         model.frame = 0;
+        model.hit_max_vertices = false;
         model.camera_yaw = 0.0;
         model.camera_pitch = 0.0;
         model.zoom = 1.0;

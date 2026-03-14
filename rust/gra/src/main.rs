@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod barnes_hut;
 mod gpu;
 mod render;
 
@@ -8,12 +9,12 @@ use std::sync::{Arc, Mutex};
 use nannou::prelude::*;
 use serde::Deserialize;
 
+use barnes_hut::{BarnesHut, brute_force_repulsion};
 use gpu::{GpuCompute, GpuSimParams, RenderUniforms, MAX_NODES,
-          create_gpu_compute, upload_topology, readback_bbox_only,
-          readback_full, update_render_uniforms, gpu_dispatch_frame};
+          create_gpu_compute, upload_topology, upload_forces, readback_bbox_and_positions,
+          readback_states, update_render_uniforms, gpu_dispatch_frame};
 use render::RenderState;
 
-const MAX_BINS_PER_DIM: u32 = 64;
 const E: f32 = 2.718281828459045;
 const MAX_CHEB_ORDER: usize = 20;
 
@@ -38,10 +39,14 @@ struct Model {
     // Cached bounding box [min_x, min_y, max_x, max_y]
     cached_bbox: [f32; 4],
 
+    // Barnes-Hut repulsion
+    bh: BarnesHut,
+    charge: f32,
+    charge_max_dist: f32,
+    theta: f32,
+    use_brute_force: bool,
+
     // Simulation params
-    repulsion_distance: f32,
-    repulsion_strength: f32,
-    far_repulsion_strength: f32,
     spring_length: f32,
     spring_stiffness: f32,
     damping: f32,
@@ -155,19 +160,21 @@ fn model(app: &App) -> Model {
         u_values: vec![0.0; node_count],
         connections,
         cached_bbox: [f32::NEG_INFINITY; 4],
-        repulsion_distance: 200.0,
-        repulsion_strength: 32.0,
-        far_repulsion_strength: 8.0,
+        bh: BarnesHut::new(),
+        charge: 3.0,
+        charge_max_dist: 2000.0,
+        theta: 0.9,
+        use_brute_force: false,
         spring_length: 25.0,
-        spring_stiffness: 0.05,
-        damping: 0.5,
+        spring_stiffness: 0.5,
+        damping: 0.1,
         max_velocity: 3.0,
         kernel_mu: 4.0,
         kernel_sigma: 1.0,
         growth_mu: random_f32(),
         growth_sigma: random_f32().max(0.1),
-        growth_threshold: 0.5 + 0.5 * random_f32(),
-        growth_prob: 0.01 + 0.09 * random_f32(),
+        growth_threshold: 0.98,
+        growth_prob: 0.01,
         state_dt: random_f32() * 0.1,
         node_radius: 6.0,
         cheb_order: 10,
@@ -184,9 +191,6 @@ fn randomize_params(model: &mut Model) {
     model.kernel_sigma = 0.5 + random_f32() * 2.0;
     model.growth_mu = random_f32();
     model.growth_sigma = 0.1 + random_f32() * 0.5;
-    model.growth_threshold = 0.5 + 0.5 * random_f32();
-    model.growth_prob = 0.01 + 0.09 * random_f32();
-    model.state_dt = random_f32() * 0.1;
 
     recompute_cheb_coeffs(model);
 }
@@ -216,15 +220,17 @@ fn update(app: &App, model: &mut Model) {
         }
         ui.separator();
         ui.label("Physics");
-        ui.add(egui::Slider::new(&mut model.repulsion_strength, 0.0..=100.0).text("repulsion"));
-        ui.add(egui::Slider::new(&mut model.repulsion_distance, 10.0..=500.0).text("repulsion dist"));
-        ui.add(egui::Slider::new(&mut model.far_repulsion_strength, 0.0..=50.0).text("far repulsion"));
+        ui.add(egui::Slider::new(&mut model.charge, 0.0..=100.0).text("charge"));
+        ui.add(egui::Slider::new(&mut model.charge_max_dist, 100.0..=5000.0).text("charge max dist"));
+        ui.add(egui::Slider::new(&mut model.theta, 0.1..=1.0).text("theta (BH accuracy)"));
+        ui.checkbox(&mut model.use_brute_force, "brute force O(N²)");
         ui.add(egui::Slider::new(&mut model.spring_stiffness, 0.001..=0.5).text("spring k"));
         ui.add(egui::Slider::new(&mut model.spring_length, 5.0..=100.0).text("spring len"));
         ui.add(egui::Slider::new(&mut model.damping, 0.01..=1.0).text("damping"));
         ui.add(egui::Slider::new(&mut model.max_velocity, 0.5..=10.0).text("max vel"));
         ui.separator();
         ui.label("R — Randomize & reset");
+        ui.label("T — Reset graph (keep params)");
         ui.label("S — Save screenshot");
     });
     drop(egui_ctx);
@@ -256,43 +262,24 @@ fn update(app: &App, model: &mut Model) {
         gpu.topology_dirty = false;
     }
 
-    // Spatial hash grid params from cached bounding box
-    let bin_size = model.repulsion_distance;
-    let bbox = model.cached_bbox;
-    let (origin_x, origin_y, num_bins_x, num_bins_y) = if bbox[0].is_finite() {
-        let ox = bbox[0] - bin_size;
-        let oy = bbox[1] - bin_size;
-        let nbx = (((bbox[2] - ox) / bin_size).ceil() as u32 + 2).min(MAX_BINS_PER_DIM);
-        let nby = (((bbox[3] - oy) / bin_size).ceil() as u32 + 2).min(MAX_BINS_PER_DIM);
-        (ox, oy, nbx, nby)
+    // CPU repulsion (BH or brute force)
+    let forces = if model.use_brute_force {
+        brute_force_repulsion(&model.positions, model.charge, model.charge_max_dist)
     } else {
-        // First frame: compute from CPU data
-        let mut min_x = f32::INFINITY;
-        let mut min_y = f32::INFINITY;
-        let mut max_x = f32::NEG_INFINITY;
-        let mut max_y = f32::NEG_INFINITY;
-        for &(x, y) in &model.positions {
-            min_x = min_x.min(x);
-            min_y = min_y.min(y);
-            max_x = max_x.max(x);
-            max_y = max_y.max(y);
-        }
-        let ox = min_x - bin_size;
-        let oy = min_y - bin_size;
-        let nbx = (((max_x - ox) / bin_size).ceil() as u32 + 2).min(MAX_BINS_PER_DIM);
-        let nby = (((max_y - oy) / bin_size).ceil() as u32 + 2).min(MAX_BINS_PER_DIM);
-        (ox, oy, nbx, nby)
+        // Jitter tree origin by up to half a leaf cell to randomize cell boundaries.
+        // This prevents the quadtree grid from imprinting on the force field.
+        let jitter_scale = model.bh.last_leaf_extent() * 0.5;
+        let jitter = (
+            random_range(-jitter_scale, jitter_scale),
+            random_range(-jitter_scale, jitter_scale),
+        );
+        model.bh.compute_repulsion(&model.positions, model.charge, model.charge_max_dist, model.theta, jitter)
     };
 
-    let fine_extent_x = num_bins_x as f32 * bin_size;
-    let fine_extent_y = num_bins_y as f32 * bin_size;
-    let coarse_bin_size = (fine_extent_x.max(fine_extent_y) / 16.0).max(1.0);
-
+    // Upload forces + dispatch GPU
     let gpu_params = GpuSimParams {
         num_nodes: model.positions.len() as u32,
         num_connections: model.connections.len() as u32,
-        repulsion_distance: model.repulsion_distance,
-        repulsion_strength: model.repulsion_strength,
         spring_length: model.spring_length,
         spring_stiffness: model.spring_stiffness,
         damping: model.damping,
@@ -301,43 +288,38 @@ fn update(app: &App, model: &mut Model) {
         growth_sigma: model.growth_sigma,
         state_dt: model.state_dt,
         cheb_order: model.cheb_order as u32,
-        origin_x,
-        origin_y,
-        bin_size,
-        num_bins_x,
-        num_bins_y,
-        far_repulsion_strength: model.far_repulsion_strength,
-        coarse_bin_size,
-        _pad: 0.0,
+        _pad0: 0.0,
+        _pad1: 0.0,
     };
 
-    // GPU dispatch
     {
         let window = app.window(model.window);
         let device = window.device();
         let queue = window.queue();
         let gpu = model.gpu.as_mut().unwrap();
+        upload_forces(&queue, gpu, &forces);
         gpu_dispatch_frame(&device, &queue, gpu, &gpu_params, model.cheb_order, &model.cheb_coeffs);
     }
 
-    // Read bbox every frame
+    // Read bbox + positions every frame (positions needed for BH tree accuracy)
     {
         let window = app.window(model.window);
         let device = window.device();
         let gpu = model.gpu.as_ref().unwrap();
-        model.cached_bbox = readback_bbox_only(&device, gpu);
+        let (bbox, positions) = readback_bbox_and_positions(&device, gpu, model.positions.len());
+        model.cached_bbox = bbox;
+        model.positions = positions;
     }
 
-    // Full readback + topology ops every 10 frames
+    // State readback + topology ops every 10 frames
     if model.frame % 10 == 0 {
         let window = app.window(model.window);
         let device = window.device();
         let queue = window.queue();
         let gpu = model.gpu.as_ref().unwrap();
-        let data = readback_full(&device, &queue, gpu, model.positions.len());
+        let data = readback_states(&device, &queue, gpu, model.positions.len());
 
         // Update CPU-side data
-        model.positions = data.positions;
         model.states = data.states;
         model.u_values = data.u_values;
 
@@ -446,6 +428,21 @@ fn key_pressed(app: &App, model: &mut Model, key: KeyCode) {
     }
     if key == KeyCode::KeyR {
         randomize_params(model);
+        let graphs = load_graphs();
+        let (positions, states, connections) = random_graph(&graphs);
+        let node_count = positions.len();
+        model.positions = positions;
+        model.states = states;
+        model.u_values = vec![0.0; node_count];
+        model.connections = connections;
+        model.cached_bbox = [f32::NEG_INFINITY; 4];
+        model.frame = 0;
+        model.hit_max_nodes = false;
+        if let Some(ref mut gpu) = model.gpu {
+            gpu.topology_dirty = true;
+        }
+    }
+    if key == KeyCode::KeyT {
         let graphs = load_graphs();
         let (positions, states, connections) = random_graph(&graphs);
         let node_count = positions.len();

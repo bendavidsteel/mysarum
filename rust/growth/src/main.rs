@@ -47,6 +47,7 @@ struct Model {
     growth_sigma: f32,
     split_threshold: f32,
     split_chance: f32,
+    max_edge_len: f32,
     cheb_order: usize,
     cheb_coeffs: [f32; 20],
     frame: u64,
@@ -153,6 +154,7 @@ fn model(app: &App) -> Model {
         growth_sigma: 0.3,
         split_threshold: 0.95,
         split_chance: 0.001,
+        max_edge_len: 45.0,
         cheb_order: 10,
         cheb_coeffs: [0.0; 20],
         frame: 0,
@@ -213,7 +215,8 @@ fn update(app: &App, model: &mut Model) {
         ui.separator();
         ui.label("Split");
         ui.add(egui::Slider::new(&mut model.split_threshold, 0.0..=1.0).text("threshold"));
-        ui.add(egui::Slider::new(&mut model.split_chance, 0.001..=1.0).text("chance").logarithmic(true));
+        ui.add(egui::Slider::new(&mut model.split_chance, 0.0..=0.1).text("chance"));
+        ui.add(egui::Slider::new(&mut model.max_edge_len, 10.0..=100.0).text("max edge len"));
         let n_verts = model.mesh.active_vertex_count();
         ui.label(format!("vertices: {} / {}", n_verts, mesh::MAX_VERTICES));
         if model.hit_max_vertices {
@@ -384,10 +387,15 @@ fn update(app: &App, model: &mut Model) {
         let mesh = Arc::make_mut(&mut model.mesh);
         readback_from_gpu(&device, &queue, gpu, mesh);
 
-        // Growth (every 10 frames)
-        if mesh::generate_new_triangles(mesh, model.split_threshold, model.split_chance) {
+        // State-based growth (every 10 frames)
+        if mesh::generate_new_triangles(mesh, model.split_threshold, model.split_chance, model.spring_len) {
             model.hit_max_vertices = true;
         }
+
+        // Split long edges
+        // if mesh::split_long_edges(mesh, model.max_edge_len) {
+        //     model.hit_max_vertices = true;
+        // }
 
         // Mesh refinement (every 20 frames)
         if model.frame % 20 == 0 {

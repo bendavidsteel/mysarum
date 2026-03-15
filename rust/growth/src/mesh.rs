@@ -2,7 +2,7 @@ use nannou::prelude::*;
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
-pub(crate) const MAX_VERTICES: usize = 16000;
+pub(crate) const MAX_VERTICES: usize = 32000;
 pub(crate) const MAX_HALF_EDGES: usize = MAX_VERTICES * 6;
 pub(crate) const MAX_FACES: usize = MAX_VERTICES * 2;
 pub(crate) const EPSILON: f32 = 1e-6;
@@ -48,28 +48,30 @@ pub(crate) struct HalfEdgeMesh {
 
 impl HalfEdgeMesh {
     pub(crate) fn new() -> Box<Self> {
-        let mut mesh = Box::new(HalfEdgeMesh {
-            face_idx: [-1; MAX_FACES],
-            face_half_edge: [-1; MAX_FACES],
-            vertex_idx: [-1; MAX_VERTICES],
-            vertex_half_edge: [-1; MAX_VERTICES],
-            vertex_pos: [Vec3::ZERO; MAX_VERTICES],
-            vertex_state: [0.0; MAX_VERTICES],
-            vertex_u: [0.0; MAX_VERTICES],
-            half_edge_idx: [-1; MAX_HALF_EDGES],
-            half_edge_twin: [-1; MAX_HALF_EDGES],
-            half_edge_dest: [-1; MAX_HALF_EDGES],
-            half_edge_face: [-1; MAX_HALF_EDGES],
-            half_edge_next: [-1; MAX_HALF_EDGES],
-            half_edge_prev: [-1; MAX_HALF_EDGES],
-            next_vertex: 0,
-            next_face: 0,
-            next_half_edge: 0,
-            num_active_vertices: 0,
-            scratch_splits: Vec::with_capacity(256),
-            scratch_edge_counts: Vec::with_capacity(MAX_VERTICES),
-            scratch_edges_to_check: Vec::with_capacity(MAX_HALF_EDGES),
-        });
+        // Allocate directly on the heap to avoid stack overflow with large arrays
+        let mut mesh: Box<Self> = unsafe {
+            let layout = std::alloc::Layout::new::<Self>();
+            let ptr = std::alloc::alloc_zeroed(layout) as *mut Self;
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            Box::from_raw(ptr)
+        };
+        // Set sentinel values for index arrays (-1 = inactive)
+        mesh.face_idx.fill(-1);
+        mesh.face_half_edge.fill(-1);
+        mesh.vertex_idx.fill(-1);
+        mesh.vertex_half_edge.fill(-1);
+        mesh.half_edge_idx.fill(-1);
+        mesh.half_edge_twin.fill(-1);
+        mesh.half_edge_dest.fill(-1);
+        mesh.half_edge_face.fill(-1);
+        mesh.half_edge_next.fill(-1);
+        mesh.half_edge_prev.fill(-1);
+        // Vec fields are zero-initialized (null ptr, 0 len/cap) — replace with real Vecs
+        mesh.scratch_splits = Vec::with_capacity(256);
+        mesh.scratch_edge_counts = Vec::with_capacity(MAX_VERTICES);
+        mesh.scratch_edges_to_check = Vec::with_capacity(MAX_HALF_EDGES);
         // initialise vertex_state with random values
         for s in mesh.vertex_state.iter_mut() {
             *s = random_f32();
@@ -694,49 +696,143 @@ impl HalfEdgeMesh {
     }
 }
 
-// ── Growth: generate new triangles ─────────────────────────────────────────────
+// ── Helper: squared edge length for a half-edge ────────────────────────────────
 
-pub(crate) fn generate_new_triangles(mesh: &mut HalfEdgeMesh, split_threshold: f32, split_chance: f32) -> bool {
-    // Collect vertices that want to split
+fn edge_length_sq(mesh: &HalfEdgeMesh, he: usize) -> f32 {
+    let twin = mesh.half_edge_twin[he];
+    if twin < 0 { return 0.0; }
+    let src = mesh.half_edge_dest[twin as usize];
+    let dst = mesh.half_edge_dest[he];
+    if src < 0 || dst < 0 { return 0.0; }
+    let d = mesh.vertex_pos[dst as usize] - mesh.vertex_pos[src as usize];
+    d.length_squared()
+}
+
+// ── Helper: is this half-edge the longest edge in its face? ─────────────────────
+
+fn is_longest_in_face(mesh: &HalfEdgeMesh, he: usize, len_sq: f32) -> bool {
+    let face = mesh.half_edge_face[he];
+    if face < 0 { return true; } // boundary half-edge, no face constraint
+    let next = mesh.half_edge_next[he] as usize;
+    let prev = mesh.half_edge_prev[he] as usize;
+    len_sq >= edge_length_sq(mesh, next) && len_sq >= edge_length_sq(mesh, prev)
+}
+
+// ── Growth: state-based splitting (Lenia growth) ────────────────────────────────
+
+pub(crate) fn generate_new_triangles(mesh: &mut HalfEdgeMesh, split_threshold: f32, split_chance: f32, spring_len: f32) -> bool {
     mesh.scratch_splits.clear();
+    let spring_len_sq = spring_len * spring_len;
 
     for v in 0..mesh.next_vertex {
-        if mesh.vertex_idx[v] < 0 {
-            continue;
-        }
-        if mesh.vertex_state[v] < split_threshold || random_f32() > split_chance {
-            continue;
-        }
+        if mesh.vertex_idx[v] < 0 { continue; }
+        if mesh.vertex_state[v] < split_threshold { continue; }
 
         let he_start = mesh.vertex_half_edge[v];
-        if he_start < 0 {
-            continue;
+        if he_start < 0 { continue; }
+
+        // Pick a random outgoing edge
+        let mut edge_count = 0u32;
+        {
+            let mut he = he_start as usize;
+            loop {
+                edge_count += 1;
+                let twin = mesh.half_edge_twin[he];
+                if twin < 0 { break; }
+                let next = mesh.half_edge_next[twin as usize];
+                if next < 0 { break; }
+                he = next as usize;
+                if he == he_start as usize { break; }
+            }
         }
-        let he = he_start as usize;
-        let dest = mesh.half_edge_dest[he];
-        if dest < 0 {
-            continue;
-        }
-        let twin = mesh.half_edge_twin[he];
-        if twin < 0 {
-            continue;
+        if edge_count == 0 { continue; }
+        let skip = (random_f32() * edge_count as f32) as u32;
+        let mut he = he_start as usize;
+        for _ in 0..skip {
+            let twin = mesh.half_edge_twin[he];
+            if twin < 0 { break; }
+            let next = mesh.half_edge_next[twin as usize];
+            if next < 0 { break; }
+            he = next as usize;
         }
 
+        let dest = mesh.half_edge_dest[he];
+        if dest < 0 { continue; }
+        let twin = mesh.half_edge_twin[he];
+        if twin < 0 { continue; }
         let src = mesh.half_edge_dest[twin as usize];
-        if src < 0 {
-            continue;
-        }
+        if src < 0 { continue; }
+
+        // Scale split probability by edge length relative to spring_len.
+        // This prevents dense regions (short edges) from accumulating
+        // ever more splits — without this, per-vertex random selection
+        // creates a rich-get-richer feedback loop.
+        let len_sq = edge_length_sq(mesh, he);
+        let len_ratio = len_sq / spring_len_sq;
+        if random_f32() > split_chance * len_ratio { continue; }
+
         let src = src as usize;
         let dest = dest as usize;
-
         let he_on_boundary = mesh.half_edge_face[he] == -1;
         let twin_on_boundary = mesh.half_edge_face[twin as usize] == -1;
 
         mesh.scratch_splits.push((src, dest, he_on_boundary, twin_on_boundary));
     }
 
-    // Need to iterate over a copy since we mutate mesh
-    let splits: Vec<(usize, usize, bool, bool)> = mesh.scratch_splits.clone();
+    do_splits(mesh)
+}
+
+// ── Growth: split edges that exceed a length threshold ──────────────────────────
+
+pub(crate) fn split_long_edges(mesh: &mut HalfEdgeMesh, max_edge_len: f32) -> bool {
+    let max_len_sq = max_edge_len * max_edge_len;
+    mesh.scratch_splits.clear();
+
+    for he in 0..mesh.next_half_edge {
+        if mesh.half_edge_idx[he] < 0 { continue; }
+
+        let twin_i = mesh.half_edge_twin[he];
+        if twin_i < 0 { continue; }
+        let twin = twin_i as usize;
+
+        let dst = mesh.half_edge_dest[he];
+        let src = mesh.half_edge_dest[twin];
+        if src < 0 || dst < 0 { continue; }
+        // Deduplicate: only process each edge once
+        if src >= dst { continue; }
+
+        let len_sq = edge_length_sq(mesh, he);
+        if len_sq < max_len_sq { continue; }
+
+        // Only split if it's the longest edge in its adjacent triangle(s)
+        if !is_longest_in_face(mesh, he, len_sq) { continue; }
+        if mesh.half_edge_face[twin] >= 0 && !is_longest_in_face(mesh, twin, len_sq) { continue; }
+
+        let src = src as usize;
+        let dst = dst as usize;
+        let he_on_boundary = mesh.half_edge_face[he] == -1;
+        let twin_on_boundary = mesh.half_edge_face[twin] == -1;
+
+        mesh.scratch_splits.push((src, dst, he_on_boundary, twin_on_boundary));
+    }
+
+    do_splits(mesh)
+}
+
+// ── Shared: execute collected splits ────────────────────────────────────────────
+
+fn do_splits(mesh: &mut HalfEdgeMesh) -> bool {
+    let mut splits: Vec<(usize, usize, bool, bool)> = mesh.scratch_splits.clone();
+
+    // Shuffle to avoid systematic bias toward low-indexed vertices.
+    // Without this, splits are always processed in vertex index order,
+    // so the same spatial region (where low indices cluster) consistently
+    // gets its splits executed first while later splits fail due to
+    // topology changes from earlier ones.
+    for i in (1..splits.len()).rev() {
+        let j = (random_f32() * (i + 1) as f32) as usize;
+        splits.swap(i, j.min(i));
+    }
 
     let mut hit_max = false;
     for (src, dest, he_on_boundary, twin_on_boundary) in splits {
@@ -746,7 +842,6 @@ pub(crate) fn generate_new_triangles(mesh: &mut HalfEdgeMesh, split_threshold: f
         }
 
         if he_on_boundary || twin_on_boundary {
-            // Boundary split
             if twin_on_boundary {
                 mesh.add_internal_edge_triangle(src, dest);
             } else {

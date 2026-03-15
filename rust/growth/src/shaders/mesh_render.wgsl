@@ -83,7 +83,7 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @loca
         let brightness = ambient + (1.0 - ambient) * n_dot_l;
 
         // Screen-space curvature ambient occlusion
-        let ao_strength = 8.0;
+        let ao_strength = 16.0;
         let dn = vec3<f32>(fwidth(normal.x), fwidth(normal.y), fwidth(normal.z));
         let curvature = length(dn);
         let ao = 1.0 - saturate(curvature * ao_strength);

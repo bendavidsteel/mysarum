@@ -1,0 +1,19 @@
+[package]
+name = "pond"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nannou = { path = "/home/ben/Projects/personal/repos/nannou/nannou", features = ["egui"] }
+nannou_audio = { path = "/home/ben/Projects/personal/repos/nannou/nannou_audio" }
+bytemuck = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ringbuf = "0.4"
+crossbeam-channel = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

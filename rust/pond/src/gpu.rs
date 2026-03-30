@@ -132,6 +132,10 @@ pub(crate) struct ModalAudioParams {
     pub(crate) current_x: [f32; 2],
     pub(crate) current_y: [f32; 2],
     pub(crate) max_speed: f32,
+    pub(crate) g_bin_size: f32,
+    pub(crate) g_num_bins_x: u32,
+    pub(crate) g_num_bins_y: u32,
+    pub(crate) world_half: f32,
     pub(crate) _pad0: u32,
     pub(crate) _pad1: u32,
     pub(crate) _pad2: u32,
@@ -211,8 +215,9 @@ pub(crate) struct GpuCompute {
     pub(crate) audio_params_buf: wgpu::Buffer,
     pub(crate) render_uniform_buf: wgpu::Buffer,
 
-    // ── GRA readback ──
-    pub(crate) gra_pos_readback_buf: wgpu::Buffer,
+    // ── GRA readback (double-buffered) ──
+    pub(crate) gra_pos_readback_bufs: [wgpu::Buffer; 2],
+    pub(crate) gra_readback_frame: usize,
     pub(crate) bbox_atomic_buf: wgpu::Buffer,
     pub(crate) bbox_readback_buf: wgpu::Buffer,
 
@@ -402,11 +407,17 @@ pub(crate) fn create_gpu_compute(
         label: Some("render_uniforms"), size: std::mem::size_of::<RenderUniforms>() as u64, usage: uniform, mapped_at_creation: false,
     });
 
-    // GRA readback
-    let gra_pos_readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("gra_pos_readback"), size: gra_vec4_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
-    });
+    // GRA readback (double-buffered)
+    let gra_pos_readback_bufs = [
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gra_pos_readback_0"), size: gra_vec4_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+        }),
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gra_pos_readback_1"), size: gra_vec4_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+        }),
+    ];
     let bbox_atomic_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("bbox_atomic"), size: 16, usage: storage_rw, mapped_at_creation: false,
     });
@@ -669,9 +680,10 @@ pub(crate) fn create_gpu_compute(
         .uniform_buffer(cs, false)  // ck_hi
         .build(device);
 
-    // Modal audio: gra_pos(R) + gra_vel(R) + modal_amp(R) + modal_phase(R) + audio_out(RW) + params(U) + freqs(U)
+    // Modal audio: gra_sorted_pos(R) + g_bin_offset(R) + gra_vel(R) + modal_amp(R) + modal_phase(R) + audio_out(RW) + params(U) + freqs(U)
     let modal_audio_layout = wgpu::BindGroupLayoutBuilder::new()
-        .storage_buffer(cs, false, true)   // gra_pos
+        .storage_buffer(cs, false, true)   // gra_sorted_pos
+        .storage_buffer(cs, false, true)   // g_bin_offset
         .storage_buffer(cs, false, true)   // gra_vel
         .storage_buffer(cs, false, true)   // modal_amp
         .storage_buffer(cs, false, true)   // modal_phase
@@ -1018,7 +1030,8 @@ pub(crate) fn create_gpu_compute(
 
     // Modal audio bind group
     let modal_audio_bg = wgpu::BindGroupBuilder::new()
-        .buffer_bytes(&gra_pos_buf, 0, None)
+        .buffer_bytes(&gra_sorted_pos_buf, 0, None)
+        .buffer_bytes(&g_bin_offset_buf, 0, None)
         .buffer_bytes(&gra_vel_buf, 0, None)
         .buffer_bytes(&modal_amp_buf, 0, None)
         .buffer_bytes(&modal_phase_buf, 0, None)
@@ -1042,7 +1055,8 @@ pub(crate) fn create_gpu_compute(
         adj_offset_buf, adj_list_buf, connection_buf,
         gra_sorted_pos_buf, g_bin_size_buf, g_bin_offset_buf, g_num_bins: g_num_bins + 1,
         sim_params_buf, audio_params_buf, render_uniform_buf,
-        gra_pos_readback_buf, bbox_atomic_buf, bbox_readback_buf,
+        gra_pos_readback_bufs, gra_readback_frame: 0,
+        bbox_atomic_buf, bbox_readback_buf,
         audio_out_buf, audio_staging_bufs,
         particle_sim_pipeline, p_clear_bins_pipeline, p_fill_bins_pipeline,
         p_prefix_sum_pipeline, p_sort_clear_pipeline, p_sort_pipeline,
@@ -1337,6 +1351,7 @@ pub(crate) fn dispatch_particle_sim(
 pub(crate) fn dispatch_gra_physics(
     encoder: &mut wgpu::CommandEncoder,
     gpu: &GpuCompute,
+    readback_idx: usize,
 ) {
     let n = gpu.num_gra_nodes;
 
@@ -1385,7 +1400,7 @@ pub(crate) fn dispatch_gra_physics(
     // Copy for readback
     encoder.copy_buffer_to_buffer(&gpu.bbox_atomic_buf, 0, &gpu.bbox_readback_buf, 0, 16);
     let pos_copy_size = (n as u64) * 16;
-    encoder.copy_buffer_to_buffer(&gpu.gra_pos_buf, 0, &gpu.gra_pos_readback_buf, 0, pos_copy_size);
+    encoder.copy_buffer_to_buffer(&gpu.gra_pos_buf, 0, &gpu.gra_pos_readback_bufs[readback_idx], 0, pos_copy_size);
 }
 
 // ── Dispatch: audio ──────────────────────────────────────────────────────────
@@ -1527,16 +1542,17 @@ pub(crate) fn encode_modal_audio_pass(
 
 // ── Readback ─────────────────────────────────────────────────────────────────
 
-pub(crate) fn readback_gra_positions(device: &wgpu::Device, gpu: &GpuCompute, num_nodes: usize) -> Vec<(f32, f32)> {
+pub(crate) fn readback_gra_positions(device: &wgpu::Device, gpu: &GpuCompute, num_nodes: usize, readback_idx: usize) -> Vec<(f32, f32)> {
     let pos_size = (num_nodes * 16) as u64;
-    let slice = gpu.gra_pos_readback_buf.slice(..pos_size);
+    let buf = &gpu.gra_pos_readback_bufs[readback_idx];
+    let slice = buf.slice(..pos_size);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     device.poll(wgpu::PollType::Wait).unwrap();
     let data = slice.get_mapped_range();
     let floats: &[[f32; 4]] = bytemuck::cast_slice(&data);
     let positions: Vec<(f32, f32)> = floats[..num_nodes].iter().map(|f| (f[0], f[1])).collect();
     drop(data);
-    gpu.gra_pos_readback_buf.unmap();
+    buf.unmap();
     positions
 }
 

@@ -34,5 +34,5 @@ fn sort_nodes(@builtin(global_invocation_id) id: vec3<u32>) {
     );
     let slot = atomicAdd(&bin_size[binIndex], 1u);
     let newIndex = bin_offset[binIndex] + slot;
-    gra_sorted_pos[newIndex] = node;
+    gra_sorted_pos[newIndex] = vec4(node.xy, f32(id.x), node.w);
 }

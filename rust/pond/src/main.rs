@@ -302,6 +302,8 @@ pub(crate) struct Model {
     frame: u64,
     hit_max_nodes: bool,
     time: f32,
+    gra_readback_pending: bool,
+    gra_readback_count: usize, // node count when readback was submitted
 
     // Camera
     zoom: f32,
@@ -442,6 +444,7 @@ fn cull_inviable_trials(model: &mut Model) -> bool {
     if let Some(ref mut gpu) = model.gpu {
         gpu.topology_dirty = true;
     }
+    model.gra_readback_pending = false; // topology changed, stale readback
     true
 }
 
@@ -596,6 +599,8 @@ fn model(app: &App) -> Model {
         frame: 0,
         hit_max_nodes: false,
         time: 0.0,
+        gra_readback_pending: false,
+        gra_readback_count: 0,
 
         zoom: 1.0,
         pan: Vec2::ZERO,
@@ -768,6 +773,21 @@ fn update(app: &App, model: &mut Model) {
 
     // ── GRA: CPU Barnes-Hut repulsion ────────────────────────────────────
     if !model.gra_positions.is_empty() {
+        let window = app.window(model.window);
+        let device = window.device();
+        let queue = window.queue();
+        let gpu = model.gpu.as_mut().unwrap();
+
+        // Read back PREVIOUS frame's positions (async double-buffered)
+        // Only apply if topology hasn't changed (node count must match)
+        if model.gra_readback_pending && model.gra_readback_count == model.gra_positions.len() {
+            let read_idx = gpu.gra_readback_frame;
+            let positions = readback_gra_positions(&device, gpu, model.gra_readback_count, read_idx);
+            model.gra_positions = positions.into_iter()
+                .map(|(x, y)| wrap_pos(x, y))
+                .collect();
+        }
+
         let jitter_scale = model.bh.last_leaf_extent() * 0.5;
         let jitter = (
             random_range(-jitter_scale, jitter_scale),
@@ -778,26 +798,22 @@ fn update(app: &App, model: &mut Model) {
             model.gra_theta, jitter, model.gra_charge_epsilon, WORLD_HALF,
         );
 
-        let window = app.window(model.window);
-        let device = window.device();
-        let queue = window.queue();
-        let gpu = model.gpu.as_mut().unwrap();
-
         upload_gra_forces(&queue, gpu, &forces);
         update_sim_params(&queue, gpu, &sim_params);
 
         // GPU: GRA spring forces + integrate + bbox
+        // Write to the OTHER readback buffer (flip index)
+        let write_idx = 1 - gpu.gra_readback_frame;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("gra_physics_encoder"),
         });
-        dispatch_gra_physics(&mut encoder, gpu);
+        dispatch_gra_physics(&mut encoder, gpu, write_idx);
         queue.submit(Some(encoder.finish()));
 
-        // Readback GRA positions
-        let positions = readback_gra_positions(&device, gpu, model.gra_positions.len());
-        model.gra_positions = positions.into_iter()
-            .map(|(x, y)| wrap_pos(x, y))
-            .collect();
+        // Next frame will read from the buffer we just wrote to
+        gpu.gra_readback_frame = write_idx;
+        model.gra_readback_pending = true;
+        model.gra_readback_count = model.gra_positions.len();
     } else {
         let window = app.window(model.window);
         let queue = window.queue();
@@ -898,6 +914,10 @@ fn update(app: &App, model: &mut Model) {
                 current_x: [cx - hw, cx + hw],
                 current_y: [cy - hh, cy + hh],
                 max_speed: model.gra_max_velocity,
+                g_bin_size: G_BIN_SIZE,
+                g_num_bins_x: g_bins_x,
+                g_num_bins_y: g_bins_y,
+                world_half: WORLD_HALF,
                 _pad0: 0, _pad1: 0, _pad2: 0,
             };
 
@@ -1027,11 +1047,21 @@ fn update(app: &App, model: &mut Model) {
                     if conn.0 > conn.1 { std::mem::swap(&mut conn.0, &mut conn.1); }
                 }
                 model.gra_connections.retain(|&(a, b)| a != b);
-                model.gra_connections.sort();
-                model.gra_connections.dedup();
 
                 to_remove.sort();
                 to_remove.dedup();
+                let removed_set: HashSet<usize> = to_remove.iter().copied().collect();
+
+                // Remove connections involving removed nodes before remapping indices
+                model.gra_connections.retain(|&(a, b)| {
+                    !removed_set.contains(&a) && !removed_set.contains(&b)
+                });
+
+                // Track where each original index ends up after all swap_removes
+                let old_len = model.gra_positions.len();
+                let mut pos_of: Vec<usize> = (0..old_len).collect();
+                let mut elem_at: Vec<usize> = (0..old_len).collect();
+
                 for &idx in to_remove.iter().rev() {
                     let last = model.gra_positions.len() - 1;
                     model.gra_positions.swap_remove(idx);
@@ -1040,18 +1070,24 @@ fn update(app: &App, model: &mut Model) {
                     model.gra_trial_ids.swap_remove(idx);
 
                     if idx < last {
-                        for conn in model.gra_connections.iter_mut() {
-                            if conn.0 == last { conn.0 = idx; }
-                            if conn.1 == last { conn.1 = idx; }
-                        }
+                        let moved_elem = elem_at[last];
+                        pos_of[moved_elem] = idx;
+                        elem_at[idx] = moved_elem;
                     }
-                    // Re-canonicalize after index remap
-                    for conn in model.gra_connections.iter_mut() {
-                        if conn.0 > conn.1 { std::mem::swap(&mut conn.0, &mut conn.1); }
-                    }
-                    let new_len = model.gra_positions.len();
-                    model.gra_connections.retain(|&(a, b)| a < new_len && b < new_len && a != b);
                 }
+
+                // Apply remap to connections in a single pass
+                for conn in model.gra_connections.iter_mut() {
+                    conn.0 = pos_of[conn.0];
+                    conn.1 = pos_of[conn.1];
+                }
+
+                // Single final canonicalize
+                let new_len = model.gra_positions.len();
+                for conn in model.gra_connections.iter_mut() {
+                    if conn.0 > conn.1 { std::mem::swap(&mut conn.0, &mut conn.1); }
+                }
+                model.gra_connections.retain(|&(a, b)| a < new_len && b < new_len && a != b);
                 model.gra_connections.sort();
                 model.gra_connections.dedup();
             }
@@ -1119,6 +1155,7 @@ fn update(app: &App, model: &mut Model) {
             }
 
             if !to_remove.is_empty() || !new_nodes.is_empty() {
+                model.gra_readback_pending = false; // topology changed, stale readback
                 let window = app.window(model.window);
                 let queue = window.queue();
                 let gpu = model.gpu.as_mut().unwrap();
@@ -1147,6 +1184,7 @@ fn update(app: &App, model: &mut Model) {
             if let Some(ref mut gpu) = model.gpu {
                 gpu.topology_dirty = true;
             }
+            model.gra_readback_pending = false; // topology changed, stale readback
         }
     }
 

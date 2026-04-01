@@ -52,9 +52,11 @@ struct SimParams {
     gra_repulsion_radius: f32,
     gra_repulsion_strength: f32,
 
+    // Pre-computed friction: pow(0.5, dt / particle_friction)
+    particle_friction_mu: f32,
+
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 }
 
 struct AudioParams {
@@ -68,16 +70,21 @@ struct AudioParams {
     max_speed: f32,
     energy_scale: f32,
     gra_max_speed: f32,
-    num_gra_states: u32,
     // particle bin info for spatial audio
     p_map_x0: f32,
     p_map_y0: f32,
     p_bin_size: f32,
     p_num_bins_x: u32,
     p_num_bins_y: u32,
+    // GRA bin info for spatial audio
+    g_bin_size: f32,
+    g_num_bins_x: u32,
+    g_num_bins_y: u32,
+    world_half_audio: f32,
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+    _pad3: u32,
 }
 
 struct RenderUniforms {
@@ -141,7 +148,7 @@ fn normalize_energy(energy: f32, energy_scale: f32) -> f32 {
 
 fn particle_frequency(p: Particle, t: f32, energy_scale: f32) -> f32 {
     let energy_normalized = -1.0 * normalize_energy(p.energy, energy_scale) + 1.0;
-    let base_freq = 80.0 + energy_normalized * 50.0;
+    let base_freq = 80.0 + pow(energy_normalized, 3.0) * 200.0;
     let mod1 = smoothstep(0.0, 1.0, p.species.x);
     let mod2 = smoothstep(0.0, 1.0, p.species.y);
     let mod3 = smoothstep(0.0, 1.0, -p.species.x);
@@ -163,11 +170,22 @@ fn particle_phase(p: Particle, t: f32, energy_scale: f32) -> f32 {
     return p.phase + TAU * freq * t;
 }
 
+// E: Species-driven AM — magnitude controls rate, species.y controls attack shape
 fn particle_amp_phase(p: Particle, t: f32, energy_scale: f32) -> f32 {
     let energy_normalized = (1.0 - normalize_energy(p.energy, energy_scale)) * 0.5;
-    var lfo_freq = 0.005 + energy_normalized * (0.1 * p.interaction.x + 0.2 * sin(TAU * p.interaction.y * 0.1));
-    lfo_freq = min(lfo_freq, 5.0);
+    let mag = length(p.species);
+    var lfo_freq = 0.1 + mag * 4.0;  // 0.1–~4 Hz based on species magnitude
+    lfo_freq += energy_normalized * 0.5;
+    lfo_freq = min(lfo_freq, 8.0);
     return p.amp_phase + TAU * lfo_freq * t;
+}
+
+// E: Shaped AM envelope — species.y controls sharpness (soft pulse ↔ percussive)
+fn particle_amp_envelope(p: Particle, amp_phase: f32) -> f32 {
+    let sharpness = 1.0 + smoothstep(0.0, 1.0, p.species.y) * 4.0; // exponent 1–5
+    let raw = sin(amp_phase);
+    let shaped = pow(abs(raw), 1.0 / sharpness) * sign(raw);
+    return 0.2 + 0.8 * shaped;
 }
 
 // ── Audio helpers (GRA node) ─────────────────────────────────────────────────

@@ -39,12 +39,10 @@ const PARTICLE_SORT_WGSL: &str = shader_with_common!("shaders/particle_sort.wgsl
 const GRA_SORT_WGSL: &str = shader_with_common!("shaders/gra_sort.wgsl");
 const AUDIO_WGSL: &str = shader_with_common!("shaders/audio.wgsl");
 const PHASE_UPDATE_WGSL: &str = shader_with_common!("shaders/phase_update.wgsl");
-const GRA_PHASE_UPDATE_WGSL: &str = shader_with_common!("shaders/gra_phase_update.wgsl");
 const BBOX_WGSL: &str = shader_with_common!("shaders/bbox.wgsl");
 const MODAL_CHEB_INIT_WGSL: &str = shader_with_common!("shaders/modal_cheb_init.wgsl");
 const MODAL_CHEB_STEP_WGSL: &str = shader_with_common!("shaders/modal_cheb_step.wgsl");
-const MODAL_AUDIO_WGSL: &str = include_str!("shaders/modal_audio.wgsl");
-const MODAL_PHASE_UPDATE_WGSL: &str = include_str!("shaders/modal_phase_update.wgsl");
+const MODAL_PHASE_UPDATE_WGSL: &str = shader_with_common!("shaders/modal_phase_update.wgsl");
 
 // ── GPU data types ───────────────────────────────────────────────────────────
 
@@ -92,9 +90,9 @@ pub(crate) struct SimParams {
     pub(crate) g_num_bins_y: u32,
     pub(crate) gra_repulsion_radius: f32,
     pub(crate) gra_repulsion_strength: f32,
+    pub(crate) particle_friction_mu: f32,
     pub(crate) _pad0: u32,
     pub(crate) _pad1: u32,
-    pub(crate) _pad2: u32,
 }
 
 #[repr(C)]
@@ -111,27 +109,11 @@ pub(crate) struct AudioParams {
     pub(crate) max_speed: f32,
     pub(crate) energy_scale: f32,
     pub(crate) gra_max_speed: f32,
-    pub(crate) num_gra_states: u32,
     pub(crate) p_map_x0: f32,
     pub(crate) p_map_y0: f32,
     pub(crate) p_bin_size: f32,
     pub(crate) p_num_bins_x: u32,
     pub(crate) p_num_bins_y: u32,
-    pub(crate) _pad0: u32,
-    pub(crate) _pad1: u32,
-    pub(crate) _pad2: u32,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Pod, Zeroable)]
-pub(crate) struct ModalAudioParams {
-    pub(crate) sample_rate: f32,
-    pub(crate) num_gra_nodes: u32,
-    pub(crate) chunk_size: u32,
-    pub(crate) volume: f32,
-    pub(crate) current_x: [f32; 2],
-    pub(crate) current_y: [f32; 2],
-    pub(crate) max_speed: f32,
     pub(crate) g_bin_size: f32,
     pub(crate) g_num_bins_x: u32,
     pub(crate) g_num_bins_y: u32,
@@ -139,6 +121,7 @@ pub(crate) struct ModalAudioParams {
     pub(crate) _pad0: u32,
     pub(crate) _pad1: u32,
     pub(crate) _pad2: u32,
+    pub(crate) _pad3: u32, // struct alignment padding (vec2 → 8-byte aligned, total must be multiple of 8)
 }
 
 #[repr(C)]
@@ -199,7 +182,6 @@ pub(crate) struct GpuCompute {
     pub(crate) gra_vel_buf: wgpu::Buffer,
     pub(crate) gra_force_buf: wgpu::Buffer,
     pub(crate) gra_state_buf: wgpu::Buffer,
-    pub(crate) gra_audio_buf: wgpu::Buffer,
     pub(crate) adj_offset_buf: wgpu::Buffer,
     pub(crate) adj_list_buf: wgpu::Buffer,
     pub(crate) connection_buf: wgpu::Buffer,
@@ -245,16 +227,15 @@ pub(crate) struct GpuCompute {
     bbox_clear_pipeline: wgpu::ComputePipeline,
     bbox_reduce_pipeline: wgpu::ComputePipeline,
 
-    // Audio (particle - kept for particle synthesis)
+    // Audio (combined particle + GRA modal)
     audio_pipeline: wgpu::ComputePipeline,
     particle_phase_pipeline: wgpu::ComputePipeline,
-    gra_phase_pipeline: wgpu::ComputePipeline,
+    modal_phase_update_pipeline: wgpu::ComputePipeline,
 
-    // Modal synthesis (GRA)
+    // Modal synthesis buffers (Chebyshev decomposition)
     pub(crate) modal_amp_buf: wgpu::Buffer,
     pub(crate) modal_phase_buf: wgpu::Buffer,
     pub(crate) modal_freq_buf: wgpu::Buffer,
-    pub(crate) modal_audio_params_buf: wgpu::Buffer,
     modal_coeff_lo_bufs: Vec<wgpu::Buffer>,
     modal_coeff_hi_bufs: Vec<wgpu::Buffer>,
     cheb_a_buf: wgpu::Buffer,
@@ -262,9 +243,6 @@ pub(crate) struct GpuCompute {
     cheb_c_buf: wgpu::Buffer,
     modal_cheb_init_pipeline: wgpu::ComputePipeline,
     modal_cheb_step_pipeline: wgpu::ComputePipeline,
-    modal_audio_pipeline: wgpu::ComputePipeline,
-    modal_phase_update_pipeline: wgpu::ComputePipeline,
-    pub(crate) modal_audio_out_buf: wgpu::Buffer,
 
     // ── Bind groups ──
     // Particle sim (2 variants for ping-pong)
@@ -300,15 +278,13 @@ pub(crate) struct GpuCompute {
     // Audio (2 variants for ping-pong particle buffer)
     audio_bgs: [wgpu::BindGroup; 2],
     particle_phase_bgs: [wgpu::BindGroup; 2],
-    gra_phase_bg: wgpu::BindGroup,
+    modal_phase_update_bg: wgpu::BindGroup,
 
-    // Modal bind groups
+    // Chebyshev decomposition bind groups
     modal_cheb_init_data_bg: wgpu::BindGroup,
     modal_cheb_init_params_bg: wgpu::BindGroup,
     modal_cheb_step_data_bgs: [wgpu::BindGroup; 3],
     modal_cheb_step_params_bgs: Vec<wgpu::BindGroup>,
-    modal_audio_bg: wgpu::BindGroup,
-    modal_phase_update_bg: wgpu::BindGroup,
 
     // Config
     pub(crate) topology_dirty: bool,
@@ -368,9 +344,6 @@ pub(crate) fn create_gpu_compute(
     });
     let gra_state_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("gra_state"), size: gra_vec4_size, usage: storage_rw, mapped_at_creation: false,
-    });
-    let gra_audio_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("gra_audio"), size: gra_vec4_size, usage: storage_rw, mapped_at_creation: false,
     });
     let adj_offset_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("adj_offset"), size: adj_offset_size, usage: storage_r, mapped_at_creation: false,
@@ -455,12 +428,6 @@ pub(crate) fn create_gpu_compute(
         usage: uniform,
         mapped_at_creation: false,
     });
-    let modal_audio_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("modal_audio_params"),
-        size: std::mem::size_of::<ModalAudioParams>() as u64,
-        usage: uniform,
-        mapped_at_creation: false,
-    });
     let modal_coeff_lo_bufs: Vec<wgpu::Buffer> = (0..MAX_CHEB_ORDER)
         .map(|i| device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(&format!("modal_coeff_lo_{}", i)),
@@ -484,11 +451,6 @@ pub(crate) fn create_gpu_compute(
     let cheb_c_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("cheb_c"), size: cheb_node_buf_size, usage: storage_rw, mapped_at_creation: false,
     });
-    let modal_audio_out_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("modal_audio_out"), size: audio_buf_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false,
-    });
-
     // ── Shader modules ───────────────────────────────────────────────────────
     let cs = wgpu::ShaderStages::COMPUTE;
 
@@ -522,9 +484,6 @@ pub(crate) fn create_gpu_compute(
     let phase_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("phase_update"), source: wgpu::ShaderSource::Wgsl(PHASE_UPDATE_WGSL.into()),
     });
-    let gra_phase_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("gra_phase_update"), source: wgpu::ShaderSource::Wgsl(GRA_PHASE_UPDATE_WGSL.into()),
-    });
     let bbox_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("bbox"), source: wgpu::ShaderSource::Wgsl(BBOX_WGSL.into()),
     });
@@ -533,9 +492,6 @@ pub(crate) fn create_gpu_compute(
     });
     let modal_cheb_step_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("modal_cheb_step"), source: wgpu::ShaderSource::Wgsl(MODAL_CHEB_STEP_WGSL.into()),
-    });
-    let modal_audio_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("modal_audio"), source: wgpu::ShaderSource::Wgsl(MODAL_AUDIO_WGSL.into()),
     });
     let modal_phase_update_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("modal_phase_update"), source: wgpu::ShaderSource::Wgsl(MODAL_PHASE_UPDATE_WGSL.into()),
@@ -618,29 +574,24 @@ pub(crate) fn create_gpu_compute(
         .storage_buffer(cs, false, false)  // bbox_atomic
         .build(device);
 
-    // Audio: particles(R) + p_bin_offset(R) + gra_pos(R) + gra_vel(R) + gra_state(R) + gra_audio(R) + audio_out(RW) + params(U)
+    // Audio: particles(R) + p_bin_offset(R) + gra_sorted_pos(R) + g_bin_offset(R) + gra_vel(R) + modal_amp(R) + modal_phase(R) + audio_out(RW) + params(U) + freqs(U)
     let audio_layout = wgpu::BindGroupLayoutBuilder::new()
         .storage_buffer(cs, false, true)   // particles
         .storage_buffer(cs, false, true)   // p_bin_offset
-        .storage_buffer(cs, false, true)   // gra_pos
+        .storage_buffer(cs, false, true)   // gra_sorted_pos
+        .storage_buffer(cs, false, true)   // g_bin_offset
         .storage_buffer(cs, false, true)   // gra_vel
-        .storage_buffer(cs, false, true)   // gra_state
-        .storage_buffer(cs, false, true)   // gra_audio
+        .storage_buffer(cs, false, true)   // modal_amp
+        .storage_buffer(cs, false, true)   // modal_phase
         .storage_buffer(cs, false, false)  // audio_out
         .uniform_buffer(cs, false)         // audio_params
+        .uniform_buffer(cs, false)         // modal_freqs
+        .storage_buffer(cs, false, true)   // gra_state (for freq_scale in .w)
         .build(device);
 
     // Particle phase: particles(RW) + audio_params(U)
     let particle_phase_layout = wgpu::BindGroupLayoutBuilder::new()
         .storage_buffer(cs, false, false)  // particles
-        .uniform_buffer(cs, false)         // audio_params
-        .build(device);
-
-    // GRA phase: gra_audio(RW) + gra_state(R) + gra_vel(R) + audio_params(U)
-    let gra_phase_layout = wgpu::BindGroupLayoutBuilder::new()
-        .storage_buffer(cs, false, false)  // gra_audio
-        .storage_buffer(cs, false, true)   // gra_state
-        .storage_buffer(cs, false, true)   // gra_vel
         .uniform_buffer(cs, false)         // audio_params
         .build(device);
 
@@ -680,23 +631,12 @@ pub(crate) fn create_gpu_compute(
         .uniform_buffer(cs, false)  // ck_hi
         .build(device);
 
-    // Modal audio: gra_sorted_pos(R) + g_bin_offset(R) + gra_vel(R) + modal_amp(R) + modal_phase(R) + audio_out(RW) + params(U) + freqs(U)
-    let modal_audio_layout = wgpu::BindGroupLayoutBuilder::new()
-        .storage_buffer(cs, false, true)   // gra_sorted_pos
-        .storage_buffer(cs, false, true)   // g_bin_offset
-        .storage_buffer(cs, false, true)   // gra_vel
-        .storage_buffer(cs, false, true)   // modal_amp
-        .storage_buffer(cs, false, true)   // modal_phase
-        .storage_buffer(cs, false, false)  // modal_audio_out
-        .uniform_buffer(cs, false)         // modal_audio_params
-        .uniform_buffer(cs, false)         // modal_freqs
-        .build(device);
-
-    // Modal phase update: modal_phase(RW) + params(U) + freqs(U)
+    // Modal phase update: modal_phase(RW) + audio_params(U) + freqs(U)
     let modal_phase_update_layout = wgpu::BindGroupLayoutBuilder::new()
         .storage_buffer(cs, false, false)  // modal_phase
-        .uniform_buffer(cs, false)         // modal_audio_params
+        .uniform_buffer(cs, false)         // audio_params
         .uniform_buffer(cs, false)         // modal_freqs
+        .storage_buffer(cs, false, true)   // gra_state (for freq_scale in .w)
         .build(device);
 
     // ── Pipeline layouts ─────────────────────────────────────────────────────
@@ -767,12 +707,6 @@ pub(crate) fn create_gpu_compute(
         push_constant_ranges: &[],
     });
 
-    let gra_phase_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("gra_phase_pl"),
-        bind_group_layouts: &[&gra_phase_layout],
-        push_constant_ranges: &[],
-    });
-
     let modal_cheb_init_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("modal_cheb_init_pl"),
         bind_group_layouts: &[&modal_cheb_init_data_layout, &modal_init_params_layout],
@@ -781,11 +715,6 @@ pub(crate) fn create_gpu_compute(
     let modal_cheb_step_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("modal_cheb_step_pl"),
         bind_group_layouts: &[&modal_cheb_step_data_layout, &modal_step_params_layout],
-        push_constant_ranges: &[],
-    });
-    let modal_audio_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("modal_audio_pl"),
-        bind_group_layouts: &[&modal_audio_layout],
         push_constant_ranges: &[],
     });
     let modal_phase_update_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -826,11 +755,9 @@ pub(crate) fn create_gpu_compute(
 
     let audio_pipeline = make("audio", &audio_pl, &audio_shader, "main");
     let particle_phase_pipeline = make("particle_phase", &particle_phase_pl, &phase_shader, "update_particle_phase");
-    let gra_phase_pipeline = make("gra_phase", &gra_phase_pl, &gra_phase_shader, "update_gra_phase");
 
     let modal_cheb_init_pipeline = make("modal_cheb_init", &modal_cheb_init_pl, &modal_cheb_init_shader, "main");
     let modal_cheb_step_pipeline = make("modal_cheb_step", &modal_cheb_step_pl, &modal_cheb_step_shader, "main");
-    let modal_audio_pipeline = make("modal_audio", &modal_audio_pl_layout, &modal_audio_shader, "main");
     let modal_phase_update_pipeline = make("modal_phase_update", &modal_phase_update_pl_layout, &modal_phase_update_shader, "main");
 
     // ── Bind groups ──────────────────────────────────────────────────────────
@@ -939,17 +866,20 @@ pub(crate) fn create_gpu_compute(
         .buffer_bytes(&sim_params_buf, 0, None)
         .build(device, &params_layout);
 
-    // Audio (ping-pong for particle buffer)
+    // Audio (ping-pong for particle buffer, combined particle + GRA modal)
     let audio_bgs = [0, 1].map(|i| {
         wgpu::BindGroupBuilder::new()
             .buffer_bytes(&particle_bufs[i], 0, None)
             .buffer_bytes(&p_bin_offset_buf, 0, None)
-            .buffer_bytes(&gra_pos_buf, 0, None)
+            .buffer_bytes(&gra_sorted_pos_buf, 0, None)
+            .buffer_bytes(&g_bin_offset_buf, 0, None)
             .buffer_bytes(&gra_vel_buf, 0, None)
-            .buffer_bytes(&gra_state_buf, 0, None)
-            .buffer_bytes(&gra_audio_buf, 0, None)
+            .buffer_bytes(&modal_amp_buf, 0, None)
+            .buffer_bytes(&modal_phase_buf, 0, None)
             .buffer_bytes(&audio_out_buf, 0, None)
             .buffer_bytes(&audio_params_buf, 0, None)
+            .buffer_bytes(&modal_freq_buf, 0, None)
+            .buffer_bytes(&gra_state_buf, 0, None)
             .build(device, &audio_layout)
     });
 
@@ -959,13 +889,6 @@ pub(crate) fn create_gpu_compute(
             .buffer_bytes(&audio_params_buf, 0, None)
             .build(device, &particle_phase_layout)
     });
-
-    let gra_phase_bg = wgpu::BindGroupBuilder::new()
-        .buffer_bytes(&gra_audio_buf, 0, None)
-        .buffer_bytes(&gra_state_buf, 0, None)
-        .buffer_bytes(&gra_vel_buf, 0, None)
-        .buffer_bytes(&audio_params_buf, 0, None)
-        .build(device, &gra_phase_layout);
 
     // Modal Chebyshev init data bind group
     let modal_cheb_init_data_bg = wgpu::BindGroupBuilder::new()
@@ -1028,30 +951,19 @@ pub(crate) fn create_gpu_compute(
         })
         .collect();
 
-    // Modal audio bind group
-    let modal_audio_bg = wgpu::BindGroupBuilder::new()
-        .buffer_bytes(&gra_sorted_pos_buf, 0, None)
-        .buffer_bytes(&g_bin_offset_buf, 0, None)
-        .buffer_bytes(&gra_vel_buf, 0, None)
-        .buffer_bytes(&modal_amp_buf, 0, None)
-        .buffer_bytes(&modal_phase_buf, 0, None)
-        .buffer_bytes(&modal_audio_out_buf, 0, None)
-        .buffer_bytes(&modal_audio_params_buf, 0, None)
-        .buffer_bytes(&modal_freq_buf, 0, None)
-        .build(device, &modal_audio_layout);
-
     // Modal phase update bind group
     let modal_phase_update_bg = wgpu::BindGroupBuilder::new()
         .buffer_bytes(&modal_phase_buf, 0, None)
-        .buffer_bytes(&modal_audio_params_buf, 0, None)
+        .buffer_bytes(&audio_params_buf, 0, None)
         .buffer_bytes(&modal_freq_buf, 0, None)
+        .buffer_bytes(&gra_state_buf, 0, None)
         .build(device, &modal_phase_update_layout);
 
     GpuCompute {
         particle_bufs,
         particle_frame: 0,
         p_bin_size_buf, p_bin_offset_buf, p_num_bins: p_num_bins + 1,
-        gra_pos_buf, gra_vel_buf, gra_force_buf, gra_state_buf, gra_audio_buf,
+        gra_pos_buf, gra_vel_buf, gra_force_buf, gra_state_buf,
         adj_offset_buf, adj_list_buf, connection_buf,
         gra_sorted_pos_buf, g_bin_size_buf, g_bin_offset_buf, g_num_bins: g_num_bins + 1,
         sim_params_buf, audio_params_buf, render_uniform_buf,
@@ -1064,7 +976,8 @@ pub(crate) fn create_gpu_compute(
         g_clear_bins_pipeline, g_fill_bins_pipeline, g_prefix_sum_pipeline,
         g_sort_clear_pipeline, g_sort_pipeline,
         bbox_clear_pipeline, bbox_reduce_pipeline,
-        audio_pipeline, particle_phase_pipeline, gra_phase_pipeline,
+        audio_pipeline, particle_phase_pipeline,
+        modal_phase_update_pipeline,
         particle_sim_bgs, particle_sim_gra_bg,
         p_bin_fill_bgs, p_bin_params_bg, p_bin_size_bg,
         p_prefix_bg, p_sort_data_bgs, p_sort_params_bg,
@@ -1073,16 +986,14 @@ pub(crate) fn create_gpu_compute(
         gra_bin_fill_data_bg, gra_bin_params_bg, gra_bin_size_bg,
         g_prefix_bg, gra_sort_data_bg, gra_sort_params_bg,
         bbox_data_bg, bbox_params_bg,
-        audio_bgs, particle_phase_bgs, gra_phase_bg,
-        modal_amp_buf, modal_phase_buf, modal_freq_buf, modal_audio_params_buf,
+        audio_bgs, particle_phase_bgs,
+        modal_phase_update_bg,
+        modal_amp_buf, modal_phase_buf, modal_freq_buf,
         modal_coeff_lo_bufs, modal_coeff_hi_bufs,
         cheb_a_buf, cheb_b_buf, cheb_c_buf,
         modal_cheb_init_pipeline, modal_cheb_step_pipeline,
-        modal_audio_pipeline, modal_phase_update_pipeline,
-        modal_audio_out_buf,
         modal_cheb_init_data_bg, modal_cheb_init_params_bg,
         modal_cheb_step_data_bgs, modal_cheb_step_params_bgs,
-        modal_audio_bg, modal_phase_update_bg,
         topology_dirty: true,
         num_gra_nodes: 0,
         num_gra_connections: 0,
@@ -1165,18 +1076,27 @@ pub(crate) fn upload_gra_forces(queue: &wgpu::Queue, gpu: &GpuCompute, forces: &
     queue.write_buffer(&gpu.gra_force_buf, 0, bytemuck::cast_slice(&force_data));
 }
 
+/// Per-node trial visual/audio params passed from the trial system.
+pub(crate) struct NodeTrialInfo {
+    pub hue_base: f32,
+    pub freq_scale: f32,
+}
+
 pub(crate) fn upload_gra_discrete_states(
     queue: &wgpu::Queue,
     gpu: &GpuCompute,
     discrete_states: &[u8],
     num_states: u8,
+    trial_info: &[NodeTrialInfo],
 ) {
     let state_data: Vec<[f32; 4]> = discrete_states.iter()
-        .map(|&s| {
+        .enumerate()
+        .map(|(i, &s)| {
+            let info = &trial_info[i];
             let t = (s as f32) / ((num_states.max(2) - 1) as f32);
-            let hue = ((280.0 + t * 110.0) % 360.0) / 360.0;
+            let hue = ((info.hue_base + t * 110.0) % 360.0) / 360.0;
             let (r, g, b) = hsv_to_rgb(hue, 0.85, 0.95);
-            [r, g, b, 0.0]
+            [r, g, b, info.freq_scale]
         })
         .collect();
     queue.write_buffer(&gpu.gra_state_buf, 0, bytemuck::cast_slice(&state_data));
@@ -1413,7 +1333,7 @@ pub(crate) fn encode_audio_pass(
     let frame = gpu.particle_frame;
     let audio_buf_size = (CHUNK_SIZE * NUM_CHANNELS * 4) as u64;
 
-    // Audio synthesis
+    // Combined particle + GRA modal audio synthesis
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("audio"), timestamp_writes: None,
@@ -1423,7 +1343,7 @@ pub(crate) fn encode_audio_pass(
         pass.dispatch_workgroups(dispatch_count(CHUNK_SIZE, WORKGROUP_SIZE), 1, 1);
     }
 
-    // Phase updates
+    // Particle phase update
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("particle_phase"), timestamp_writes: None,
@@ -1432,12 +1352,14 @@ pub(crate) fn encode_audio_pass(
         pass.set_bind_group(0, &gpu.particle_phase_bgs[frame], &[]);
         pass.dispatch_workgroups(dispatch_count(gpu.num_particles, WORKGROUP_SIZE), 1, 1);
     }
+
+    // Modal phase update (GRA)
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("gra_phase"), timestamp_writes: None,
+            label: Some("modal_phase_update"), timestamp_writes: None,
         });
-        pass.set_pipeline(&gpu.gra_phase_pipeline);
-        pass.set_bind_group(0, &gpu.gra_phase_bg, &[]);
+        pass.set_pipeline(&gpu.modal_phase_update_pipeline);
+        pass.set_bind_group(0, &gpu.modal_phase_update_bg, &[]);
         pass.dispatch_workgroups(dispatch_count(gpu.num_gra_nodes, GRA_WORKGROUP_SIZE), 1, 1);
     }
 
@@ -1466,10 +1388,6 @@ pub(crate) fn upload_modal_coefficients(
 
 pub(crate) fn update_modal_freqs(queue: &wgpu::Queue, gpu: &GpuCompute, freqs: &ModalFreqs) {
     queue.write_buffer(&gpu.modal_freq_buf, 0, bytemuck::bytes_of(freqs));
-}
-
-pub(crate) fn update_modal_audio_params(queue: &wgpu::Queue, gpu: &GpuCompute, params: &ModalAudioParams) {
-    queue.write_buffer(&gpu.modal_audio_params_buf, 0, bytemuck::bytes_of(params));
 }
 
 pub(crate) fn encode_modal_chebyshev(
@@ -1503,41 +1421,6 @@ pub(crate) fn encode_modal_chebyshev(
             pass.dispatch_workgroups(dispatch_count(n, GRA_WORKGROUP_SIZE), 1, 1);
         }
     }
-}
-
-pub(crate) fn encode_modal_audio_pass(
-    encoder: &mut wgpu::CommandEncoder,
-    gpu: &GpuCompute,
-    staging_idx: usize,
-) {
-    let audio_buf_size = (CHUNK_SIZE * NUM_CHANNELS * 4) as u64;
-
-    // Modal audio synthesis
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("modal_audio"), timestamp_writes: None,
-        });
-        pass.set_pipeline(&gpu.modal_audio_pipeline);
-        pass.set_bind_group(0, &gpu.modal_audio_bg, &[]);
-        pass.dispatch_workgroups(dispatch_count(CHUNK_SIZE, WORKGROUP_SIZE), 1, 1);
-    }
-
-    // Modal phase update
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("modal_phase_update"), timestamp_writes: None,
-        });
-        pass.set_pipeline(&gpu.modal_phase_update_pipeline);
-        pass.set_bind_group(0, &gpu.modal_phase_update_bg, &[]);
-        pass.dispatch_workgroups(dispatch_count(gpu.num_gra_nodes, GRA_WORKGROUP_SIZE), 1, 1);
-    }
-
-    // Copy to staging
-    encoder.copy_buffer_to_buffer(
-        &gpu.modal_audio_out_buf, 0,
-        &gpu.audio_staging_bufs[staging_idx], 0,
-        audio_buf_size,
-    );
 }
 
 // ── Readback ─────────────────────────────────────────────────────────────────

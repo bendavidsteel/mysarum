@@ -178,9 +178,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     // ── Integrate ───────────────────────────────────────────────────────────
 
-    // Friction
-    let mu = pow(0.5, params.dt / params.particle_friction);
-    particle.vel *= mu;
+    // Friction (pre-computed on CPU)
+    particle.vel *= params.particle_friction_mu;
 
     // Apply force
     particle.vel += totalForce * params.dt / params.particle_mass;

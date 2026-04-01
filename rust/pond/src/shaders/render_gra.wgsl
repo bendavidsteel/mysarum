@@ -42,11 +42,14 @@ fn wrap_delta(d: f32) -> f32 {
     return d;
 }
 
-// ── EDGE rendering (quad strips with Gaussian falloff) ─────────────────────
+// ── EDGE rendering (dual Gaussian ridges with node-color gradient) ────────
 
 struct LineVertexOutput {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) perp: f32,  // -1..+1 across the edge width
+    @location(0) perp: f32,           // -1..+1 across the edge width
+    @location(1) along_t: f32,        // 0..1 along the edge (for color gradient)
+    @location(2) @interpolate(flat) color_from: vec3<f32>,
+    @location(3) @interpolate(flat) color_to: vec3<f32>,
 }
 
 // 12 vertices per connection: 2 segments × 6 verts (two triangles each).
@@ -63,6 +66,9 @@ fn vs_line(@builtin(vertex_index) vertex_index: u32) -> LineVertexOutput {
     if conn_idx >= uniforms.num_gra_connections {
         out.clip_position = vec4(0.0, 0.0, -2.0, 1.0);
         out.perp = 0.0;
+        out.along_t = 0.0;
+        out.color_from = vec3(0.0);
+        out.color_to = vec3(0.0);
         return out;
     }
 
@@ -70,6 +76,10 @@ fn vs_line(@builtin(vertex_index) vertex_index: u32) -> LineVertexOutput {
     let to_idx = connections[conn_idx * 2u + 1u];
     let from_pos = gra_pos[from_idx].xy;
     let to_pos = gra_pos[to_idx].xy;
+
+    // Node colors for gradient
+    out.color_from = gra_state[from_idx].xyz;
+    out.color_to = gra_state[to_idx].xyz;
 
     let dx = wrap_delta(to_pos.x - from_pos.x);
     let dy = wrap_delta(to_pos.y - from_pos.y);
@@ -94,14 +104,15 @@ fn vs_line(@builtin(vertex_index) vertex_index: u32) -> LineVertexOutput {
     let clip_start = world_to_clip(seg_start.x, seg_start.y);
     let clip_end = world_to_clip(seg_end.x, seg_end.y);
 
-    // Edge direction and perpendicular in clip space
+    // Edge direction and perpendicular in clip space — wider to fit dual ridges
     let edge_dir = clip_end - clip_start;
     let edge_len = length(edge_dir);
-    let half_width = uniforms.gra_node_radius * 0.4 / (uniforms.max_x - uniforms.min_x) * 2.0;
+    let half_width = uniforms.gra_node_radius * 0.8 / (uniforms.max_x - uniforms.min_x) * 2.0;
 
     if edge_len < 0.00001 {
         out.clip_position = vec4(0.0, 0.0, -2.0, 1.0);
         out.perp = 0.0;
+        out.along_t = 0.0;
         return out;
     }
 
@@ -124,14 +135,36 @@ fn vs_line(@builtin(vertex_index) vertex_index: u32) -> LineVertexOutput {
     let side = select(1.0, -1.0, (corner & 1u) != 0u);
     out.clip_position = vec4(along + perp * side, 0.0, 1.0);
     out.perp = side;
+
+    // along_t: 0 at from-node end, 1 at to-node end
+    let at_end = f32(corner >= 2u);
+    if seg == 0u {
+        out.along_t = at_end;          // seg0: start=from(0), end=to(1)
+    } else {
+        out.along_t = 1.0 - at_end;   // seg1: start=to(1), end=from(0)
+    }
+
     return out;
 }
 
 @fragment
 fn fs_line(in: LineVertexOutput) -> @location(0) vec4<f32> {
-    let d = abs(in.perp);
-    let alpha = exp(-4.0 * d * d);
-    let color = vec3(0.0, 0.5, 0.64);
+    let d = in.perp;  // -1..+1
+
+    // Two Gaussian ridges offset from center
+    let ridge_offset = 0.38;
+    let ridge_width = 6.0;
+    let ridge_l = exp(-ridge_width * (d - ridge_offset) * (d - ridge_offset));
+    let ridge_r = exp(-ridge_width * (d + ridge_offset) * (d + ridge_offset));
+    let ridge_alpha = ridge_l + ridge_r;
+
+    // Fade out near endpoints so edges don't clash with node glows
+    let endpoint_fade = smoothstep(0.0, 0.15, in.along_t) * smoothstep(1.0, 0.85, in.along_t);
+    let alpha = ridge_alpha * endpoint_fade;
+
+    // Color gradient between the two connected nodes
+    let color = mix(in.color_from, in.color_to, in.along_t);
+
     return vec4(color * alpha, alpha);
 }
 
@@ -185,14 +218,25 @@ fn fs_node(in: NodeVertexOutput) -> @location(0) vec4<f32> {
     let dist = length(centered) * 2.0;
     if dist > 1.0 { discard; }
 
-    // Gaussian core + soft glow (matching particle style)
-    let core_radius = 0.25;
+    // Gaussian core
+    let core_radius = 0.22;
+    let core_sharpness = 10.0;
     let core_falloff = dist / core_radius;
-    let core = exp(-8.0 * core_falloff * core_falloff);
-    let glow = pow(1.0 - dist, 2.0) * 0.5;
-    let brightness = core + glow;
+    let core = exp(-core_sharpness * core_falloff * core_falloff);
 
-    return vec4(in.color * brightness, brightness);
+    // Membrane / soft shell ring at core boundary
+    let membrane_width = 0.15;
+    let membrane = smoothstep(core_radius - membrane_width, core_radius, dist)
+                  * smoothstep(core_radius + membrane_width, core_radius, dist);
+
+    // Outer bloom (wide soft glow)
+    let glow = pow(1.0 - dist, 2.0) * 0.5;
+
+    let inner = core * 0.3 + membrane * 0.4;
+    let combined = inner + glow;
+    let alpha = combined * 0.9;
+
+    return vec4(in.color * combined, alpha);
 }
 
 // Core entry points kept as no-op stubs (pipeline references them)

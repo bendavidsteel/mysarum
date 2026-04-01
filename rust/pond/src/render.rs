@@ -266,7 +266,7 @@ pub(crate) fn init_render_state(
         cache: None,
     });
 
-    // Node glow pipeline
+    // Node glow pipeline (alpha blend so nodes render on top of edges)
     let gra_node_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("gra_node_render"),
         layout: Some(&gra_pl),
@@ -281,7 +281,7 @@ pub(crate) fn init_render_state(
             entry_point: Some("fs_node"),
             targets: &[Some(wgpu::ColorTargetState {
                 format: texture_format,
-                blend: additive_blend,
+                blend: alpha_blend,
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             compilation_options: Default::default(),

@@ -3,6 +3,7 @@
 mod barnes_hut;
 mod gpu;
 mod render;
+mod reverb;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -16,16 +17,16 @@ use nannou_audio::Buffer;
 use crossbeam_channel::{self, Receiver};
 
 use barnes_hut::BarnesHut;
-use gpu::{GpuCompute, SimParams, ModalAudioParams, ModalFreqs, RenderUniforms, Particle,
+use gpu::{GpuCompute, SimParams, AudioParams, ModalFreqs, RenderUniforms, Particle,
           MAX_GRA_NODES, SAMPLE_RATE, CHUNK_SIZE, NUM_CHANNELS, CHUNK_FLOATS,
           NUM_AUDIO_STAGING_BUFS, NUM_MODAL_BANDS, MODAL_CHEB_ORDER, compute_bin_counts,
           create_gpu_compute, upload_particles, upload_gra_topology,
-          upload_gra_forces, upload_gra_discrete_states,
+          upload_gra_forces, upload_gra_discrete_states, NodeTrialInfo,
           update_sim_params, update_render_uniforms,
-          update_modal_audio_params, upload_modal_coefficients, update_modal_freqs,
+          update_audio_params, upload_modal_coefficients, update_modal_freqs,
           dispatch_particle_bin_sort, dispatch_gra_bin_sort,
           dispatch_particle_sim, dispatch_gra_physics,
-          encode_modal_chebyshev, encode_modal_audio_pass,
+          encode_modal_chebyshev, encode_audio_pass,
           readback_gra_positions};
 use render::RenderState;
 
@@ -41,7 +42,7 @@ const MAX_REQUEST_THRESHOLD: u32 = CHUNK_FLOATS * 4;
 const BUFFER_HISTORY_SIZE: usize = 64;
 
 // Modal synthesis
-const MODAL_BASE_FREQ: f32 = 150.0;
+const MODAL_BASE_FREQ: f32 = 120.0;
 
 // GRA trial management
 const NUM_INITIAL_TRIALS: usize = 16;
@@ -189,6 +190,22 @@ struct TrialParams {
     rule_topo: Vec<u8>,
     discrete_step_interval: u32,
     max_divisions_per_step: u32,
+    hue_base: f32,
+    base_freq: f32,
+}
+
+const MUTATION_INTERVAL: u64 = 300;
+const MUTATION_PROB: f32 = 0.3;
+
+fn mutate_trial_params(params: &mut TrialParams) {
+    let n = params.rule_state.len();
+    let idx = random_range(0, n);
+    if random_f32() < 0.5 {
+        params.rule_state[idx] = random_range(0u8, NUM_DISCRETE_STATES);
+    } else {
+        let num_actions = if NUM_DISCRETE_STATES <= 2 { 2 } else { 3 };
+        params.rule_topo[idx] = random_range(0u8, num_actions);
+    }
 }
 
 fn random_trial_params() -> TrialParams {
@@ -197,6 +214,8 @@ fn random_trial_params() -> TrialParams {
         rule_topo: random_topo_table(NUM_DISCRETE_STATES),
         discrete_step_interval: random_range(10u32, 40),
         max_divisions_per_step: random_range(1u32, 5),
+        hue_base: random_range(0.0f32, 360.0),
+        base_freq: random_range(120.0f32, 400.0),
     }
 }
 
@@ -220,6 +239,22 @@ fn with_trials<R>(f: impl FnOnce(&mut TrialState) -> R) -> R {
     f(&mut ts)
 }
 
+fn build_node_trial_info(trial_ids: &[u32]) -> Vec<NodeTrialInfo> {
+    with_trials(|ts| {
+        let trial_map: HashMap<u32, &Trial> = ts.trials.iter().map(|t| (t.id, t)).collect();
+        trial_ids.iter().map(|&tid| {
+            if let Some(trial) = trial_map.get(&tid) {
+                NodeTrialInfo {
+                    hue_base: trial.params.hue_base,
+                    freq_scale: trial.params.base_freq / MODAL_BASE_FREQ,
+                }
+            } else {
+                NodeTrialInfo { hue_base: 280.0, freq_scale: 1.0 }
+            }
+        }).collect()
+    })
+}
+
 // ── Audio ────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
@@ -228,18 +263,33 @@ struct AudioFeedback {
     current_buffer_level: u32,
 }
 
+#[derive(Clone, Copy)]
+struct ReverbParams {
+    room_size: f32,
+    damp: f32,
+    wet: f32,
+}
+
 struct AudioModel {
     consumer: ringbuf::HeapCons<f32>,
     feedback_tx: crossbeam_channel::Sender<AudioFeedback>,
     buffer_history: VecDeque<u32>,
+    reverb: reverb::Freeverb,
+    reverb_params: Arc<Mutex<ReverbParams>>,
 }
 
 fn audio_fn(audio_model: &mut AudioModel, buffer: &mut Buffer) {
+    if let Ok(p) = audio_model.reverb_params.try_lock() {
+        audio_model.reverb.set_room_size(p.room_size);
+        audio_model.reverb.set_damp(p.damp);
+        audio_model.reverb.set_wet(p.wet);
+    }
     for frame in buffer.frames_mut() {
         let left = audio_model.consumer.try_pop().unwrap_or(0.0);
         let right = audio_model.consumer.try_pop().unwrap_or(0.0);
-        frame[0] = left;
-        frame[1] = right;
+        let (l, r) = audio_model.reverb.process(left, right);
+        frame[0] = l;
+        frame[1] = r;
     }
     let buffer_len = audio_model.consumer.occupied_len() as u32;
     audio_model.buffer_history.push_back(buffer_len);
@@ -324,6 +374,7 @@ pub(crate) struct Model {
     _audio_thread: Arc<std::thread::JoinHandle<()>>,
     integral_error: f32,
     latest_feedback: Option<AudioFeedback>,
+    reverb_params: Arc<Mutex<ReverbParams>>,
 }
 
 // ── App ──────────────────────────────────────────────────────────────────────
@@ -533,10 +584,17 @@ fn model(app: &App) -> Model {
     let (audio_producer, audio_consumer) = ring_buf.split();
 
     let (audio_feedback_tx, audio_feedback_rx) = crossbeam_channel::unbounded();
+    let reverb_params = Arc::new(Mutex::new(ReverbParams {
+        room_size: 0.85,
+        damp: 0.5,
+        wet: 0.9,
+    }));
     let audio_model = AudioModel {
         consumer: audio_consumer,
         feedback_tx: audio_feedback_tx,
         buffer_history: VecDeque::with_capacity(BUFFER_HISTORY_SIZE),
+        reverb: reverb::Freeverb::new(SAMPLE_RATE),
+        reverb_params: Arc::clone(&reverb_params),
     };
 
     let audio_host = audio::Host::new();
@@ -589,12 +647,12 @@ fn model(app: &App) -> Model {
         particle_friction: 0.1,
         particle_mass: 1.0,
         particle_copy_radius: 0.2,
-        particle_copy_cos_sim: 0.2,
+        particle_copy_cos_sim: 0.5,
         particle_copy_prob: 0.001,
         particle_size: 0.05,
 
-        gra_repulsion_radius: 0.36,
-        gra_repulsion_strength: 3.0,
+        gra_repulsion_radius: 0.5,
+        gra_repulsion_strength: 4.0,
 
         frame: 0,
         hit_max_nodes: false,
@@ -619,6 +677,7 @@ fn model(app: &App) -> Model {
         _audio_thread: Arc::new(audio_thread),
         integral_error: 0.0,
         latest_feedback: None,
+        reverb_params,
     };
 
     // Spawn initial GRA trials in a grid
@@ -681,6 +740,11 @@ fn update(app: &App, model: &mut Model) {
         ui.label("Audio (Modal Synthesis)");
         ui.checkbox(&mut model.audio_active, "Enable audio");
         ui.add(egui::Slider::new(&mut model.audio_volume, 0.0..=1.0).text("volume"));
+        if let Ok(mut rp) = model.reverb_params.try_lock() {
+            ui.add(egui::Slider::new(&mut rp.wet, 0.0..=1.0).text("reverb"));
+            ui.add(egui::Slider::new(&mut rp.room_size, 0.0..=1.0).text("room size"));
+            ui.add(egui::Slider::new(&mut rp.damp, 0.0..=1.0).text("damping"));
+        }
         let old_base = model.modal_base_freq;
         ui.add(egui::Slider::new(&mut model.modal_base_freq, 50.0..=500.0).text("base freq"));
         if (model.modal_base_freq - old_base).abs() > 0.5 {
@@ -732,7 +796,8 @@ fn update(app: &App, model: &mut Model) {
         let queue = window.queue();
         let gpu = model.gpu.as_mut().unwrap();
         upload_gra_topology(&queue, gpu, &model.gra_positions, &model.gra_states, &model.gra_connections);
-        upload_gra_discrete_states(&queue, gpu, &model.gra_discrete_states, NUM_DISCRETE_STATES);
+        let trial_info = build_node_trial_info(&model.gra_trial_ids);
+        upload_gra_discrete_states(&queue, gpu, &model.gra_discrete_states, NUM_DISCRETE_STATES, &trial_info);
         gpu.topology_dirty = false;
     }
 
@@ -768,91 +833,67 @@ fn update(app: &App, model: &mut Model) {
         g_num_bins_y: g_bins_y,
         gra_repulsion_radius: model.gra_repulsion_radius,
         gra_repulsion_strength: model.gra_repulsion_strength,
-        _pad0: 0, _pad1: 0, _pad2: 0,
+        particle_friction_mu: (0.5f32).powf(model.dt / model.particle_friction),
+        _pad0: 0, _pad1: 0,
     };
 
     // ── GRA: CPU Barnes-Hut repulsion ────────────────────────────────────
-    if !model.gra_positions.is_empty() {
+    {
         let window = app.window(model.window);
         let device = window.device();
         let queue = window.queue();
         let gpu = model.gpu.as_mut().unwrap();
 
-        // Read back PREVIOUS frame's positions (async double-buffered)
-        // Only apply if topology hasn't changed (node count must match)
-        if model.gra_readback_pending && model.gra_readback_count == model.gra_positions.len() {
-            let read_idx = gpu.gra_readback_frame;
-            let positions = readback_gra_positions(&device, gpu, model.gra_readback_count, read_idx);
-            model.gra_positions = positions.into_iter()
-                .map(|(x, y)| wrap_pos(x, y))
-                .collect();
+        if !model.gra_positions.is_empty() {
+            // Read back PREVIOUS frame's positions (async double-buffered)
+            // Only apply if topology hasn't changed (node count must match)
+            if model.gra_readback_pending && model.gra_readback_count == model.gra_positions.len() {
+                let read_idx = gpu.gra_readback_frame;
+                let positions = readback_gra_positions(&device, gpu, model.gra_readback_count, read_idx);
+                model.gra_positions = positions.into_iter()
+                    .map(|(x, y)| wrap_pos(x, y))
+                    .collect();
+            }
+
+            let jitter_scale = model.bh.last_leaf_extent() * 0.5;
+            let jitter = (
+                random_range(-jitter_scale, jitter_scale),
+                random_range(-jitter_scale, jitter_scale),
+            );
+            let forces = model.bh.compute_repulsion(
+                &model.gra_positions, model.gra_charge, model.gra_charge_max_dist,
+                model.gra_theta, jitter, model.gra_charge_epsilon, WORLD_HALF,
+            );
+
+            upload_gra_forces(&queue, gpu, &forces);
         }
 
-        let jitter_scale = model.bh.last_leaf_extent() * 0.5;
-        let jitter = (
-            random_range(-jitter_scale, jitter_scale),
-            random_range(-jitter_scale, jitter_scale),
-        );
-        let forces = model.bh.compute_repulsion(
-            &model.gra_positions, model.gra_charge, model.gra_charge_max_dist,
-            model.gra_theta, jitter, model.gra_charge_epsilon, WORLD_HALF,
-        );
-
-        upload_gra_forces(&queue, gpu, &forces);
         update_sim_params(&queue, gpu, &sim_params);
 
-        // GPU: GRA spring forces + integrate + bbox
-        // Write to the OTHER readback buffer (flip index)
-        let write_idx = 1 - gpu.gra_readback_frame;
+        // ── Single batched encoder: GRA physics + GRA bin sort + particle bin sort + particle sim
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("gra_physics_encoder"),
+            label: Some("physics_encoder"),
         });
-        dispatch_gra_physics(&mut encoder, gpu, write_idx);
-        queue.submit(Some(encoder.finish()));
 
-        // Next frame will read from the buffer we just wrote to
-        gpu.gra_readback_frame = write_idx;
-        model.gra_readback_pending = true;
-        model.gra_readback_count = model.gra_positions.len();
-    } else {
-        let window = app.window(model.window);
-        let queue = window.queue();
-        let gpu = model.gpu.as_ref().unwrap();
-        update_sim_params(&queue, gpu, &sim_params);
-    }
+        let gra_readback_write_idx = if !model.gra_positions.is_empty() {
+            let write_idx = 1 - gpu.gra_readback_frame;
+            dispatch_gra_physics(&mut encoder, gpu, write_idx);
+            Some(write_idx)
+        } else {
+            None
+        };
 
-    // ── GRA spatial hash (for particle→GRA lookups) ──────────────────────
-    {
-        let window = app.window(model.window);
-        let device = window.device();
-        let queue = window.queue();
-        let gpu = model.gpu.as_ref().unwrap();
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("gra_bin_sort_encoder"),
-        });
         dispatch_gra_bin_sort(&mut encoder, gpu);
-        queue.submit(Some(encoder.finish()));
-    }
-
-    // ── Particle: spatial hash + sort + physics ──────────────────────────
-    {
-        let window = app.window(model.window);
-        let device = window.device();
-        let queue = window.queue();
-        let gpu = model.gpu.as_mut().unwrap();
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("particle_encoder"),
-        });
-
-        // Bin sort particles
         dispatch_particle_bin_sort(&mut encoder, gpu);
-
-        // Particle physics (reads sorted particles + GRA bins)
         dispatch_particle_sim(&mut encoder, gpu);
 
         queue.submit(Some(encoder.finish()));
+
+        if let Some(write_idx) = gra_readback_write_idx {
+            gpu.gra_readback_frame = write_idx;
+            model.gra_readback_pending = true;
+            model.gra_readback_count = model.gra_positions.len();
+        }
     }
 
     // ── Audio ────────────────────────────────────────────────────────────
@@ -906,19 +947,28 @@ fn update(app: &App, model: &mut Model) {
             let hw = WORLD_HALF / model.zoom;
             let hh = WORLD_HALF / model.zoom;
 
-            let modal_params = ModalAudioParams {
+            let audio_params = AudioParams {
                 sample_rate: SAMPLE_RATE as f32,
+                num_particles: NUM_PARTICLES,
                 num_gra_nodes: model.gra_positions.len() as u32,
                 chunk_size: CHUNK_SIZE,
                 volume: model.audio_volume,
+                _align_pad: 0.0,
                 current_x: [cx - hw, cx + hw],
                 current_y: [cy - hh, cy + hh],
-                max_speed: model.gra_max_velocity,
+                max_speed: 5.0,
+                energy_scale: 10.0,
+                gra_max_speed: model.gra_max_velocity,
+                p_map_x0: -WORLD_HALF,
+                p_map_y0: -WORLD_HALF,
+                p_bin_size: P_BIN_SIZE,
+                p_num_bins_x: p_bins_x,
+                p_num_bins_y: p_bins_y,
                 g_bin_size: G_BIN_SIZE,
                 g_num_bins_x: g_bins_x,
                 g_num_bins_y: g_bins_y,
                 world_half: WORLD_HALF,
-                _pad0: 0, _pad1: 0, _pad2: 0,
+                _pad0: 0, _pad1: 0, _pad2: 0, _pad3: 0,
             };
 
             let window = app.window(model.window);
@@ -926,7 +976,7 @@ fn update(app: &App, model: &mut Model) {
             let queue = window.queue();
             let gpu = model.gpu.as_ref().unwrap();
 
-            update_modal_audio_params(&queue, gpu, &modal_params);
+            update_audio_params(&queue, gpu, &audio_params);
 
             let write_idx = if prev_staging_idx < 0 { 0 }
             else { (prev_staging_idx as usize + 1) % NUM_AUDIO_STAGING_BUFS };
@@ -937,8 +987,8 @@ fn update(app: &App, model: &mut Model) {
 
             // Chebyshev bandpass: decompose GRA state into 8 spectral bands
             encode_modal_chebyshev(&mut encoder, gpu, MODAL_CHEB_ORDER);
-            // Additive modal synthesis + phase update + copy to staging
-            encode_modal_audio_pass(&mut encoder, gpu, write_idx);
+            // Combined particle + GRA modal synthesis + phase updates + copy to staging
+            encode_audio_pass(&mut encoder, gpu, write_idx);
 
             queue.submit(Some(encoder.finish()));
 
@@ -1027,6 +1077,19 @@ fn update(app: &App, model: &mut Model) {
                     }
                 }
                 let (a, b) = match found { Some(pair) => pair, None => continue };
+
+                // The three external neighbours (one per triangle vertex) must be
+                // distinct, otherwise dedup after remapping would drop edges and
+                // break 3-regularity.
+                let ext_i = adj[i].iter().copied().find(|&x| x != a && x != b);
+                let ext_a = adj[a].iter().copied().find(|&x| x != i && x != b);
+                let ext_b = adj[b].iter().copied().find(|&x| x != i && x != a);
+                match (ext_i, ext_a, ext_b) {
+                    (Some(ei), Some(ea), Some(eb))
+                        if ei != ea && ea != eb && ei != eb => {}
+                    _ => continue,
+                }
+
                 let avg_pos = toroidal_avg(&[
                     model.gra_positions[i], model.gra_positions[a], model.gra_positions[b],
                 ]);
@@ -1160,12 +1223,14 @@ fn update(app: &App, model: &mut Model) {
                 let queue = window.queue();
                 let gpu = model.gpu.as_mut().unwrap();
                 upload_gra_topology(&queue, gpu, &model.gra_positions, &model.gra_states, &model.gra_connections);
-                upload_gra_discrete_states(&queue, gpu, &model.gra_discrete_states, NUM_DISCRETE_STATES);
+                let trial_info = build_node_trial_info(&model.gra_trial_ids);
+                upload_gra_discrete_states(&queue, gpu, &model.gra_discrete_states, NUM_DISCRETE_STATES, &trial_info);
             } else {
                 let window = app.window(model.window);
                 let queue = window.queue();
                 let gpu = model.gpu.as_ref().unwrap();
-                upload_gra_discrete_states(&queue, gpu, &model.gra_discrete_states, NUM_DISCRETE_STATES);
+                let trial_info = build_node_trial_info(&model.gra_trial_ids);
+                upload_gra_discrete_states(&queue, gpu, &model.gra_discrete_states, NUM_DISCRETE_STATES, &trial_info);
             }
         }
     }
@@ -1173,6 +1238,16 @@ fn update(app: &App, model: &mut Model) {
     // ── Trial lifecycle ──────────────────────────────────────────────────
     if model.frame % 30 == 0 && model.frame > GRACE_FRAMES {
         cull_inviable_trials(model);
+    }
+
+    if model.frame % MUTATION_INTERVAL == 0 {
+        with_trials(|ts| {
+            for trial in ts.trials.iter_mut() {
+                if random_f32() < MUTATION_PROB {
+                    mutate_trial_params(&mut trial.params);
+                }
+            }
+        });
     }
 
     if model.frame % SPAWN_INTERVAL == 0 {

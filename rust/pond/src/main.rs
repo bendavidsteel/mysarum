@@ -274,6 +274,8 @@ struct AudioModel {
     consumer: ringbuf::HeapCons<f32>,
     feedback_tx: crossbeam_channel::Sender<AudioFeedback>,
     buffer_history: VecDeque<u32>,
+    lp_prev: [f32; 2],
+    lp_alpha: f32,
     reverb: reverb::Freeverb,
     reverb_params: Arc<Mutex<ReverbParams>>,
 }
@@ -285,9 +287,12 @@ fn audio_fn(audio_model: &mut AudioModel, buffer: &mut Buffer) {
         audio_model.reverb.set_wet(p.wet);
     }
     for frame in buffer.frames_mut() {
-        let left = audio_model.consumer.try_pop().unwrap_or(0.0);
-        let right = audio_model.consumer.try_pop().unwrap_or(0.0);
-        let (l, r) = audio_model.reverb.process(left, right);
+        let raw_l = audio_model.consumer.try_pop().unwrap_or(0.0);
+        let raw_r = audio_model.consumer.try_pop().unwrap_or(0.0);
+        let a = audio_model.lp_alpha;
+        audio_model.lp_prev[0] += a * (raw_l - audio_model.lp_prev[0]);
+        audio_model.lp_prev[1] += a * (raw_r - audio_model.lp_prev[1]);
+        let (l, r) = audio_model.reverb.process(audio_model.lp_prev[0], audio_model.lp_prev[1]);
         frame[0] = l;
         frame[1] = r;
     }
@@ -589,10 +594,15 @@ fn model(app: &App) -> Model {
         damp: 0.5,
         wet: 0.9,
     }));
+    // One-pole lowpass at ~12 kHz to knock out digital clicks before reverb
+    let lp_cutoff = 12000.0_f32;
+    let lp_alpha = 1.0 - (-std::f32::consts::TAU * lp_cutoff / SAMPLE_RATE as f32).exp();
     let audio_model = AudioModel {
         consumer: audio_consumer,
         feedback_tx: audio_feedback_tx,
         buffer_history: VecDeque::with_capacity(BUFFER_HISTORY_SIZE),
+        lp_prev: [0.0; 2],
+        lp_alpha,
         reverb: reverb::Freeverb::new(SAMPLE_RATE),
         reverb_params: Arc::clone(&reverb_params),
     };
@@ -834,7 +844,8 @@ fn update(app: &App, model: &mut Model) {
         gra_repulsion_radius: model.gra_repulsion_radius,
         gra_repulsion_strength: model.gra_repulsion_strength,
         particle_friction_mu: (0.5f32).powf(model.dt / model.particle_friction),
-        _pad0: 0, _pad1: 0,
+        current_strength: 0.05,
+        _pad0: 0,
     };
 
     // ── GRA: CPU Barnes-Hut repulsion ────────────────────────────────────
@@ -1288,7 +1299,9 @@ fn update(app: &App, model: &mut Model) {
             world_half: WORLD_HALF,
             max_speed: 5.0,
             energy_scale: 10.0,
-            _pad0: 0, _pad1: 0, _pad2: 0,
+            current_strength: 0.05,
+            time: model.time,
+            _pad0: 0,
         };
         let queue = window.queue();
         let gpu = model.gpu.as_ref().unwrap();

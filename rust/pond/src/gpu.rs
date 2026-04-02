@@ -91,8 +91,8 @@ pub(crate) struct SimParams {
     pub(crate) gra_repulsion_radius: f32,
     pub(crate) gra_repulsion_strength: f32,
     pub(crate) particle_friction_mu: f32,
+    pub(crate) current_strength: f32,
     pub(crate) _pad0: u32,
-    pub(crate) _pad1: u32,
 }
 
 #[repr(C)]
@@ -147,9 +147,9 @@ pub(crate) struct RenderUniforms {
     pub(crate) world_half: f32,
     pub(crate) max_speed: f32,
     pub(crate) energy_scale: f32,
+    pub(crate) current_strength: f32,
+    pub(crate) time: f32,
     pub(crate) _pad0: u32,
-    pub(crate) _pad1: u32,
-    pub(crate) _pad2: u32,
 }
 
 fn dispatch_count(n: u32, workgroup: u32) -> u32 {

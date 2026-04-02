@@ -55,8 +55,8 @@ struct SimParams {
     // Pre-computed friction: pow(0.5, dt / particle_friction)
     particle_friction_mu: f32,
 
+    current_strength: f32,
     _pad0: u32,
-    _pad1: u32,
 }
 
 struct AudioParams {
@@ -101,9 +101,9 @@ struct RenderUniforms {
     world_half: f32,
     max_speed: f32,
     energy_scale: f32,
+    current_strength: f32,
+    time: f32,
     _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
 }
 
 const PI: f32 = 3.14159265359;
@@ -201,4 +201,66 @@ fn gra_frequency(color: vec3<f32>, t: f32) -> f32 {
 fn gra_amplitude(speed: f32, max_speed: f32, neighbor_hint: f32) -> f32 {
     let speed_norm = clamp(speed / max(max_speed, 0.01), 0.0, 1.0);
     return clamp(0.08 + speed_norm * 0.7 + neighbor_hint * 0.2, 0.0, 1.0);
+}
+
+// ── Gradient noise for current field ────────────────────────────────────────
+
+fn grad_hash(p: vec2<f32>) -> vec2<f32> {
+    let k = vec2(0.3183099, 0.3678794);
+    var pp = p * k + k.yx;
+    return -1.0 + 2.0 * fract(16.0 * k * fract(pp.x * pp.y * (pp.x + pp.y)));
+}
+
+fn gradient_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    return mix(
+        mix(dot(grad_hash(i + vec2(0.0, 0.0)), f - vec2(0.0, 0.0)),
+            dot(grad_hash(i + vec2(1.0, 0.0)), f - vec2(1.0, 0.0)), u.x),
+        mix(dot(grad_hash(i + vec2(0.0, 1.0)), f - vec2(0.0, 1.0)),
+            dot(grad_hash(i + vec2(1.0, 1.0)), f - vec2(1.0, 1.0)), u.x),
+        u.y
+    );
+}
+
+// ── Ocean current ───────────────────────────────────────────────────────────
+
+fn current_radial_profile(r: f32) -> f32 {
+    // 0 at centre, peak at r=0.75, ~0.25 at r=1.0
+    return smoothstep(0.0, 0.75, r) * mix(1.0, 0.25, smoothstep(0.75, 1.0, r));
+}
+
+fn current_at_pos(pos: vec2<f32>, world_half: f32, time: f32, strength: f32) -> vec2<f32> {
+    let r = length(pos) / world_half;
+    if r < 0.001 {
+        return vec2(0.0);
+    }
+
+    let profile = current_radial_profile(r);
+
+    // Base tangent (counter-clockwise)
+    let tangent = normalize(vec2(-pos.y, pos.x));
+
+    // Coarse, slowly evolving Perlin noise
+    let ns = 0.3;
+    let t = time * 0.05;
+    let angle_noise = gradient_noise(pos * ns + vec2(t, 0.0)) * 6.4;
+    let str_noise = gradient_noise(pos * ns + vec2(0.0, t + 43.0)) * 2.8;
+
+    // Rotate tangent by noise angle
+    let ca = cos(angle_noise);
+    let sa = sin(angle_noise);
+    let dir = vec2(tangent.x * ca - tangent.y * sa, tangent.x * sa + tangent.y * ca);
+
+    return dir * profile * strength * (1.0 + str_noise);
+}
+
+fn current_magnitude_at_pos(pos: vec2<f32>, world_half: f32, time: f32, strength: f32) -> f32 {
+    let r = length(pos) / world_half;
+    let profile = current_radial_profile(r);
+    let ns = 0.3;
+    let t = time * 0.05;
+    let str_noise = gradient_noise(pos * ns + vec2(0.0, t + 43.0)) * 2.8;
+    return profile * strength * (1.0 + str_noise);
 }

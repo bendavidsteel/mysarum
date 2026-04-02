@@ -4,8 +4,16 @@ use crate::gpu::GpuCompute;
 
 const RENDER_PARTICLE_WGSL: &str = include_str!("shaders/render_particle.wgsl");
 const RENDER_GRA_WGSL: &str = include_str!("shaders/render_gra.wgsl");
+const RENDER_BACKGROUND_WGSL: &str = concat!(
+    include_str!("shaders/common.wgsl"),
+    include_str!("shaders/render_background.wgsl"),
+);
 
 pub(crate) struct RenderState {
+    // Background (current field)
+    pub(crate) bg_pipeline: Option<wgpu::RenderPipeline>,
+    pub(crate) bg_bind_group: Option<wgpu::BindGroup>,
+
     // Particle rendering
     pub(crate) particle_pipeline: Option<wgpu::RenderPipeline>,
     pub(crate) particle_bgs: Option<[wgpu::BindGroup; 2]>,
@@ -22,6 +30,8 @@ pub(crate) struct RenderState {
 impl Default for RenderState {
     fn default() -> Self {
         Self {
+            bg_pipeline: None,
+            bg_bind_group: None,
             particle_pipeline: None,
             particle_bgs: None,
             gra_line_pipeline: None,
@@ -97,6 +107,68 @@ pub(crate) fn init_render_state(
             dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
             operation: wgpu::BlendOperation::Add,
         },
+    });
+
+    // ── Background (current field) ─────────────────────────────────────────
+    let bg_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("render_background"),
+        source: wgpu::ShaderSource::Wgsl(RENDER_BACKGROUND_WGSL.into()),
+    });
+
+    let bg_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("bg_bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false, min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+
+    let bg_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("bg_bg"),
+        layout: &bg_bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: gpu.render_uniform_buf.as_entire_binding(),
+        }],
+    });
+
+    let bg_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("bg_pl"),
+        bind_group_layouts: &[&bg_bgl],
+        push_constant_ranges: &[],
+    });
+
+    let bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("bg_render"),
+        layout: Some(&bg_pl),
+        vertex: wgpu::VertexState {
+            module: &bg_shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &bg_shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: texture_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample,
+        multiview: None,
+        cache: None,
     });
 
     // ── Particle rendering ───────────────────────────────────────────────────
@@ -326,6 +398,8 @@ pub(crate) fn init_render_state(
         cache: None,
     });
 
+    rs.bg_pipeline = Some(bg_pipeline);
+    rs.bg_bind_group = Some(bg_bind_group);
     rs.particle_pipeline = Some(particle_pipeline);
     rs.particle_bgs = Some(particle_bgs);
     rs.gra_line_pipeline = Some(gra_line_pipeline);
@@ -370,6 +444,14 @@ pub(crate) fn render(_render_app: &RenderApp, model: &super::Model, mut frame: F
         });
 
         let quad_buf = rs.quad_vertex_buf.as_ref().unwrap();
+
+        // ── Draw background (current field) ─────────────────────────────
+        {
+            let bg_bg = rs.bg_bind_group.as_ref().unwrap();
+            pass.set_pipeline(rs.bg_pipeline.as_ref().unwrap());
+            pass.set_bind_group(0, bg_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
 
         // ── Draw GRA edges ───────────────────────────────────────────────
         if gpu.num_gra_connections > 0 {

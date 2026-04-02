@@ -27,9 +27,9 @@ struct RenderUniforms {
     world_half: f32,
     max_speed: f32,
     energy_scale: f32,
+    current_strength: f32,
+    time: f32,
     _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
 }
 
 struct VertexInput {

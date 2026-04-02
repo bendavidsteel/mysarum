@@ -27,6 +27,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     // Apply force
     vel += force.xy;
 
+    // Current force (scaled by dt for frame-rate independence)
+    vel += current_at_pos(pos.xy, params.world_half, params.time, params.current_strength) * params.dt;
+
     // Clamp velocity magnitude
     let speed = length(vel);
     if speed > params.gra_max_velocity {

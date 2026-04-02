@@ -176,6 +176,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
+    // ── Current force ──────────────────────────────────────────────────────
+
+    totalForce += current_at_pos(particle.pos, params.world_half, params.time, params.current_strength);
+
     // ── Integrate ───────────────────────────────────────────────────────────
 
     // Friction (pre-computed on CPU)

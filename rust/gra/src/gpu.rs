@@ -1,8 +1,8 @@
 use bytemuck::{Pod, Zeroable};
 use nannou::prelude::*;
 
-pub(crate) const MAX_NODES: usize = 4000;
-pub(crate) const MAX_CONNECTIONS: usize = 12000;
+pub(crate) const MAX_NODES: usize = 16000;
+pub(crate) const MAX_CONNECTIONS: usize = 48000;
 const MAX_ADJ_ENTRIES: usize = MAX_CONNECTIONS * 2;
 pub(crate) const WORKGROUP_SIZE: u32 = 64;
 const MAX_CHEB_ORDER: usize = 20;
@@ -24,12 +24,18 @@ pub(crate) struct GpuSimParams {
     pub(crate) spring_stiffness: f32,
     pub(crate) damping: f32,
     pub(crate) max_velocity: f32,
-    pub(crate) growth_mu: f32,
-    pub(crate) growth_sigma: f32,
     pub(crate) state_dt: f32,
     pub(crate) cheb_order: u32,
-    pub(crate) _pad0: f32,
-    pub(crate) _pad1: f32,
+    pub(crate) num_channels: u32,
+    pub(crate) _pad0: u32,
+    pub(crate) _pad1: u32,
+    pub(crate) _pad2: u32,
+    // vec4-aligned (offset 48)
+    pub(crate) growth_mu: [f32; 4],       // .xyz = per-channel mu
+    pub(crate) growth_sigma: [f32; 4],    // .xyz = per-channel sigma
+    pub(crate) coupling_row0: [f32; 4],   // .xyz = how R,G,B affect R
+    pub(crate) coupling_row1: [f32; 4],   // .xyz = how R,G,B affect G
+    pub(crate) coupling_row2: [f32; 4],   // .xyz = how R,G,B affect B
 }
 
 #[repr(C)]
@@ -43,6 +49,10 @@ pub(crate) struct RenderUniforms {
     pub(crate) num_nodes: u32,
     pub(crate) num_connections: u32,
     pub(crate) window_aspect: f32,
+    pub(crate) num_channels: u32,
+    pub(crate) _pad0: u32,
+    pub(crate) _pad1: u32,
+    pub(crate) _pad2: u32,
 }
 
 pub(crate) fn dispatch_count(n: u32) -> u32 {
@@ -55,8 +65,8 @@ pub(crate) struct GpuCompute {
     pub(crate) node_pos_buf: wgpu::Buffer,
     node_vel_buf: wgpu::Buffer,
     pub(crate) node_force_buf: wgpu::Buffer,
-    pub(crate) node_state_buf: wgpu::Buffer,
-    node_u_buf: wgpu::Buffer,
+    pub(crate) node_state_buf: wgpu::Buffer,  // vec4<f32> per node (xyz = RGB channels)
+    node_u_buf: wgpu::Buffer,                  // vec4<f32> per node
 
     // Adjacency list buffers
     adj_offset_buf: wgpu::Buffer,
@@ -65,7 +75,7 @@ pub(crate) struct GpuCompute {
     // Connection buffer (for line rendering)
     pub(crate) connection_buf: wgpu::Buffer,
 
-    // Chebyshev buffers
+    // Chebyshev buffers (all vec4<f32> per node)
     cheb_a_buf: wgpu::Buffer,
     cheb_b_buf: wgpu::Buffer,
     cheb_c_buf: wgpu::Buffer,
@@ -126,7 +136,7 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
     let pos_buf_size = (MAX_NODES * 16) as u64;      // vec4<f32>
     let vel_buf_size = pos_buf_size;
     let force_buf_size = pos_buf_size;
-    let state_buf_size = (MAX_NODES * 4) as u64;      // f32
+    let state_buf_size = (MAX_NODES * 16) as u64;     // vec4<f32> (xyz = RGB channels)
     let adj_offset_size = ((MAX_NODES + 1) * 4) as u64; // u32
     let adj_list_size = (MAX_ADJ_ENTRIES * 4) as u64;
     let conn_buf_size = (MAX_CONNECTIONS * 2 * 4) as u64; // pairs of u32
@@ -161,7 +171,7 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
         label: Some("connections"), size: conn_buf_size, usage: storage_r, mapped_at_creation: false,
     });
 
-    // Chebyshev buffers
+    // Chebyshev buffers (vec4 per node)
     let cheb_a_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("cheb_a"), size: state_buf_size, usage: storage_rw, mapped_at_creation: false,
     });
@@ -175,15 +185,15 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
         label: Some("cheb_result"), size: state_buf_size, usage: storage_rw, mapped_at_creation: false,
     });
     let cheb_c0_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("cheb_c0"), size: 4, usage: uniform, mapped_at_creation: false,
+        label: Some("cheb_c0"), size: 16, usage: uniform, mapped_at_creation: false,
     });
     let cheb_c1_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("cheb_c1"), size: 4, usage: uniform, mapped_at_creation: false,
+        label: Some("cheb_c1"), size: 16, usage: uniform, mapped_at_creation: false,
     });
     let cheb_coeff_bufs: Vec<wgpu::Buffer> = (0..MAX_CHEB_ORDER)
         .map(|i| device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(&format!("cheb_coeff_{}", i)),
-            size: 4,
+            size: 16,
             usage: uniform,
             mapped_at_creation: false,
         }))
@@ -476,7 +486,7 @@ pub(crate) fn upload_topology(
     queue: &wgpu::Queue,
     gpu: &mut GpuCompute,
     positions: &[(f32, f32)],
-    states: &[f32],
+    states: &[[f32; 3]],
     connections: &[(usize, usize)],
 ) {
     let n = positions.len().min(MAX_NODES);
@@ -490,8 +500,11 @@ pub(crate) fn upload_topology(
         .collect();
     queue.write_buffer(&gpu.node_pos_buf, 0, bytemuck::cast_slice(&pos_data));
 
-    // Upload states
-    queue.write_buffer(&gpu.node_state_buf, 0, bytemuck::cast_slice(&states[..n]));
+    // Upload states (vec4: r, g, b, 0)
+    let state_data: Vec<[f32; 4]> = states[..n].iter()
+        .map(|&[r, g, b]| [r, g, b, 0.0])
+        .collect();
+    queue.write_buffer(&gpu.node_state_buf, 0, bytemuck::cast_slice(&state_data));
 
     // Clear velocities
     let zeros = vec![[0.0f32; 4]; n];
@@ -577,14 +590,14 @@ pub(crate) fn readback_bbox_and_positions(device: &wgpu::Device, gpu: &GpuComput
     (bbox, positions)
 }
 
-///// Read back states and u values (positions already read back every frame).
+/// Read back states and u values (vec4 per node, xyz = RGB channels).
 pub(crate) struct StateReadback {
-    pub(crate) states: Vec<f32>,
-    pub(crate) u_values: Vec<f32>,
+    pub(crate) states: Vec<[f32; 3]>,
+    pub(crate) u_values: Vec<[f32; 3]>,
 }
 
 pub(crate) fn readback_states(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &GpuCompute, num_nodes: usize) -> StateReadback {
-    let state_size = (num_nodes * 4) as u64;
+    let state_size = (num_nodes * 16) as u64;  // vec4<f32> per node
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("readback_encoder"),
@@ -601,15 +614,15 @@ pub(crate) fn readback_states(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &
 
     let states = {
         let data = state_slice.get_mapped_range();
-        let floats: &[f32] = bytemuck::cast_slice(&data);
-        floats[..num_nodes].to_vec()
+        let floats: &[[f32; 4]] = bytemuck::cast_slice(&data);
+        floats[..num_nodes].iter().map(|f| [f[0], f[1], f[2]]).collect()
     };
     gpu.state_readback_buf.unmap();
 
     let u_values = {
         let data = u_slice.get_mapped_range();
-        let floats: &[f32] = bytemuck::cast_slice(&data);
-        floats[..num_nodes].to_vec()
+        let floats: &[[f32; 4]] = bytemuck::cast_slice(&data);
+        floats[..num_nodes].iter().map(|f| [f[0], f[1], f[2]]).collect()
     };
     gpu.u_readback_buf.unmap();
 
@@ -620,26 +633,13 @@ pub(crate) fn update_render_uniforms(queue: &wgpu::Queue, gpu: &GpuCompute, unif
     queue.write_buffer(&gpu.render_uniform_buf, 0, bytemuck::bytes_of(uniforms));
 }
 
-pub(crate) fn gpu_dispatch_frame(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    gpu: &mut GpuCompute,
-    params: &GpuSimParams,
-    cheb_order: usize,
-    cheb_coeffs: &[f32; 20],
+/// Encode physics passes (forces + integrate) and bbox reduction into the encoder.
+/// Shared by both continuous and discrete CA modes.
+fn encode_physics_and_bbox(
+    encoder: &mut wgpu::CommandEncoder,
+    gpu: &GpuCompute,
+    n: u32,
 ) {
-    let n = params.num_nodes;
-
-    // Upload sim params
-    queue.write_buffer(&gpu.sim_params_buf, 0, bytemuck::bytes_of(params));
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("compute_encoder"),
-    });
-
-    // ── Forces ──────────────────────────────────────────────────────────
-    // Repulsion forces already uploaded to node_force_buf from CPU Barnes-Hut.
-
     // Spring forces (adds to existing repulsion force)
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -662,55 +662,7 @@ pub(crate) fn gpu_dispatch_frame(
         pass.dispatch_workgroups(dispatch_count(n), 1, 1);
     }
 
-    // ── State evolution (Chebyshev) ─────────────────────────────────────
-
-    // Upload chebyshev coefficients
-    queue.write_buffer(&gpu.cheb_c0_buf, 0, bytemuck::bytes_of(&cheb_coeffs[0]));
-    queue.write_buffer(&gpu.cheb_c1_buf, 0, bytemuck::bytes_of(&cheb_coeffs[1]));
-
-    // Init: T_0 = state → cheb_a, T_1 = W(state) → cheb_b, result = c0*T0 + c1*T1
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("cheb_init"), timestamp_writes: None,
-        });
-        pass.set_pipeline(&gpu.chebyshev_init_pipeline);
-        pass.set_bind_group(0, &gpu.cheb_init_data_bg, &[]);
-        pass.set_bind_group(1, &gpu.cheb_init_params_bg, &[]);
-        pass.dispatch_workgroups(dispatch_count(n), 1, 1);
-    }
-
-    // Chebyshev steps k=2..cheb_order
-    for k in 2..cheb_order {
-        if k < gpu.cheb_coeff_bufs.len() {
-            queue.write_buffer(&gpu.cheb_coeff_bufs[k], 0, bytemuck::bytes_of(&cheb_coeffs[k]));
-        }
-    }
-    for k in 2..cheb_order {
-        let bg_idx = (k - 2) % 3;
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("cheb_step"), timestamp_writes: None,
-            });
-            pass.set_pipeline(&gpu.chebyshev_step_pipeline);
-            pass.set_bind_group(0, &gpu.cheb_step_data_bgs[bg_idx], &[]);
-            pass.set_bind_group(1, &gpu.cheb_step_params_bgs[k], &[]);
-            pass.dispatch_workgroups(dispatch_count(n), 1, 1);
-        }
-    }
-
-    // Growth function (state update from Chebyshev result)
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("growth"), timestamp_writes: None,
-        });
-        pass.set_pipeline(&gpu.growth_pipeline);
-        pass.set_bind_group(0, &gpu.growth_data_bg, &[]);
-        pass.set_bind_group(1, &gpu.growth_params_bg, &[]);
-        pass.dispatch_workgroups(dispatch_count(n), 1, 1);
-    }
-
-    // ── Bounding box reduction ──────────────────────────────────────────
-
+    // Bounding box reduction
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("bbox_clear"), timestamp_writes: None,
@@ -734,6 +686,167 @@ pub(crate) fn gpu_dispatch_frame(
     encoder.copy_buffer_to_buffer(&gpu.bbox_atomic_buf, 0, &gpu.bbox_readback_buf, 0, 16);
     let pos_copy_size = (n as u64) * 16;
     encoder.copy_buffer_to_buffer(&gpu.node_pos_buf, 0, &gpu.pos_readback_buf, 0, pos_copy_size);
+}
+
+/// Full GPU frame: physics + Chebyshev state evolution (continuous CA mode).
+pub(crate) fn gpu_dispatch_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    gpu: &mut GpuCompute,
+    params: &GpuSimParams,
+    cheb_order: usize,
+    cheb_coeffs: &[[f32; 4]; 20],
+) {
+    let n = params.num_nodes;
+    queue.write_buffer(&gpu.sim_params_buf, 0, bytemuck::bytes_of(params));
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("compute_encoder"),
+    });
+
+    // Physics (forces + integrate)
+    // Spring forces
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("spring_forces"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.spring_forces_pipeline);
+        pass.set_bind_group(0, &gpu.spring_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.spring_params_bg, &[]);
+        pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+    }
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("integrate"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.integrate_pipeline);
+        pass.set_bind_group(0, &gpu.integrate_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.integrate_params_bg, &[]);
+        pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+    }
+
+    // ── State evolution (Chebyshev) ─────────────────────────────────────
+    queue.write_buffer(&gpu.cheb_c0_buf, 0, bytemuck::cast_slice(&cheb_coeffs[0]));
+    queue.write_buffer(&gpu.cheb_c1_buf, 0, bytemuck::cast_slice(&cheb_coeffs[1]));
+
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("cheb_init"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.chebyshev_init_pipeline);
+        pass.set_bind_group(0, &gpu.cheb_init_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.cheb_init_params_bg, &[]);
+        pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+    }
+
+    for k in 2..cheb_order {
+        if k < gpu.cheb_coeff_bufs.len() {
+            queue.write_buffer(&gpu.cheb_coeff_bufs[k], 0, bytemuck::cast_slice(&cheb_coeffs[k]));
+        }
+    }
+    for k in 2..cheb_order {
+        let bg_idx = (k - 2) % 3;
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cheb_step"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&gpu.chebyshev_step_pipeline);
+            pass.set_bind_group(0, &gpu.cheb_step_data_bgs[bg_idx], &[]);
+            pass.set_bind_group(1, &gpu.cheb_step_params_bgs[k], &[]);
+            pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+        }
+    }
+
+    // Growth function
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("growth"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.growth_pipeline);
+        pass.set_bind_group(0, &gpu.growth_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.growth_params_bg, &[]);
+        pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+    }
+
+    // ── Bounding box reduction ──────────────────────────────────────────
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("bbox_clear"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.bbox_clear_pipeline);
+        pass.set_bind_group(0, &gpu.bbox_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.bbox_params_bg, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("bbox_reduce"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.bbox_reduce_pipeline);
+        pass.set_bind_group(0, &gpu.bbox_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.bbox_params_bg, &[]);
+        pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+    }
+
+    encoder.copy_buffer_to_buffer(&gpu.bbox_atomic_buf, 0, &gpu.bbox_readback_buf, 0, 16);
+    let pos_copy_size = (n as u64) * 16;
+    encoder.copy_buffer_to_buffer(&gpu.node_pos_buf, 0, &gpu.pos_readback_buf, 0, pos_copy_size);
 
     queue.submit(Some(encoder.finish()));
+}
+
+/// Physics-only GPU frame: forces + integrate + bbox (discrete CA mode).
+/// State evolution is handled on CPU.
+pub(crate) fn gpu_dispatch_physics_only(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    gpu: &mut GpuCompute,
+    params: &GpuSimParams,
+) {
+    let n = params.num_nodes;
+    queue.write_buffer(&gpu.sim_params_buf, 0, bytemuck::bytes_of(params));
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("compute_encoder_physics"),
+    });
+
+    encode_physics_and_bbox(&mut encoder, gpu, n);
+
+    queue.submit(Some(encoder.finish()));
+}
+
+/// Upload discrete states to the GPU node_state_buf for rendering.
+/// Maps discrete states to distinct colors via HSV hue rotation.
+pub(crate) fn upload_discrete_states(
+    queue: &wgpu::Queue,
+    gpu: &GpuCompute,
+    discrete_states: &[u8],
+    num_states: u8,
+) {
+    let state_data: Vec<[f32; 4]> = discrete_states.iter()
+        .map(|&s| {
+            let t = (s as f32) / ((num_states.max(2) - 1) as f32);
+            // Purple (280°) → orange (30°), wrapping through red
+            let hue = ((280.0 + t * 110.0) % 360.0) / 360.0;
+            let (r, g, b) = hsv_to_rgb(hue, 0.85, 0.95);
+            [r, g, b, 0.0]
+        })
+        .collect();
+    queue.write_buffer(&gpu.node_state_buf, 0, bytemuck::cast_slice(&state_data));
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
+    let i = (h * 6.0).floor() as i32;
+    let f = h * 6.0 - i as f32;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - f * s);
+    let t = v * (1.0 - (1.0 - f) * s);
+    match i % 6 {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    }
 }

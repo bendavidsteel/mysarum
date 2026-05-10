@@ -1,6 +1,6 @@
 // Shared bindings for both node and line rendering
 @group(0) @binding(0) var<storage, read> node_pos: array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read> node_state: array<f32>;
+@group(0) @binding(1) var<storage, read> node_state: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> connections: array<u32>;
 @group(0) @binding(3) var<uniform> uniforms: RenderUniforms;
 
@@ -13,6 +13,10 @@ struct RenderUniforms {
     num_nodes: u32,
     num_connections: u32,
     window_aspect: f32,
+    num_channels: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 fn world_to_clip(wx: f32, wy: f32) -> vec2<f32> {
@@ -21,51 +25,6 @@ fn world_to_clip(wx: f32, wy: f32) -> vec2<f32> {
     let cx = 2.0 * (wx - uniforms.min_x) / range_x - 1.0;
     let cy = 2.0 * (wy - uniforms.min_y) / range_y - 1.0;
     return vec2(cx, cy);
-}
-
-// ── Node rendering (instanced quads with bloom) ────────────────────────────
-
-struct NodeVertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-    @location(1) state: f32,
-}
-
-@vertex
-fn vs_node(
-    @location(0) quad_pos: vec2<f32>,
-    @location(1) quad_uv: vec2<f32>,
-    @builtin(instance_index) instance: u32,
-) -> NodeVertexOutput {
-    var out: NodeVertexOutput;
-
-    if instance >= uniforms.num_nodes {
-        out.clip_position = vec4(0.0, 0.0, -2.0, 1.0);
-        out.uv = vec2(0.0);
-        out.state = 0.0;
-        return out;
-    }
-
-    let pos = node_pos[instance];
-    if pos.w < 0.0 {
-        out.clip_position = vec4(0.0, 0.0, -2.0, 1.0);
-        out.uv = vec2(0.0);
-        out.state = 0.0;
-        return out;
-    }
-
-    let center = world_to_clip(pos.x, pos.y);
-    let range_x = uniforms.max_x - uniforms.min_x;
-    let range_y = uniforms.max_y - uniforms.min_y;
-    // Use uniform world-space radius, then correct for aspect ratio
-    let world_size = uniforms.node_radius * 2.0 * 8.0;
-    let size_x = world_size / range_x;
-    let size_y = world_size / range_x * uniforms.window_aspect;
-
-    out.clip_position = vec4(center + quad_pos * vec2(size_x, size_y), 0.0, 1.0);
-    out.uv = quad_uv;
-    out.state = node_state[instance];
-    return out;
 }
 
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
@@ -83,6 +42,72 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
     return rgb + vec3(m);
 }
 
+fn get_node_color(instance: u32) -> vec3<f32> {
+    let state = node_state[instance];
+    if uniforms.num_channels == 1u {
+        // Single channel: purple (state=0) to orange (state=1)
+        let hue = mix(280.0, 30.0, state.x) / 360.0;
+        return hsv_to_rgb(hue, 1.0, 1.0);
+    } else {
+        // 3-channel: direct RGB
+        return state.xyz;
+    }
+}
+
+fn get_node_color_core(instance: u32) -> vec3<f32> {
+    let state = node_state[instance];
+    if uniforms.num_channels == 1u {
+        let hue = mix(280.0, 30.0, state.x) / 360.0;
+        return hsv_to_rgb(hue, 0.7, 1.0);
+    } else {
+        // Brighten for core: mix toward white
+        return mix(state.xyz, vec3(1.0), 0.3);
+    }
+}
+
+// ── Node rendering (instanced quads with bloom) ────────────────────────────
+
+struct NodeVertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) color: vec3<f32>,
+}
+
+@vertex
+fn vs_node(
+    @location(0) quad_pos: vec2<f32>,
+    @location(1) quad_uv: vec2<f32>,
+    @builtin(instance_index) instance: u32,
+) -> NodeVertexOutput {
+    var out: NodeVertexOutput;
+
+    if instance >= uniforms.num_nodes {
+        out.clip_position = vec4(0.0, 0.0, -2.0, 1.0);
+        out.uv = vec2(0.0);
+        out.color = vec3(0.0);
+        return out;
+    }
+
+    let pos = node_pos[instance];
+    if pos.w < 0.0 {
+        out.clip_position = vec4(0.0, 0.0, -2.0, 1.0);
+        out.uv = vec2(0.0);
+        out.color = vec3(0.0);
+        return out;
+    }
+
+    let center = world_to_clip(pos.x, pos.y);
+    let range_x = uniforms.max_x - uniforms.min_x;
+    let world_size = uniforms.node_radius * 2.0 * 8.0;
+    let size_x = world_size / range_x;
+    let size_y = world_size / range_x * uniforms.window_aspect;
+
+    out.clip_position = vec4(center + quad_pos * vec2(size_x, size_y), 0.0, 1.0);
+    out.uv = quad_uv;
+    out.color = get_node_color(instance);
+    return out;
+}
+
 // Bloom pass (additive blending)
 @fragment
 fn fs_node(in: NodeVertexOutput) -> @location(0) vec4<f32> {
@@ -90,13 +115,8 @@ fn fs_node(in: NodeVertexOutput) -> @location(0) vec4<f32> {
     let dist = length(centered) * 2.0;
     if dist > 1.0 { discard; }
 
-    // Color from state (hue 180-250 degrees)
-    let hue = mix(180.0, 250.0, in.state) / 360.0;
-    let rgb = hsv_to_rgb(hue, 1.0, 1.0);
-
-    // Soft bloom falloff
     let glow = pow(1.0 - dist, 2.0) * 0.6;
-    return vec4(rgb * glow, glow);
+    return vec4(in.color * glow, glow);
 }
 
 // Opaque core pass (standard alpha blending, drawn on top)
@@ -111,7 +131,7 @@ fn vs_core(
     if instance >= uniforms.num_nodes {
         out.clip_position = vec4(0.0, 0.0, -2.0, 1.0);
         out.uv = vec2(0.0);
-        out.state = 0.0;
+        out.color = vec3(0.0);
         return out;
     }
 
@@ -119,20 +139,19 @@ fn vs_core(
     if pos.w < 0.0 {
         out.clip_position = vec4(0.0, 0.0, -2.0, 1.0);
         out.uv = vec2(0.0);
-        out.state = 0.0;
+        out.color = vec3(0.0);
         return out;
     }
 
     let center = world_to_clip(pos.x, pos.y);
     let range_x = uniforms.max_x - uniforms.min_x;
-    // Core is smaller than bloom quad
     let world_size = uniforms.node_radius * 2.0;
     let size_x = world_size / range_x;
     let size_y = world_size / range_x * uniforms.window_aspect;
 
     out.clip_position = vec4(center + quad_pos * vec2(size_x, size_y), 0.0, 1.0);
     out.uv = quad_uv;
-    out.state = node_state[instance];
+    out.color = get_node_color_core(instance);
     return out;
 }
 
@@ -141,15 +160,10 @@ fn fs_core(in: NodeVertexOutput) -> @location(0) vec4<f32> {
     let centered = in.uv - vec2(0.5);
     let dist = length(centered) * 2.0;
 
-    // Anti-aliased circle
     let alpha = smoothstep(1.0, 0.85, dist);
     if alpha < 0.001 { discard; }
 
-    // Color from state (hue 180-250 degrees), brighter for core
-    let hue = mix(180.0, 250.0, in.state) / 360.0;
-    let rgb = hsv_to_rgb(hue, 0.7, 1.0);
-
-    return vec4(rgb, alpha);
+    return vec4(in.color, alpha);
 }
 
 // ── Line rendering (connection edges) ──────────────────────────────────────

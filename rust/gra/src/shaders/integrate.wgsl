@@ -12,7 +12,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     var vel = node_vel[id.x].xy;
     let force = node_force[id.x].xy;
 
-    // Add force to velocity
+    // Apply damping first (velocity decay), then add force
+    vel *= (1.0 - params.damping);
     vel += force;
 
     // Clamp velocity magnitude
@@ -25,7 +26,5 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     p = vec4f(p.xy + vel, 0.0, p.w);
     node_pos[id.x] = p;
 
-    // Apply damping
-    vel *= (1.0 - params.damping);
     node_vel[id.x] = vec4f(vel, 0.0, 0.0);
 }

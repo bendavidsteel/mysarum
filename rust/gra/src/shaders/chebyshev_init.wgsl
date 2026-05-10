@@ -1,15 +1,16 @@
 // Initialize Chebyshev: T_0 = state, T_1 = W(state), result = c0*T_0 + c1*T_1
 // Uses adjacency list for averaging operator W
+// All state data is vec4 (xyz = RGB channels)
 
-@group(0) @binding(0) var<storage, read> node_state: array<f32>;
-@group(0) @binding(1) var<storage, read_write> t_a: array<f32>;   // will hold T_0 (=state)
-@group(0) @binding(2) var<storage, read_write> t_b: array<f32>;   // will hold T_1 (=W(state))
-@group(0) @binding(3) var<storage, read_write> result: array<f32>;
+@group(0) @binding(0) var<storage, read> node_state: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> t_a: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> t_b: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> result: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read> adj_offset: array<u32>;
 @group(0) @binding(5) var<storage, read> adj_list: array<u32>;
 @group(1) @binding(0) var<uniform> params: SimParams;
-@group(1) @binding(1) var<uniform> c0: f32;
-@group(1) @binding(2) var<uniform> c1: f32;
+@group(1) @binding(1) var<uniform> c0: vec4<f32>;
+@group(1) @binding(2) var<uniform> c1: vec4<f32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3u) {
@@ -25,7 +26,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     let count = end - start;
     if count > 0u {
-        var sum = 0.0;
+        var sum = vec4<f32>(0.0);
         for (var k = start; k < end; k += 1u) {
             let j = adj_list[k];
             sum += node_state[j];

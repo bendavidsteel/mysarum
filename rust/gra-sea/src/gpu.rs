@@ -1,0 +1,1247 @@
+use bytemuck::{Pod, Zeroable};
+use nannou::prelude::*;
+
+pub(crate) const MAX_NODES: usize = 16000;
+pub(crate) const MAX_CONNECTIONS: usize = 48000;
+const MAX_ADJ_ENTRIES: usize = MAX_CONNECTIONS * 2;
+pub(crate) const WORKGROUP_SIZE: u32 = 64;
+const MAX_CHEB_ORDER: usize = 20;
+
+// Shader sources (loaded at compile time, common prepended)
+const SPRING_FORCES_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/spring_forces.wgsl"));
+const CHEB_INIT_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/chebyshev_init.wgsl"));
+const CHEB_STEP_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/chebyshev_step.wgsl"));
+const GROWTH_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/growth.wgsl"));
+const INTEGRATE_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/integrate.wgsl"));
+const BBOX_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/bbox.wgsl"));
+const MODAL_CHEB_INIT_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/modal_cheb_init.wgsl"));
+const MODAL_CHEB_STEP_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/modal_cheb_step.wgsl"));
+const MODAL_AUDIO_WGSL: &str = include_str!("shaders/modal_audio.wgsl");
+const MODAL_PHASE_UPDATE_WGSL: &str = include_str!("shaders/modal_phase_update.wgsl");
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub(crate) struct GpuSimParams {
+    pub(crate) num_nodes: u32,
+    pub(crate) num_connections: u32,
+    pub(crate) spring_length: f32,
+    pub(crate) spring_stiffness: f32,
+    pub(crate) damping: f32,
+    pub(crate) max_velocity: f32,
+    pub(crate) state_dt: f32,
+    pub(crate) cheb_order: u32,
+    pub(crate) num_channels: u32,
+    pub(crate) world_half: f32,
+    pub(crate) _pad1: u32,
+    pub(crate) _pad2: u32,
+    // vec4-aligned (offset 48)
+    pub(crate) growth_mu: [f32; 4],       // .xyz = per-channel mu
+    pub(crate) growth_sigma: [f32; 4],    // .xyz = per-channel sigma
+    pub(crate) coupling_row0: [f32; 4],   // .xyz = how R,G,B affect R
+    pub(crate) coupling_row1: [f32; 4],   // .xyz = how R,G,B affect G
+    pub(crate) coupling_row2: [f32; 4],   // .xyz = how R,G,B affect B
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub(crate) struct GpuNodeGrowthParams {
+    pub(crate) growth_mu: [f32; 4],
+    pub(crate) growth_sigma: [f32; 4],
+    pub(crate) coupling_row0: [f32; 4],
+    pub(crate) coupling_row1: [f32; 4],
+    pub(crate) coupling_row2: [f32; 4],
+    pub(crate) state_dt: f32,
+    pub(crate) num_channels: u32,
+    pub(crate) _pad0: u32,
+    pub(crate) _pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub(crate) struct RenderUniforms {
+    pub(crate) min_x: f32,
+    pub(crate) min_y: f32,
+    pub(crate) max_x: f32,
+    pub(crate) max_y: f32,
+    pub(crate) node_radius: f32,
+    pub(crate) num_nodes: u32,
+    pub(crate) num_connections: u32,
+    pub(crate) window_aspect: f32,
+    pub(crate) num_channels: u32,
+    pub(crate) world_half: f32,
+    pub(crate) _pad1: u32,
+    pub(crate) _pad2: u32,
+}
+
+pub(crate) const SAMPLE_RATE: u32 = 44100;
+pub(crate) const CHUNK_SIZE: u32 = 2048;
+pub(crate) const NUM_CHANNELS: u32 = 2;
+pub(crate) const NUM_AUDIO_STAGING_BUFS: usize = 4;
+pub(crate) const CHUNK_FLOATS: u32 = CHUNK_SIZE * NUM_CHANNELS;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub(crate) struct AudioParams {
+    pub(crate) sample_rate: f32,
+    pub(crate) num_nodes: u32,
+    pub(crate) chunk_size: u32,
+    pub(crate) volume: f32,
+    pub(crate) current_x: [f32; 2],
+    pub(crate) current_y: [f32; 2],
+    pub(crate) max_speed: f32,
+    pub(crate) num_states: u32,
+    pub(crate) _pad0: u32,
+    pub(crate) _pad1: u32,
+}
+
+pub(crate) const NUM_MODAL_BANDS: usize = 8;
+pub(crate) const MODAL_CHEB_ORDER: usize = 12;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub(crate) struct ModalFreqs {
+    pub(crate) lo: [f32; 4],
+    pub(crate) hi: [f32; 4],
+}
+
+pub(crate) fn dispatch_count(n: u32) -> u32 {
+    (n + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE
+}
+
+#[derive(Clone)]
+pub(crate) struct GpuCompute {
+    // Node buffers
+    pub(crate) node_pos_buf: wgpu::Buffer,
+    node_vel_buf: wgpu::Buffer,
+    pub(crate) node_force_buf: wgpu::Buffer,
+    pub(crate) node_state_buf: wgpu::Buffer,  // vec4<f32> per node (xyz = RGB channels)
+    node_u_buf: wgpu::Buffer,                  // vec4<f32> per node
+    pub(crate) node_growth_buf: wgpu::Buffer,  // NodeGrowthParams per node
+
+    // Adjacency list buffers
+    adj_offset_buf: wgpu::Buffer,
+    adj_list_buf: wgpu::Buffer,
+
+    // Connection buffer (for line rendering)
+    pub(crate) connection_buf: wgpu::Buffer,
+
+    // Chebyshev buffers (all vec4<f32> per node)
+    cheb_a_buf: wgpu::Buffer,
+    cheb_b_buf: wgpu::Buffer,
+    cheb_c_buf: wgpu::Buffer,
+    cheb_result_buf: wgpu::Buffer,
+    cheb_c0_buf: wgpu::Buffer,
+    cheb_c1_buf: wgpu::Buffer,
+    cheb_coeff_bufs: Vec<wgpu::Buffer>,
+
+    // Params
+    sim_params_buf: wgpu::Buffer,
+
+    // Readback
+    pos_readback_buf: wgpu::Buffer,
+    state_readback_buf: wgpu::Buffer,
+    u_readback_buf: wgpu::Buffer,
+
+    // Bounding box reduction
+    bbox_atomic_buf: wgpu::Buffer,
+    bbox_readback_buf: wgpu::Buffer,
+
+    // Pipelines
+    spring_forces_pipeline: wgpu::ComputePipeline,
+    chebyshev_init_pipeline: wgpu::ComputePipeline,
+    chebyshev_step_pipeline: wgpu::ComputePipeline,
+    growth_pipeline: wgpu::ComputePipeline,
+    integrate_pipeline: wgpu::ComputePipeline,
+    bbox_clear_pipeline: wgpu::ComputePipeline,
+    bbox_reduce_pipeline: wgpu::ComputePipeline,
+
+    // Bind groups - forces
+    spring_data_bg: wgpu::BindGroup,
+    spring_params_bg: wgpu::BindGroup,
+
+    // Bind groups - chebyshev
+    cheb_init_data_bg: wgpu::BindGroup,
+    cheb_init_params_bg: wgpu::BindGroup,
+    cheb_step_data_bgs: [wgpu::BindGroup; 3],
+    cheb_step_params_bgs: Vec<wgpu::BindGroup>,
+
+    // Bind groups - growth + integrate + bbox
+    growth_data_bg: wgpu::BindGroup,
+    growth_params_bg: wgpu::BindGroup,
+    integrate_data_bg: wgpu::BindGroup,
+    integrate_params_bg: wgpu::BindGroup,
+    bbox_data_bg: wgpu::BindGroup,
+    bbox_params_bg: wgpu::BindGroup,
+
+    // Render buffers
+    pub(crate) render_uniform_buf: wgpu::Buffer,
+
+    // Audio buffers (shared with modal synthesis)
+    pub(crate) audio_out_buf: wgpu::Buffer,         // vec2 per sample
+    pub(crate) audio_staging_bufs: Vec<wgpu::Buffer>,
+    pub(crate) audio_params_buf: wgpu::Buffer,
+
+    // Modal synthesis buffers
+    pub(crate) modal_amp_buf: wgpu::Buffer,      // 2 vec4 per node (8 bands)
+    pub(crate) modal_phase_buf: wgpu::Buffer,     // 2 vec4 per node (8 phases)
+    pub(crate) modal_freq_buf: wgpu::Buffer,      // ModalFreqs uniform (2 vec4 = 8 freqs)
+    modal_coeff_lo_bufs: Vec<wgpu::Buffer>,       // MAX_CHEB_ORDER uniform bufs (bands 0-3)
+    modal_coeff_hi_bufs: Vec<wgpu::Buffer>,       // MAX_CHEB_ORDER uniform bufs (bands 4-7)
+
+    // Modal pipelines
+    modal_cheb_init_pipeline: wgpu::ComputePipeline,
+    modal_cheb_step_pipeline: wgpu::ComputePipeline,
+    modal_audio_pipeline: wgpu::ComputePipeline,
+    modal_phase_update_pipeline: wgpu::ComputePipeline,
+
+    // Modal bind groups
+    modal_cheb_init_data_bg: wgpu::BindGroup,
+    modal_cheb_init_params_bg: wgpu::BindGroup,
+    modal_cheb_step_data_bgs: [wgpu::BindGroup; 3],
+    modal_cheb_step_params_bgs: Vec<wgpu::BindGroup>,
+    modal_audio_bg: wgpu::BindGroup,
+    modal_phase_update_bg: wgpu::BindGroup,
+
+    // Config
+    pub(crate) topology_dirty: bool,
+    pub(crate) num_nodes: u32,
+    pub(crate) num_connections: u32,
+}
+
+pub(crate) fn create_gpu_compute(device: &wgpu::Device, _queue: &wgpu::Queue) -> GpuCompute {
+    let pos_buf_size = (MAX_NODES * 16) as u64;      // vec4<f32>
+    let vel_buf_size = pos_buf_size;
+    let force_buf_size = pos_buf_size;
+    let state_buf_size = (MAX_NODES * 16) as u64;     // vec4<f32> (xyz = RGB channels)
+    let adj_offset_size = ((MAX_NODES + 1) * 4) as u64; // u32
+    let adj_list_size = (MAX_ADJ_ENTRIES * 4) as u64;
+    let conn_buf_size = (MAX_CONNECTIONS * 2 * 4) as u64; // pairs of u32
+
+    let storage_rw = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
+    let storage_r = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+    let uniform = wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
+
+    // Create buffers
+    let node_pos_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("node_pos"), size: pos_buf_size, usage: storage_rw, mapped_at_creation: false,
+    });
+    let node_vel_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("node_vel"), size: vel_buf_size, usage: storage_rw, mapped_at_creation: false,
+    });
+    let node_force_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("node_force"), size: force_buf_size, usage: storage_rw, mapped_at_creation: false,
+    });
+    let node_state_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("node_state"), size: state_buf_size, usage: storage_rw, mapped_at_creation: false,
+    });
+    let node_u_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("node_u"), size: state_buf_size, usage: storage_rw, mapped_at_creation: false,
+    });
+    let node_growth_buf_size = (MAX_NODES * std::mem::size_of::<GpuNodeGrowthParams>()) as u64;
+    let node_growth_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("node_growth"), size: node_growth_buf_size, usage: storage_r, mapped_at_creation: false,
+    });
+    let adj_offset_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("adj_offset"), size: adj_offset_size, usage: storage_r, mapped_at_creation: false,
+    });
+    let adj_list_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("adj_list"), size: adj_list_size, usage: storage_r, mapped_at_creation: false,
+    });
+    let connection_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("connections"), size: conn_buf_size, usage: storage_r, mapped_at_creation: false,
+    });
+
+    // Chebyshev buffers (vec4 per node)
+    let cheb_a_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cheb_a"), size: state_buf_size, usage: storage_rw, mapped_at_creation: false,
+    });
+    let cheb_b_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cheb_b"), size: state_buf_size, usage: storage_rw, mapped_at_creation: false,
+    });
+    let cheb_c_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cheb_c"), size: state_buf_size, usage: storage_rw, mapped_at_creation: false,
+    });
+    let cheb_result_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cheb_result"), size: state_buf_size, usage: storage_rw, mapped_at_creation: false,
+    });
+    let cheb_c0_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cheb_c0"), size: 16, usage: uniform, mapped_at_creation: false,
+    });
+    let cheb_c1_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cheb_c1"), size: 16, usage: uniform, mapped_at_creation: false,
+    });
+    let cheb_coeff_bufs: Vec<wgpu::Buffer> = (0..MAX_CHEB_ORDER)
+        .map(|i| device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&format!("cheb_coeff_{}", i)),
+            size: 16,
+            usage: uniform,
+            mapped_at_creation: false,
+        }))
+        .collect();
+
+    let sim_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sim_params"), size: std::mem::size_of::<GpuSimParams>() as u64, usage: uniform, mapped_at_creation: false,
+    });
+    let render_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("render_uniform"), size: std::mem::size_of::<RenderUniforms>() as u64, usage: uniform, mapped_at_creation: false,
+    });
+    let pos_readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("pos_readback"), size: pos_buf_size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+    });
+    let state_readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("state_readback"), size: state_buf_size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+    });
+    let u_readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("u_readback"), size: state_buf_size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+    });
+    let bbox_atomic_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bbox_atomic"), size: 16, usage: storage_rw, mapped_at_creation: false,
+    });
+    let bbox_readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bbox_readback"), size: 16,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+    });
+
+    // Create shader modules
+    let spring_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("spring_forces"), source: wgpu::ShaderSource::Wgsl(SPRING_FORCES_WGSL.into()),
+    });
+    let cheb_init_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("cheb_init"), source: wgpu::ShaderSource::Wgsl(CHEB_INIT_WGSL.into()),
+    });
+    let cheb_step_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("cheb_step"), source: wgpu::ShaderSource::Wgsl(CHEB_STEP_WGSL.into()),
+    });
+    let growth_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("growth"), source: wgpu::ShaderSource::Wgsl(GROWTH_WGSL.into()),
+    });
+    let integrate_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("integrate"), source: wgpu::ShaderSource::Wgsl(INTEGRATE_WGSL.into()),
+    });
+    let bbox_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("bbox"), source: wgpu::ShaderSource::Wgsl(BBOX_WGSL.into()),
+    });
+
+    let cs = wgpu::ShaderStages::COMPUTE;
+
+    // ── Bind group layouts ──────────────────────────────────────────────────
+
+    let params_layout = wgpu::BindGroupLayoutBuilder::new()
+        .uniform_buffer(cs, false)
+        .build(device);
+
+    // Spring forces: pos(R) + force(RW) + adj_offset(R) + adj_list(R)
+    let spring_data_layout = wgpu::BindGroupLayoutBuilder::new()
+        .storage_buffer(cs, false, true)   // node_pos
+        .storage_buffer(cs, false, false)  // node_force
+        .storage_buffer(cs, false, true)   // adj_offset
+        .storage_buffer(cs, false, true)   // adj_list
+        .build(device);
+
+    // Chebyshev init: state(R) + t_a(RW) + t_b(RW) + result(RW) + adj_offset(R) + adj_list(R)
+    let cheb_init_data_layout = wgpu::BindGroupLayoutBuilder::new()
+        .storage_buffer(cs, false, true)   // node_state
+        .storage_buffer(cs, false, false)  // t_a
+        .storage_buffer(cs, false, false)  // t_b
+        .storage_buffer(cs, false, false)  // result
+        .storage_buffer(cs, false, true)   // adj_offset
+        .storage_buffer(cs, false, true)   // adj_list
+        .build(device);
+    let cheb_init_params_layout = wgpu::BindGroupLayoutBuilder::new()
+        .uniform_buffer(cs, false)  // params
+        .uniform_buffer(cs, false)  // c0
+        .uniform_buffer(cs, false)  // c1
+        .build(device);
+
+    // Chebyshev step: t_curr(R) + t_prev(R) + t_next(RW) + result(RW) + adj_offset(R) + adj_list(R)
+    let cheb_step_data_layout = wgpu::BindGroupLayoutBuilder::new()
+        .storage_buffer(cs, false, true)   // t_curr
+        .storage_buffer(cs, false, true)   // t_prev
+        .storage_buffer(cs, false, false)  // t_next
+        .storage_buffer(cs, false, false)  // result
+        .storage_buffer(cs, false, true)   // adj_offset
+        .storage_buffer(cs, false, true)   // adj_list
+        .build(device);
+    let cheb_step_params_layout = wgpu::BindGroupLayoutBuilder::new()
+        .uniform_buffer(cs, false)  // params
+        .uniform_buffer(cs, false)  // coeff
+        .build(device);
+
+    // Growth: state(RW) + u(RW) + result(R) + pos(R) + node_growth(R)
+    let growth_data_layout = wgpu::BindGroupLayoutBuilder::new()
+        .storage_buffer(cs, false, false)  // node_state
+        .storage_buffer(cs, false, false)  // node_u
+        .storage_buffer(cs, false, true)   // result
+        .storage_buffer(cs, false, true)   // node_pos
+        .storage_buffer(cs, false, true)   // node_growth_params
+        .build(device);
+
+    let integrate_data_layout = wgpu::BindGroupLayoutBuilder::new()
+        .storage_buffer(cs, false, false)  // node_pos
+        .storage_buffer(cs, false, false)  // node_vel
+        .storage_buffer(cs, false, true)   // node_force
+        .build(device);
+
+    let bbox_data_layout = wgpu::BindGroupLayoutBuilder::new()
+        .storage_buffer(cs, false, true)   // node_pos
+        .storage_buffer(cs, false, false)  // bbox_atomic
+        .build(device);
+
+    // ── Pipeline layouts ────────────────────────────────────────────────────
+
+    let spring_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("spring_pl"),
+        bind_group_layouts: &[&spring_data_layout, &params_layout],
+        push_constant_ranges: &[],
+    });
+    let cheb_init_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("cheb_init_pl"),
+        bind_group_layouts: &[&cheb_init_data_layout, &cheb_init_params_layout],
+        push_constant_ranges: &[],
+    });
+    let cheb_step_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("cheb_step_pl"),
+        bind_group_layouts: &[&cheb_step_data_layout, &cheb_step_params_layout],
+        push_constant_ranges: &[],
+    });
+    let growth_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("growth_pl"),
+        bind_group_layouts: &[&growth_data_layout, &params_layout],
+        push_constant_ranges: &[],
+    });
+    let integrate_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("integrate_pl"),
+        bind_group_layouts: &[&integrate_data_layout, &params_layout],
+        push_constant_ranges: &[],
+    });
+    let bbox_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("bbox_pl"),
+        bind_group_layouts: &[&bbox_data_layout, &params_layout],
+        push_constant_ranges: &[],
+    });
+
+    // ── Compute pipelines ───────────────────────────────────────────────────
+
+    let make_pipeline = |label, layout: &wgpu::PipelineLayout, module: &wgpu::ShaderModule, entry: &str| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: Some(layout),
+            module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
+
+    let spring_forces_pipeline = make_pipeline("spring_forces", &spring_pl, &spring_shader, "main");
+    let chebyshev_init_pipeline = make_pipeline("cheb_init", &cheb_init_pl, &cheb_init_shader, "main");
+    let chebyshev_step_pipeline = make_pipeline("cheb_step", &cheb_step_pl, &cheb_step_shader, "main");
+    let growth_pipeline = make_pipeline("growth", &growth_pl, &growth_shader, "main");
+    let integrate_pipeline = make_pipeline("integrate", &integrate_pl, &integrate_shader, "main");
+    let bbox_clear_pipeline = make_pipeline("bbox_clear", &bbox_pl, &bbox_shader, "bbox_clear");
+    let bbox_reduce_pipeline = make_pipeline("bbox_reduce", &bbox_pl, &bbox_shader, "bbox_reduce");
+
+    // ── Bind groups ─────────────────────────────────────────────────────────
+
+    let spring_data_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&node_pos_buf, 0, None)
+        .buffer_bytes(&node_force_buf, 0, None)
+        .buffer_bytes(&adj_offset_buf, 0, None)
+        .buffer_bytes(&adj_list_buf, 0, None)
+        .build(device, &spring_data_layout);
+    let spring_params_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&sim_params_buf, 0, None)
+        .build(device, &params_layout);
+
+    // Chebyshev init bind groups
+    let cheb_init_data_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&node_state_buf, 0, None)
+        .buffer_bytes(&cheb_a_buf, 0, None)
+        .buffer_bytes(&cheb_b_buf, 0, None)
+        .buffer_bytes(&cheb_result_buf, 0, None)
+        .buffer_bytes(&adj_offset_buf, 0, None)
+        .buffer_bytes(&adj_list_buf, 0, None)
+        .build(device, &cheb_init_data_layout);
+    let cheb_init_params_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&sim_params_buf, 0, None)
+        .buffer_bytes(&cheb_c0_buf, 0, None)
+        .buffer_bytes(&cheb_c1_buf, 0, None)
+        .build(device, &cheb_init_params_layout);
+
+    // Chebyshev step bind groups (3 rotations: curr→prev→next)
+    let cheb_step_data_bgs = [
+        // [0]: curr=B, prev=A, next=C
+        wgpu::BindGroupBuilder::new()
+            .buffer_bytes(&cheb_b_buf, 0, None)
+            .buffer_bytes(&cheb_a_buf, 0, None)
+            .buffer_bytes(&cheb_c_buf, 0, None)
+            .buffer_bytes(&cheb_result_buf, 0, None)
+            .buffer_bytes(&adj_offset_buf, 0, None)
+            .buffer_bytes(&adj_list_buf, 0, None)
+            .build(device, &cheb_step_data_layout),
+        // [1]: curr=C, prev=B, next=A
+        wgpu::BindGroupBuilder::new()
+            .buffer_bytes(&cheb_c_buf, 0, None)
+            .buffer_bytes(&cheb_b_buf, 0, None)
+            .buffer_bytes(&cheb_a_buf, 0, None)
+            .buffer_bytes(&cheb_result_buf, 0, None)
+            .buffer_bytes(&adj_offset_buf, 0, None)
+            .buffer_bytes(&adj_list_buf, 0, None)
+            .build(device, &cheb_step_data_layout),
+        // [2]: curr=A, prev=C, next=B
+        wgpu::BindGroupBuilder::new()
+            .buffer_bytes(&cheb_a_buf, 0, None)
+            .buffer_bytes(&cheb_c_buf, 0, None)
+            .buffer_bytes(&cheb_b_buf, 0, None)
+            .buffer_bytes(&cheb_result_buf, 0, None)
+            .buffer_bytes(&adj_offset_buf, 0, None)
+            .buffer_bytes(&adj_list_buf, 0, None)
+            .build(device, &cheb_step_data_layout),
+    ];
+    let cheb_step_params_bgs: Vec<wgpu::BindGroup> = cheb_coeff_bufs.iter()
+        .map(|coeff_buf| {
+            wgpu::BindGroupBuilder::new()
+                .buffer_bytes(&sim_params_buf, 0, None)
+                .buffer_bytes(coeff_buf, 0, None)
+                .build(device, &cheb_step_params_layout)
+        })
+        .collect();
+
+    let growth_data_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&node_state_buf, 0, None)
+        .buffer_bytes(&node_u_buf, 0, None)
+        .buffer_bytes(&cheb_result_buf, 0, None)
+        .buffer_bytes(&node_pos_buf, 0, None)
+        .buffer_bytes(&node_growth_buf, 0, None)
+        .build(device, &growth_data_layout);
+    let growth_params_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&sim_params_buf, 0, None)
+        .build(device, &params_layout);
+
+    let integrate_data_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&node_pos_buf, 0, None)
+        .buffer_bytes(&node_vel_buf, 0, None)
+        .buffer_bytes(&node_force_buf, 0, None)
+        .build(device, &integrate_data_layout);
+    let integrate_params_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&sim_params_buf, 0, None)
+        .build(device, &params_layout);
+
+    let bbox_data_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&node_pos_buf, 0, None)
+        .buffer_bytes(&bbox_atomic_buf, 0, None)
+        .build(device, &bbox_data_layout);
+    let bbox_params_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&sim_params_buf, 0, None)
+        .build(device, &params_layout);
+
+    // ── Audio buffers ─────────────────────────────────────────────────────
+    let audio_out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("audio_out"),
+        size: (CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let audio_staging_bufs: Vec<wgpu::Buffer> = (0..NUM_AUDIO_STAGING_BUFS)
+        .map(|i| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("audio_staging_{}", i)),
+                size: (CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        })
+        .collect();
+    let audio_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("audio_params"),
+        size: std::mem::size_of::<AudioParams>() as u64,
+        usage: uniform,
+        mapped_at_creation: false,
+    });
+
+    // ── Modal synthesis buffers ──────────────────────────────────────────
+    let modal_buf_size = (MAX_NODES * 2 * 16) as u64;  // 2 vec4 per node
+    let modal_amp_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("modal_amp"), size: modal_buf_size, usage: storage_rw, mapped_at_creation: false,
+    });
+    let modal_phase_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("modal_phase"), size: modal_buf_size, usage: storage_rw, mapped_at_creation: false,
+    });
+    let modal_freq_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("modal_freq"),
+        size: std::mem::size_of::<ModalFreqs>() as u64,
+        usage: uniform,
+        mapped_at_creation: false,
+    });
+    let modal_coeff_lo_bufs: Vec<wgpu::Buffer> = (0..MAX_CHEB_ORDER)
+        .map(|i| device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&format!("modal_coeff_lo_{}", i)),
+            size: 16, usage: uniform, mapped_at_creation: false,
+        }))
+        .collect();
+    let modal_coeff_hi_bufs: Vec<wgpu::Buffer> = (0..MAX_CHEB_ORDER)
+        .map(|i| device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&format!("modal_coeff_hi_{}", i)),
+            size: 16, usage: uniform, mapped_at_creation: false,
+        }))
+        .collect();
+
+    // ── Modal synthesis pipelines + bind groups ───────────────────────────
+    let modal_cheb_init_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("modal_cheb_init"), source: wgpu::ShaderSource::Wgsl(MODAL_CHEB_INIT_WGSL.into()),
+    });
+    let modal_cheb_step_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("modal_cheb_step"), source: wgpu::ShaderSource::Wgsl(MODAL_CHEB_STEP_WGSL.into()),
+    });
+    let modal_audio_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("modal_audio"), source: wgpu::ShaderSource::Wgsl(MODAL_AUDIO_WGSL.into()),
+    });
+    let modal_phase_update_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("modal_phase_update"), source: wgpu::ShaderSource::Wgsl(MODAL_PHASE_UPDATE_WGSL.into()),
+    });
+
+    // Modal Chebyshev init params: params(U) + c0_lo(U) + c0_hi(U) + c1_lo(U) + c1_hi(U)
+    let modal_init_params_layout = wgpu::BindGroupLayoutBuilder::new()
+        .uniform_buffer(cs, false)  // sim_params
+        .uniform_buffer(cs, false)  // c0_lo
+        .uniform_buffer(cs, false)  // c0_hi
+        .uniform_buffer(cs, false)  // c1_lo
+        .uniform_buffer(cs, false)  // c1_hi
+        .build(device);
+
+    // Modal Chebyshev step params: params(U) + ck_lo(U) + ck_hi(U)
+    let modal_step_params_layout = wgpu::BindGroupLayoutBuilder::new()
+        .uniform_buffer(cs, false)
+        .uniform_buffer(cs, false)
+        .uniform_buffer(cs, false)
+        .build(device);
+
+    // Modal audio: pos(R) + vel(R) + modal_amp(R) + modal_phase(R) + audio_out(RW) + params(U) + freqs(U)
+    let modal_audio_bgl = wgpu::BindGroupLayoutBuilder::new()
+        .storage_buffer(cs, false, true)   // node_pos
+        .storage_buffer(cs, false, true)   // node_vel
+        .storage_buffer(cs, false, true)   // modal_amp
+        .storage_buffer(cs, false, true)   // modal_phase
+        .storage_buffer(cs, false, false)  // audio_out
+        .uniform_buffer(cs, false)         // audio_params
+        .uniform_buffer(cs, false)         // modal_freq
+        .build(device);
+
+    // Modal phase update: modal_phase(RW) + params(U) + freqs(U)
+    let modal_phase_update_bgl = wgpu::BindGroupLayoutBuilder::new()
+        .storage_buffer(cs, false, false)  // modal_phase
+        .uniform_buffer(cs, false)         // audio_params
+        .uniform_buffer(cs, false)         // modal_freq
+        .build(device);
+
+    // Reuse cheb_init_data_layout and cheb_step_data_layout for modal (same buffer types)
+    let modal_cheb_init_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("modal_cheb_init_pl"),
+        bind_group_layouts: &[&cheb_init_data_layout, &modal_init_params_layout],
+        push_constant_ranges: &[],
+    });
+    let modal_cheb_step_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("modal_cheb_step_pl"),
+        bind_group_layouts: &[&cheb_step_data_layout, &modal_step_params_layout],
+        push_constant_ranges: &[],
+    });
+    let modal_audio_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("modal_audio_pl"),
+        bind_group_layouts: &[&modal_audio_bgl],
+        push_constant_ranges: &[],
+    });
+    let modal_phase_update_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("modal_phase_update_pl"),
+        bind_group_layouts: &[&modal_phase_update_bgl],
+        push_constant_ranges: &[],
+    });
+
+    let modal_cheb_init_pipeline = make_pipeline("modal_cheb_init", &modal_cheb_init_pl, &modal_cheb_init_shader, "main");
+    let modal_cheb_step_pipeline = make_pipeline("modal_cheb_step", &modal_cheb_step_pl, &modal_cheb_step_shader, "main");
+    let modal_audio_pipeline = make_pipeline("modal_audio", &modal_audio_pl_layout, &modal_audio_shader, "main");
+    let modal_phase_update_pipeline = make_pipeline("modal_phase_update", &modal_phase_update_pl_layout, &modal_phase_update_shader, "main");
+
+    // Modal Chebyshev init data bind group (same layout as cheb_init, but modal_amp at slot 3)
+    let modal_cheb_init_data_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&node_state_buf, 0, None)
+        .buffer_bytes(&cheb_a_buf, 0, None)
+        .buffer_bytes(&cheb_b_buf, 0, None)
+        .buffer_bytes(&modal_amp_buf, 0, None)
+        .buffer_bytes(&adj_offset_buf, 0, None)
+        .buffer_bytes(&adj_list_buf, 0, None)
+        .build(device, &cheb_init_data_layout);
+
+    // Modal Chebyshev init params bind group
+    let modal_cheb_init_params_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&sim_params_buf, 0, None)
+        .buffer_bytes(&modal_coeff_lo_bufs[0], 0, None)
+        .buffer_bytes(&modal_coeff_hi_bufs[0], 0, None)
+        .buffer_bytes(&modal_coeff_lo_bufs[1], 0, None)
+        .buffer_bytes(&modal_coeff_hi_bufs[1], 0, None)
+        .build(device, &modal_init_params_layout);
+
+    // Modal Chebyshev step data bind groups (3 rotations, modal_amp at slot 3)
+    let modal_cheb_step_data_bgs = [
+        // [0]: curr=B, prev=A, next=C
+        wgpu::BindGroupBuilder::new()
+            .buffer_bytes(&cheb_b_buf, 0, None)
+            .buffer_bytes(&cheb_a_buf, 0, None)
+            .buffer_bytes(&cheb_c_buf, 0, None)
+            .buffer_bytes(&modal_amp_buf, 0, None)
+            .buffer_bytes(&adj_offset_buf, 0, None)
+            .buffer_bytes(&adj_list_buf, 0, None)
+            .build(device, &cheb_step_data_layout),
+        // [1]: curr=C, prev=B, next=A
+        wgpu::BindGroupBuilder::new()
+            .buffer_bytes(&cheb_c_buf, 0, None)
+            .buffer_bytes(&cheb_b_buf, 0, None)
+            .buffer_bytes(&cheb_a_buf, 0, None)
+            .buffer_bytes(&modal_amp_buf, 0, None)
+            .buffer_bytes(&adj_offset_buf, 0, None)
+            .buffer_bytes(&adj_list_buf, 0, None)
+            .build(device, &cheb_step_data_layout),
+        // [2]: curr=A, prev=C, next=B
+        wgpu::BindGroupBuilder::new()
+            .buffer_bytes(&cheb_a_buf, 0, None)
+            .buffer_bytes(&cheb_c_buf, 0, None)
+            .buffer_bytes(&cheb_b_buf, 0, None)
+            .buffer_bytes(&modal_amp_buf, 0, None)
+            .buffer_bytes(&adj_offset_buf, 0, None)
+            .buffer_bytes(&adj_list_buf, 0, None)
+            .build(device, &cheb_step_data_layout),
+    ];
+
+    // Modal Chebyshev step params bind groups (one per order k)
+    let modal_cheb_step_params_bgs: Vec<wgpu::BindGroup> = (0..MAX_CHEB_ORDER)
+        .map(|k| {
+            wgpu::BindGroupBuilder::new()
+                .buffer_bytes(&sim_params_buf, 0, None)
+                .buffer_bytes(&modal_coeff_lo_bufs[k], 0, None)
+                .buffer_bytes(&modal_coeff_hi_bufs[k], 0, None)
+                .build(device, &modal_step_params_layout)
+        })
+        .collect();
+
+    // Modal audio bind group
+    let modal_audio_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&node_pos_buf, 0, None)
+        .buffer_bytes(&node_vel_buf, 0, None)
+        .buffer_bytes(&modal_amp_buf, 0, None)
+        .buffer_bytes(&modal_phase_buf, 0, None)
+        .buffer_bytes(&audio_out_buf, 0, None)
+        .buffer_bytes(&audio_params_buf, 0, None)
+        .buffer_bytes(&modal_freq_buf, 0, None)
+        .build(device, &modal_audio_bgl);
+
+    // Modal phase update bind group
+    let modal_phase_update_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&modal_phase_buf, 0, None)
+        .buffer_bytes(&audio_params_buf, 0, None)
+        .buffer_bytes(&modal_freq_buf, 0, None)
+        .build(device, &modal_phase_update_bgl);
+
+    GpuCompute {
+        node_pos_buf, node_vel_buf, node_force_buf, node_state_buf, node_u_buf, node_growth_buf,
+        adj_offset_buf, adj_list_buf, connection_buf,
+        cheb_a_buf, cheb_b_buf, cheb_c_buf, cheb_result_buf,
+        cheb_c0_buf, cheb_c1_buf, cheb_coeff_bufs,
+        sim_params_buf,
+        pos_readback_buf, state_readback_buf, u_readback_buf,
+        bbox_atomic_buf, bbox_readback_buf,
+        spring_forces_pipeline,
+        chebyshev_init_pipeline, chebyshev_step_pipeline,
+        growth_pipeline, integrate_pipeline,
+        bbox_clear_pipeline, bbox_reduce_pipeline,
+        spring_data_bg, spring_params_bg,
+        cheb_init_data_bg, cheb_init_params_bg,
+        cheb_step_data_bgs, cheb_step_params_bgs,
+        growth_data_bg, growth_params_bg,
+        integrate_data_bg, integrate_params_bg,
+        bbox_data_bg, bbox_params_bg,
+        render_uniform_buf,
+        audio_out_buf, audio_staging_bufs, audio_params_buf,
+        modal_amp_buf, modal_phase_buf, modal_freq_buf,
+        modal_coeff_lo_bufs, modal_coeff_hi_bufs,
+        modal_cheb_init_pipeline, modal_cheb_step_pipeline,
+        modal_audio_pipeline, modal_phase_update_pipeline,
+        modal_cheb_init_data_bg, modal_cheb_init_params_bg,
+        modal_cheb_step_data_bgs, modal_cheb_step_params_bgs,
+        modal_audio_bg, modal_phase_update_bg,
+        topology_dirty: true,
+        num_nodes: 0,
+        num_connections: 0,
+    }
+}
+
+/// Upload node positions, states, velocities, adjacency, and connections to GPU.
+pub(crate) fn upload_topology(
+    queue: &wgpu::Queue,
+    gpu: &mut GpuCompute,
+    positions: &[(f32, f32)],
+    states: &[[f32; 3]],
+    connections: &[(usize, usize)],
+) {
+    let n = positions.len().min(MAX_NODES);
+    let num_conn = connections.len().min(MAX_CONNECTIONS);
+    gpu.num_nodes = n as u32;
+    gpu.num_connections = num_conn as u32;
+
+    // Upload positions (vec4: x, y, 0, active=1)
+    let pos_data: Vec<[f32; 4]> = positions[..n].iter()
+        .map(|&(x, y)| [x, y, 0.0, 1.0])
+        .collect();
+    queue.write_buffer(&gpu.node_pos_buf, 0, bytemuck::cast_slice(&pos_data));
+
+    // Upload states (vec4: r, g, b, 0)
+    let state_data: Vec<[f32; 4]> = states[..n].iter()
+        .map(|&[r, g, b]| [r, g, b, 0.0])
+        .collect();
+    queue.write_buffer(&gpu.node_state_buf, 0, bytemuck::cast_slice(&state_data));
+
+    // Clear velocities
+    let zeros = vec![[0.0f32; 4]; n];
+    queue.write_buffer(&gpu.node_vel_buf, 0, bytemuck::cast_slice(&zeros));
+
+    // Build and upload adjacency list (only connections within valid node range)
+    let mut neighbors: Vec<Vec<usize>> = vec![vec![]; n];
+    for &(a, b) in &connections[..num_conn] {
+        if a < n && b < n {
+            neighbors[a].push(b);
+            neighbors[b].push(a);
+        }
+    }
+    let mut adj_offset = Vec::with_capacity(n + 1);
+    let mut adj_list = Vec::new();
+    let mut idx = 0u32;
+    for i in 0..n {
+        adj_offset.push(idx);
+        for &nb in &neighbors[i] {
+            adj_list.push(nb as u32);
+            idx += 1;
+        }
+    }
+    adj_offset.push(idx);
+    queue.write_buffer(&gpu.adj_offset_buf, 0, bytemuck::cast_slice(&adj_offset));
+    if !adj_list.is_empty() {
+        queue.write_buffer(&gpu.adj_list_buf, 0, bytemuck::cast_slice(&adj_list));
+    }
+
+    // Upload connection pairs for line rendering
+    let conn_flat: Vec<u32> = connections[..num_conn].iter()
+        .filter(|&&(a, b)| a < n && b < n)
+        .flat_map(|&(a, b)| [a as u32, b as u32])
+        .collect();
+    gpu.num_connections = (conn_flat.len() / 2) as u32;
+    if !conn_flat.is_empty() {
+        queue.write_buffer(&gpu.connection_buf, 0, bytemuck::cast_slice(&conn_flat));
+    }
+}
+
+/// Upload CPU-computed repulsion forces to the GPU force buffer.
+pub(crate) fn upload_forces(queue: &wgpu::Queue, gpu: &GpuCompute, forces: &[(f32, f32)]) {
+    let force_data: Vec<[f32; 4]> = forces.iter()
+        .map(|&(fx, fy)| [fx, fy, 0.0, 0.0])
+        .collect();
+    queue.write_buffer(&gpu.node_force_buf, 0, bytemuck::cast_slice(&force_data));
+}
+
+/// Upload per-node growth parameters to the GPU.
+pub(crate) fn upload_node_growth_params(queue: &wgpu::Queue, gpu: &GpuCompute, params: &[GpuNodeGrowthParams]) {
+    queue.write_buffer(&gpu.node_growth_buf, 0, bytemuck::cast_slice(params));
+}
+
+fn sortable_to_float(s: u32) -> f32 {
+    let mask = if (s & 0x80000000) == 0 { 0xFFFFFFFFu32 } else { 0x80000000u32 };
+    f32::from_bits(s ^ mask)
+}
+
+/// Read back bounding box and positions (both copied during gpu_dispatch_frame).
+pub(crate) fn readback_bbox_and_positions(device: &wgpu::Device, gpu: &GpuCompute, num_nodes: usize) -> ([f32; 4], Vec<(f32, f32)>) {
+    let pos_size = (num_nodes * 16) as u64;
+
+    let bbox_slice = gpu.bbox_readback_buf.slice(..);
+    bbox_slice.map_async(wgpu::MapMode::Read, |_| {});
+    let pos_slice = gpu.pos_readback_buf.slice(..pos_size);
+    pos_slice.map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::PollType::Wait).unwrap();
+
+    let bbox = {
+        let data = bbox_slice.get_mapped_range();
+        let uints: &[u32] = bytemuck::cast_slice(&data);
+        [
+            sortable_to_float(uints[0]),
+            sortable_to_float(uints[1]),
+            sortable_to_float(uints[2]),
+            sortable_to_float(uints[3]),
+        ]
+    };
+    gpu.bbox_readback_buf.unmap();
+
+    let positions = {
+        let data = pos_slice.get_mapped_range();
+        let floats: &[[f32; 4]] = bytemuck::cast_slice(&data);
+        floats[..num_nodes].iter().map(|f| (f[0], f[1])).collect()
+    };
+    gpu.pos_readback_buf.unmap();
+
+    (bbox, positions)
+}
+
+/// Read back states and u values (vec4 per node, xyz = RGB channels).
+pub(crate) struct StateReadback {
+    pub(crate) states: Vec<[f32; 3]>,
+    pub(crate) u_values: Vec<[f32; 3]>,
+}
+
+pub(crate) fn readback_states(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &GpuCompute, num_nodes: usize) -> StateReadback {
+    let state_size = (num_nodes * 16) as u64;  // vec4<f32> per node
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("readback_encoder"),
+    });
+    encoder.copy_buffer_to_buffer(&gpu.node_state_buf, 0, &gpu.state_readback_buf, 0, state_size);
+    encoder.copy_buffer_to_buffer(&gpu.node_u_buf, 0, &gpu.u_readback_buf, 0, state_size);
+    queue.submit(Some(encoder.finish()));
+
+    let state_slice = gpu.state_readback_buf.slice(..state_size);
+    state_slice.map_async(wgpu::MapMode::Read, |_| {});
+    let u_slice = gpu.u_readback_buf.slice(..state_size);
+    u_slice.map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::PollType::Wait).unwrap();
+
+    let states = {
+        let data = state_slice.get_mapped_range();
+        let floats: &[[f32; 4]] = bytemuck::cast_slice(&data);
+        floats[..num_nodes].iter().map(|f| [f[0], f[1], f[2]]).collect()
+    };
+    gpu.state_readback_buf.unmap();
+
+    let u_values = {
+        let data = u_slice.get_mapped_range();
+        let floats: &[[f32; 4]] = bytemuck::cast_slice(&data);
+        floats[..num_nodes].iter().map(|f| [f[0], f[1], f[2]]).collect()
+    };
+    gpu.u_readback_buf.unmap();
+
+    StateReadback { states, u_values }
+}
+
+pub(crate) fn update_render_uniforms(queue: &wgpu::Queue, gpu: &GpuCompute, uniforms: &RenderUniforms) {
+    queue.write_buffer(&gpu.render_uniform_buf, 0, bytemuck::bytes_of(uniforms));
+}
+
+/// Encode physics passes (forces + integrate) and bbox reduction into the encoder.
+/// Shared by both continuous and discrete CA modes.
+fn encode_physics_and_bbox(
+    encoder: &mut wgpu::CommandEncoder,
+    gpu: &GpuCompute,
+    n: u32,
+) {
+    // Spring forces (adds to existing repulsion force)
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("spring_forces"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.spring_forces_pipeline);
+        pass.set_bind_group(0, &gpu.spring_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.spring_params_bg, &[]);
+        pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+    }
+
+    // Integrate (velocity update + position update)
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("integrate"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.integrate_pipeline);
+        pass.set_bind_group(0, &gpu.integrate_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.integrate_params_bg, &[]);
+        pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+    }
+
+    // Bounding box reduction
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("bbox_clear"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.bbox_clear_pipeline);
+        pass.set_bind_group(0, &gpu.bbox_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.bbox_params_bg, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("bbox_reduce"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.bbox_reduce_pipeline);
+        pass.set_bind_group(0, &gpu.bbox_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.bbox_params_bg, &[]);
+        pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+    }
+
+    // Copy bbox + positions to readback buffers
+    encoder.copy_buffer_to_buffer(&gpu.bbox_atomic_buf, 0, &gpu.bbox_readback_buf, 0, 16);
+    let pos_copy_size = (n as u64) * 16;
+    encoder.copy_buffer_to_buffer(&gpu.node_pos_buf, 0, &gpu.pos_readback_buf, 0, pos_copy_size);
+}
+
+/// Full GPU frame: physics + Chebyshev state evolution (continuous CA mode).
+pub(crate) fn gpu_dispatch_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    gpu: &mut GpuCompute,
+    params: &GpuSimParams,
+    cheb_order: usize,
+    cheb_coeffs: &[[f32; 4]; 20],
+) {
+    let n = params.num_nodes;
+    queue.write_buffer(&gpu.sim_params_buf, 0, bytemuck::bytes_of(params));
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("compute_encoder"),
+    });
+
+    // Physics (forces + integrate)
+    // Spring forces
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("spring_forces"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.spring_forces_pipeline);
+        pass.set_bind_group(0, &gpu.spring_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.spring_params_bg, &[]);
+        pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+    }
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("integrate"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.integrate_pipeline);
+        pass.set_bind_group(0, &gpu.integrate_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.integrate_params_bg, &[]);
+        pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+    }
+
+    // ── State evolution (Chebyshev) ─────────────────────────────────────
+    queue.write_buffer(&gpu.cheb_c0_buf, 0, bytemuck::cast_slice(&cheb_coeffs[0]));
+    queue.write_buffer(&gpu.cheb_c1_buf, 0, bytemuck::cast_slice(&cheb_coeffs[1]));
+
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("cheb_init"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.chebyshev_init_pipeline);
+        pass.set_bind_group(0, &gpu.cheb_init_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.cheb_init_params_bg, &[]);
+        pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+    }
+
+    for k in 2..cheb_order {
+        if k < gpu.cheb_coeff_bufs.len() {
+            queue.write_buffer(&gpu.cheb_coeff_bufs[k], 0, bytemuck::cast_slice(&cheb_coeffs[k]));
+        }
+    }
+    for k in 2..cheb_order {
+        let bg_idx = (k - 2) % 3;
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cheb_step"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&gpu.chebyshev_step_pipeline);
+            pass.set_bind_group(0, &gpu.cheb_step_data_bgs[bg_idx], &[]);
+            pass.set_bind_group(1, &gpu.cheb_step_params_bgs[k], &[]);
+            pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+        }
+    }
+
+    // Growth function
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("growth"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.growth_pipeline);
+        pass.set_bind_group(0, &gpu.growth_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.growth_params_bg, &[]);
+        pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+    }
+
+    // ── Bounding box reduction ──────────────────────────────────────────
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("bbox_clear"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.bbox_clear_pipeline);
+        pass.set_bind_group(0, &gpu.bbox_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.bbox_params_bg, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("bbox_reduce"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.bbox_reduce_pipeline);
+        pass.set_bind_group(0, &gpu.bbox_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.bbox_params_bg, &[]);
+        pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+    }
+
+    encoder.copy_buffer_to_buffer(&gpu.bbox_atomic_buf, 0, &gpu.bbox_readback_buf, 0, 16);
+    let pos_copy_size = (n as u64) * 16;
+    encoder.copy_buffer_to_buffer(&gpu.node_pos_buf, 0, &gpu.pos_readback_buf, 0, pos_copy_size);
+
+    queue.submit(Some(encoder.finish()));
+}
+
+/// Physics-only GPU frame: forces + integrate + bbox (discrete CA mode).
+/// State evolution is handled on CPU.
+pub(crate) fn gpu_dispatch_physics_only(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    gpu: &mut GpuCompute,
+    params: &GpuSimParams,
+) {
+    let n = params.num_nodes;
+    queue.write_buffer(&gpu.sim_params_buf, 0, bytemuck::bytes_of(params));
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("compute_encoder_physics"),
+    });
+
+    encode_physics_and_bbox(&mut encoder, gpu, n);
+
+    queue.submit(Some(encoder.finish()));
+}
+
+/// Update audio params uniform buffer.
+pub(crate) fn update_audio_params(queue: &wgpu::Queue, gpu: &GpuCompute, params: &AudioParams) {
+    queue.write_buffer(&gpu.audio_params_buf, 0, bytemuck::bytes_of(params));
+}
+
+/// Upload discrete states to the GPU node_state_buf for rendering.
+/// Maps discrete states to distinct colors via HSV hue rotation.
+pub(crate) fn upload_discrete_states(
+    queue: &wgpu::Queue,
+    gpu: &GpuCompute,
+    discrete_states: &[u8],
+    num_states: u8,
+) {
+    let state_data: Vec<[f32; 4]> = discrete_states.iter()
+        .map(|&s| {
+            let t = (s as f32) / ((num_states.max(2) - 1) as f32);
+            // Purple (280°) → orange (30°), wrapping through red
+            let hue = ((280.0 + t * 110.0) % 360.0) / 360.0;
+            let (r, g, b) = hsv_to_rgb(hue, 0.85, 0.95);
+            [r, g, b, 0.0]
+        })
+        .collect();
+    queue.write_buffer(&gpu.node_state_buf, 0, bytemuck::cast_slice(&state_data));
+}
+
+/// Upload modal bandpass Chebyshev coefficients (call once or when bands change).
+pub(crate) fn upload_modal_coefficients(
+    queue: &wgpu::Queue,
+    gpu: &GpuCompute,
+    coeffs_lo: &[[f32; 4]],  // [order] entries for bands 0-3
+    coeffs_hi: &[[f32; 4]],  // [order] entries for bands 4-7
+) {
+    let order = coeffs_lo.len().min(MAX_CHEB_ORDER);
+    for k in 0..order {
+        queue.write_buffer(&gpu.modal_coeff_lo_bufs[k], 0, bytemuck::cast_slice(&coeffs_lo[k]));
+        queue.write_buffer(&gpu.modal_coeff_hi_bufs[k], 0, bytemuck::cast_slice(&coeffs_hi[k]));
+    }
+}
+
+/// Upload modal frequencies (call once or when base frequency changes).
+pub(crate) fn update_modal_freqs(queue: &wgpu::Queue, gpu: &GpuCompute, freqs: &ModalFreqs) {
+    queue.write_buffer(&gpu.modal_freq_buf, 0, bytemuck::bytes_of(freqs));
+}
+
+/// Encode modal Chebyshev bandpass analysis into the command encoder.
+/// Decomposes the current node state into 8 spectral bands using the graph Laplacian.
+pub(crate) fn encode_modal_chebyshev(
+    encoder: &mut wgpu::CommandEncoder,
+    gpu: &GpuCompute,
+    cheb_order: usize,
+) {
+    let n = gpu.num_nodes;
+
+    // Init: T_0 = signal, T_1 = W(signal), modal_amp = c0*T_0 + c1*T_1
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("modal_cheb_init"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.modal_cheb_init_pipeline);
+        pass.set_bind_group(0, &gpu.modal_cheb_init_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.modal_cheb_init_params_bg, &[]);
+        pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+    }
+
+    // Steps k=2..order: t_next = 2*W(t_curr) - t_prev, modal_amp += ck*t_next
+    for k in 2..cheb_order {
+        let bg_idx = (k - 2) % 3;
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("modal_cheb_step"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&gpu.modal_cheb_step_pipeline);
+            pass.set_bind_group(0, &gpu.modal_cheb_step_data_bgs[bg_idx], &[]);
+            pass.set_bind_group(1, &gpu.modal_cheb_step_params_bgs[k], &[]);
+            pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+        }
+    }
+}
+
+/// Encode modal audio synthesis + phase update + copy to staging.
+pub(crate) fn encode_modal_audio_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    gpu: &GpuCompute,
+    staging_idx: usize,
+) {
+    let audio_buf_size = (CHUNK_SIZE * NUM_CHANNELS * std::mem::size_of::<f32>() as u32) as u64;
+
+    // Modal audio synthesis
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("modal_audio"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.modal_audio_pipeline);
+        pass.set_bind_group(0, &gpu.modal_audio_bg, &[]);
+        pass.dispatch_workgroups((CHUNK_SIZE + 255) / 256, 1, 1);
+    }
+
+    // Modal phase update
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("modal_phase_update"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.modal_phase_update_pipeline);
+        pass.set_bind_group(0, &gpu.modal_phase_update_bg, &[]);
+        pass.dispatch_workgroups(dispatch_count(gpu.num_nodes), 1, 1);
+    }
+
+    // Copy audio output to staging buffer
+    encoder.copy_buffer_to_buffer(
+        &gpu.audio_out_buf, 0,
+        &gpu.audio_staging_bufs[staging_idx], 0,
+        audio_buf_size,
+    );
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
+    let i = (h * 6.0).floor() as i32;
+    let f = h * 6.0 - i as f32;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - f * s);
+    let t = v * (1.0 - (1.0 - f) * s);
+    match i % 6 {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    }
+}

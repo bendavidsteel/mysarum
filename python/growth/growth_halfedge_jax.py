@@ -767,40 +767,71 @@ def refine_mesh(state):
     return state
 
 
+@functools.partial(jax.jit, static_argnames=("max_splits",))
+def _select_long_edges(state, params, key, max_splits):
+    """Pick up to max_splits edges with avg intrinsic length >= max_edge_len.
+
+    Pure JAX selection: avoids per-iter transfers of the full half-edge arrays
+    and the MAX_HALF_EDGES-long Python scan. Returns small (max_splits,) arrays
+    plus a host-int candidate of n_verts (for the limit check).
+
+    Random ordering is preserved (relative to the old np.random shuffle): each
+    eligible half-edge gets a uniform-random score, top_k picks the K with the
+    highest score. Ineligible edges get score=-1 so they sort last.
+    """
+    he_valid = state.half_edge_idx != -1
+    safe_twin = jnp.clip(state.half_edge_twin, 0)
+    unique = he_valid \
+        & (state.half_edge_twin >= 0) \
+        & (state.half_edge_dest < state.half_edge_dest[safe_twin])
+
+    avg_ilen = (state.half_edge_intrinsic_len
+                + state.half_edge_intrinsic_len[safe_twin]) * 0.5
+    eligible = unique & (avg_ilen >= params.max_edge_len)
+
+    noise = jax.random.uniform(key, (MAX_HALF_EDGES,))
+    score = jnp.where(eligible, noise, -1.0)
+
+    _, top_he = jax.lax.top_k(score, max_splits)
+    top_twin = safe_twin[top_he]
+
+    src_arr = state.half_edge_dest[top_twin]
+    dst_arr = state.half_edge_dest[top_he]
+    he_bnd_arr = state.half_edge_face[top_he] == -1
+    twin_bnd_arr = state.half_edge_face[top_twin] == -1
+    valid_arr = eligible[top_he]
+
+    n_verts = jnp.sum(state.vertex_idx != -1)
+    return src_arr, dst_arr, he_bnd_arr, twin_bnd_arr, valid_arr, n_verts
+
+
 def split_long_edges(state, params, key, max_splits=20):
-    """Split edges exceeding max_edge_len based on intrinsic lengths."""
-    he_valid_np = np.array(state.half_edge_idx != -1)
-    he_dest_np = np.array(state.half_edge_dest)
-    he_twin_np = np.array(state.half_edge_twin)
-    he_face_np = np.array(state.half_edge_face)
-    he_ilen_np = np.array(state.half_edge_intrinsic_len)
+    """Split edges exceeding max_edge_len based on intrinsic lengths.
 
-    safe_twin_np = np.clip(he_twin_np, 0, None)
-    unique = he_valid_np & (he_twin_np >= 0) & (he_dest_np < he_dest_np[safe_twin_np])
+    Selection runs in JAX; mutations run on the host because each
+    add_internal_triangle{,s} call depends on the state produced by the
+    previous one (sequential graph rewrites).
+    """
+    key, sel_key = jax.random.split(key)
+    src_j, dst_j, he_bnd_j, twin_bnd_j, valid_j, n_verts_j = \
+        _select_long_edges(state, params, sel_key, max_splits)
 
-    avg_ilen = np.where(unique,
-                        (he_ilen_np + he_ilen_np[safe_twin_np]) * 0.5, 0.0)
+    src_arr = np.asarray(src_j)
+    dst_arr = np.asarray(dst_j)
+    he_bnd_arr = np.asarray(he_bnd_j)
+    twin_bnd_arr = np.asarray(twin_bnd_j)
+    valid_arr = np.asarray(valid_j)
+    n_verts = int(n_verts_j)
 
-    splits = []
-    for he in range(MAX_HALF_EDGES):
-        if not unique[he]:
+    for i in range(max_splits):
+        if not valid_arr[i]:
             continue
-        if avg_ilen[he] < float(params.max_edge_len):
-            continue
-        twin = int(safe_twin_np[he])
-        src = int(he_dest_np[twin])
-        dst = int(he_dest_np[he])
-        he_on_boundary = he_face_np[he] == -1
-        twin_on_boundary = he_face_np[twin] == -1
-        splits.append((src, dst, he_on_boundary, twin_on_boundary))
-
-    rng = np.random.default_rng(int(key[0]) if hasattr(key, '__getitem__') else 42)
-    rng.shuffle(splits)
-
-    n_verts = int(np.sum(np.array(state.vertex_idx) != -1))
-    for src, dst, he_bnd, twin_bnd in splits[:max_splits]:
         if n_verts >= MAX_VERTICES - 5:
             break
+        src = int(src_arr[i])
+        dst = int(dst_arr[i])
+        he_bnd = bool(he_bnd_arr[i])
+        twin_bnd = bool(twin_bnd_arr[i])
         if he_bnd or twin_bnd:
             if twin_bnd:
                 state = add_internal_edge_triangle(state, src, dst)

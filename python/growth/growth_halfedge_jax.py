@@ -703,57 +703,76 @@ def _intrinsic_flip_length(lab, lca, lbc, lad, ldb):
 
 # ── Mesh Refinement ──────────────────────────────────────────────────────────
 
+def _edge_flip_criterion(state, he):
+    """Per-edge intrinsic-Delaunay criterion.
+
+    Returns (should_flip, sin_sum). The canonical direction filter
+    (dest < twin_dest) ensures each undirected edge is considered once.
+    """
+    twin = state.half_edge_twin[he]
+    safe_twin = jnp.maximum(twin, 0)
+
+    he_bc = state.half_edge_next[he]
+    he_ad = state.half_edge_next[safe_twin]
+    safe_bc = jnp.maximum(he_bc, 0)
+    safe_ad = jnp.maximum(he_ad, 0)
+    he_ca = state.half_edge_next[safe_bc]
+    he_db = state.half_edge_next[safe_ad]
+    safe_ca = jnp.maximum(he_ca, 0)
+    safe_db = jnp.maximum(he_db, 0)
+
+    lab = state.half_edge_intrinsic_len[he]
+    lbc = state.half_edge_intrinsic_len[safe_bc]
+    lca = state.half_edge_intrinsic_len[safe_ca]
+    lad = state.half_edge_intrinsic_len[safe_ad]
+    ldb = state.half_edge_intrinsic_len[safe_db]
+
+    lab2 = lab * lab
+    cos_c = (lca * lca + lbc * lbc - lab2) \
+        / jnp.maximum(2.0 * lca * lbc, EPSILON)
+    sin_c = jnp.sqrt(jnp.maximum(1.0 - cos_c * cos_c, 0.0))
+    cos_d = (lad * lad + ldb * ldb - lab2) \
+        / jnp.maximum(2.0 * lad * ldb, EPSILON)
+    sin_d = jnp.sqrt(jnp.maximum(1.0 - cos_d * cos_d, 0.0))
+    sin_sum = sin_c * cos_d + cos_c * sin_d
+
+    dest = state.half_edge_dest[he]
+    twin_dest = state.half_edge_dest[safe_twin]
+
+    should_flip = (
+        (state.half_edge_idx[he] >= 0)
+        & (state.half_edge_face[he] != -1)
+        & (twin >= 0)
+        & (state.half_edge_face[safe_twin] != -1)
+        & (he_bc >= 0) & (he_ad >= 0)
+        & (he_ca >= 0) & (he_db >= 0)
+        & (dest < twin_dest)
+        & (sin_sum < -EPSILON)
+    )
+    return should_flip, sin_sum
+
+
+REFINE_TOP_K = 256
+
+
 @jax.jit
 def refine_mesh(state):
     """Flip non-Delaunay edges using intrinsic edge lengths.
 
-    Scan over every half-edge slot; for each, recompute validity + the
-    intrinsic-Delaunay sin-sum criterion from the *current* carry state
-    (earlier flips in the same pass mutate twin/next pointers and lengths).
+    Vectorized pass scores every half-edge by violation severity; top_k
+    picks the REFINE_TOP_K worst; scan over those re-checks the criterion
+    against carry state (since earlier flips can invalidate neighbours).
+    Edges that newly violate mid-pass get caught next call to refine_mesh.
     """
+    all_he = jnp.arange(MAX_HALF_EDGES, dtype=jnp.int32)
+    should_flip_all, sin_sum_all = jax.vmap(
+        _edge_flip_criterion, in_axes=(None, 0),
+    )(state, all_he)
+    score = jnp.where(should_flip_all, -sin_sum_all, -jnp.inf)
+    _, candidate_he = jax.lax.top_k(score, REFINE_TOP_K)
 
     def body(state, he):
-        twin = state.half_edge_twin[he]
-        safe_twin = jnp.maximum(twin, 0)
-
-        he_bc = state.half_edge_next[he]
-        he_ad = state.half_edge_next[safe_twin]
-        safe_bc = jnp.maximum(he_bc, 0)
-        safe_ad = jnp.maximum(he_ad, 0)
-        he_ca = state.half_edge_next[safe_bc]
-        he_db = state.half_edge_next[safe_ad]
-        safe_ca = jnp.maximum(he_ca, 0)
-        safe_db = jnp.maximum(he_db, 0)
-
-        lab = state.half_edge_intrinsic_len[he]
-        lbc = state.half_edge_intrinsic_len[safe_bc]
-        lca = state.half_edge_intrinsic_len[safe_ca]
-        lad = state.half_edge_intrinsic_len[safe_ad]
-        ldb = state.half_edge_intrinsic_len[safe_db]
-
-        lab2 = lab * lab
-        cos_c = (lca * lca + lbc * lbc - lab2) \
-            / jnp.maximum(2.0 * lca * lbc, EPSILON)
-        sin_c = jnp.sqrt(jnp.maximum(1.0 - cos_c * cos_c, 0.0))
-        cos_d = (lad * lad + ldb * ldb - lab2) \
-            / jnp.maximum(2.0 * lad * ldb, EPSILON)
-        sin_d = jnp.sqrt(jnp.maximum(1.0 - cos_d * cos_d, 0.0))
-        sin_sum = sin_c * cos_d + cos_c * sin_d
-
-        dest = state.half_edge_dest[he]
-        twin_dest = state.half_edge_dest[safe_twin]
-
-        should_flip = (
-            (state.half_edge_idx[he] >= 0)
-            & (state.half_edge_face[he] != -1)
-            & (twin >= 0)
-            & (state.half_edge_face[safe_twin] != -1)
-            & (he_bc >= 0) & (he_ad >= 0)
-            & (he_ca >= 0) & (he_db >= 0)
-            & (dest < twin_dest)
-            & (sin_sum < -EPSILON)
-        )
-
+        should_flip, _ = _edge_flip_criterion(state, he)
         state = jax.lax.cond(
             should_flip,
             lambda s: flip_edge(s, he),
@@ -762,8 +781,7 @@ def refine_mesh(state):
         )
         return state, None
 
-    indices = jnp.arange(MAX_HALF_EDGES, dtype=jnp.int32)
-    state, _ = jax.lax.scan(body, state, indices)
+    state, _ = jax.lax.scan(body, state, candidate_he)
     return state
 
 

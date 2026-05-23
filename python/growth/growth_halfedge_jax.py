@@ -899,8 +899,8 @@ def _add_internal_triangles(state, vertex_a, vertex_b, half_edge_ab):
     face_idx_updates = jnp.array([face_ebc, face_ead])
     updates['face_idx'] = state.face_idx.at[face_idx_arr].set(face_idx_updates)
 
-    face_he_idx = jnp.array([face_ebc, face_ead])
-    face_he_updates = jnp.array([half_edge_eb, half_edge_ea])
+    face_he_idx = jnp.array([face_aec, face_bed, face_ebc, face_ead])
+    face_he_updates = jnp.array([half_edge_ae, half_edge_be, half_edge_eb, half_edge_ea])
     updates['face_half_edge'] = state.face_half_edge.at[face_he_idx].set(face_he_updates)
 
     # Update half edge indices
@@ -1751,14 +1751,14 @@ def main():
         
         # Update physics
         state, repulsion_mag = update_positions(state, params)
-        state = update_vertex_state(state, params)
+        # state = update_vertex_state(state, params)
 
         # ensure first triangle vertices stay fixed
         vertex_pos = state.vertex_pos.at[jnp.array([0, 1, 2])].set(jnp.array([v0, v1, v2]))
         state = state._replace(vertex_pos=vertex_pos)
         
         # Generate new triangles
-        state, key = maybe_generate_new_triangles(state, params, key, repulsion_mag)
+        # state, key = maybe_generate_new_triangles(state, params, key, repulsion_mag)
         
         # Refine mesh every 10 frames
         if frame_count % 10 == 0:

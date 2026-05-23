@@ -18,6 +18,14 @@ import jax.numpy as jnp
 
 import growth_halfedge_jax as g
 
+# Single compiled graph per (substeps, growth_mode) pair instead of relying on
+# inner-op JIT caching. n_substeps and growth_mode are static so the substep
+# scan and the lenia/nca branch trace once.
+_jit_physics_step = jax.jit(
+    g.batched_physics_step,
+    static_argnames=("n_substeps", "growth_mode"),
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(message)s",
@@ -33,7 +41,15 @@ def parse_args():
     # Simulation
     p.add_argument("--frames", type=int, default=300, help="Simulation frames")
     p.add_argument("--seed", type=int, default=7, help="RNG seed")
+    p.add_argument("--shape", choices=["disc", "sphere"], default="disc",
+                   help="Initial mesh topology")
     p.add_argument("--rings", type=int, default=4, help="Initial disc rings")
+    p.add_argument("--sphere-lat", type=int, default=8,
+                   help="UV-sphere latitude bands (sphere only)")
+    p.add_argument("--sphere-lon", type=int, default=12,
+                   help="UV-sphere longitude segments (sphere only)")
+    p.add_argument("--sphere-radius-mult", type=float, default=2.0,
+                   help="Sphere radius as multiple of spring_len (sphere only)")
     p.add_argument("--growth-mode", choices=["lenia", "nca"], default="lenia",
                    help="Growth dynamics for vertex_state")
 
@@ -123,15 +139,30 @@ def main():
         vertex_state_mlp_params=mlp_params,
     )
 
-    log.info("Building initial mesh (n_rings=%d, spring_len=%.1f)",
-             args.rings, params.spring_len)
-    state = g.make_disc(
-        n_rings=args.rings,
-        spring_len=params.spring_len,
-        center=(args.resolution / 2, args.resolution / 2, 0.0),
-        state_dims=state_dims,
-    )
-    state = g.seed_boundary_state(state, channel=0, value=1.0)
+    if args.shape == "disc":
+        log.info("Building initial disc (n_rings=%d, spring_len=%.1f)",
+                 args.rings, params.spring_len)
+        state = g.make_disc(
+            n_rings=args.rings,
+            spring_len=params.spring_len,
+            center=(args.resolution / 2, args.resolution / 2, 0.0),
+            state_dims=state_dims,
+        )
+        state = g.seed_boundary_state(state, channel=0, value=1.0)
+    else:
+        log.info(
+            "Building initial sphere (n_lat=%d, n_lon=%d, radius=%.1f)",
+            args.sphere_lat, args.sphere_lon,
+            params.spring_len * args.sphere_radius_mult,
+        )
+        state = g.make_sphere(
+            width=args.resolution, height=args.resolution, params=params,
+            n_lat=args.sphere_lat, n_lon=args.sphere_lon,
+            radius_multiplier=args.sphere_radius_mult,
+            state_dims=state_dims,
+        )
+        key, seed_key = jax.random.split(key)
+        state = g.seed_random_state(state, seed_key, channel=0, low=0.0, high=1.0)
 
     cheb_coeffs, order = g.chebyshev_ring_coeffs(
         params.kernel_mu, params.kernel_sigma
@@ -150,13 +181,17 @@ def main():
     )
 
     # ── Warm-up JIT ──
+    # Compile physics graph and prime the host-side topology ops on the
+    # initial mesh so iter 0 doesn't pay first-call costs.
     log.info("JIT compiling batched_physics_step (substeps=%d)...", args.substeps)
     t_jit = time.time()
 
-    state, key = g.batched_physics_step(
+    state, key = _jit_physics_step(
         state, params, cheb_coeffs, key, args.substeps, args.growth_mode,
     )
     jax.block_until_ready(state.vertex_pos)
+    state, key, nv = g.split_long_edges(state, params, key, max_splits=args.max_splits)
+    state = g.refine_mesh(state)
 
     log.info("JIT done in %.1fs", time.time() - t_jit)
 
@@ -169,16 +204,17 @@ def main():
     t0 = time.time()
 
     for it in range(n_iters):
-        state, key = g.batched_physics_step(
+        state, key = _jit_physics_step(
             state, params, cheb_coeffs, key, args.substeps, args.growth_mode,
         )
 
-        state, key = g.split_long_edges(
+        # split_long_edges already counts active verts internally (host side)
+        # and returns nv — reuse it for progress + limit check, no extra sync.
+        state, key, nv = g.split_long_edges(
             state, params, key, max_splits=args.max_splits,
         )
         state = g.refine_mesh(state)
 
-        nv = int(jnp.sum(state.vertex_idx != -1))
         frame = (it + 1) * args.substeps
         elapsed = time.time() - t0
         fps = frame / max(elapsed, 0.01)
@@ -194,7 +230,6 @@ def main():
             break
 
     sys.stderr.write("\n")
-    nv = int(jnp.sum(state.vertex_idx != -1))
     nf = int(jnp.sum(state.face_idx != -1))
     elapsed = time.time() - t0
     log.info("Simulation done: %d verts, %d faces in %.1fs", nv, nf, elapsed)

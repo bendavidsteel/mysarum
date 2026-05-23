@@ -703,67 +703,67 @@ def _intrinsic_flip_length(lab, lca, lbc, lad, ldb):
 
 # ── Mesh Refinement ──────────────────────────────────────────────────────────
 
+@jax.jit
 def refine_mesh(state):
-    """Flip non-Delaunay edges using intrinsic edge lengths (CPU loop)."""
-    he_idx_np = np.array(state.half_edge_idx)
-    he_face_np = np.array(state.half_edge_face)
-    he_twin_np = np.array(state.half_edge_twin)
-    he_dest_np = np.array(state.half_edge_dest)
-    he_next_np = np.array(state.half_edge_next)
-    he_ilen_np = np.array(state.half_edge_intrinsic_len)
+    """Flip non-Delaunay edges using intrinsic edge lengths.
 
-    edges_to_check = []
-    for he in range(MAX_HALF_EDGES):
-        if he_idx_np[he] < 0:
-            continue
-        if he_face_np[he] == -1:
-            continue
-        twin = he_twin_np[he]
-        if twin < 0 or he_face_np[twin] == -1:
-            continue
-        if he_dest_np[he] < he_dest_np[twin]:
-            edges_to_check.append(he)
+    Scan over every half-edge slot; for each, recompute validity + the
+    intrinsic-Delaunay sin-sum criterion from the *current* carry state
+    (earlier flips in the same pass mutate twin/next pointers and lengths).
+    """
 
-    for he in edges_to_check:
-        if int(he_idx_np[he]) < 0:
-            continue
-        twin = int(he_twin_np[he])
-        if twin < 0:
-            continue
-        if int(he_face_np[he]) == -1 or int(he_face_np[twin]) == -1:
-            continue
+    def body(state, he):
+        twin = state.half_edge_twin[he]
+        safe_twin = jnp.maximum(twin, 0)
 
-        he_bc = int(he_next_np[he])
-        he_ad = int(he_next_np[twin])
-        if he_bc < 0 or he_ad < 0:
-            continue
-        he_ca = int(he_next_np[he_bc])
-        he_db = int(he_next_np[he_ad])
-        if he_ca < 0 or he_db < 0:
-            continue
+        he_bc = state.half_edge_next[he]
+        he_ad = state.half_edge_next[safe_twin]
+        safe_bc = jnp.maximum(he_bc, 0)
+        safe_ad = jnp.maximum(he_ad, 0)
+        he_ca = state.half_edge_next[safe_bc]
+        he_db = state.half_edge_next[safe_ad]
+        safe_ca = jnp.maximum(he_ca, 0)
+        safe_db = jnp.maximum(he_db, 0)
 
-        lab = float(he_ilen_np[he])
-        lbc = float(he_ilen_np[he_bc])
-        lca = float(he_ilen_np[he_ca])
-        lad = float(he_ilen_np[he_ad])
-        ldb = float(he_ilen_np[he_db])
+        lab = state.half_edge_intrinsic_len[he]
+        lbc = state.half_edge_intrinsic_len[safe_bc]
+        lca = state.half_edge_intrinsic_len[safe_ca]
+        lad = state.half_edge_intrinsic_len[safe_ad]
+        ldb = state.half_edge_intrinsic_len[safe_db]
 
         lab2 = lab * lab
-        cos_c = (lca * lca + lbc * lbc - lab2) / max(2.0 * lca * lbc, EPSILON)
-        sin_c = max(1.0 - cos_c * cos_c, 0.0) ** 0.5
-        cos_d = (lad * lad + ldb * ldb - lab2) / max(2.0 * lad * ldb, EPSILON)
-        sin_d = max(1.0 - cos_d * cos_d, 0.0) ** 0.5
+        cos_c = (lca * lca + lbc * lbc - lab2) \
+            / jnp.maximum(2.0 * lca * lbc, EPSILON)
+        sin_c = jnp.sqrt(jnp.maximum(1.0 - cos_c * cos_c, 0.0))
+        cos_d = (lad * lad + ldb * ldb - lab2) \
+            / jnp.maximum(2.0 * lad * ldb, EPSILON)
+        sin_d = jnp.sqrt(jnp.maximum(1.0 - cos_d * cos_d, 0.0))
         sin_sum = sin_c * cos_d + cos_c * sin_d
 
-        if sin_sum < -EPSILON:
-            state = flip_edge(state, he)
-            he_idx_np = np.array(state.half_edge_idx)
-            he_face_np = np.array(state.half_edge_face)
-            he_twin_np = np.array(state.half_edge_twin)
-            he_dest_np = np.array(state.half_edge_dest)
-            he_next_np = np.array(state.half_edge_next)
-            he_ilen_np = np.array(state.half_edge_intrinsic_len)
+        dest = state.half_edge_dest[he]
+        twin_dest = state.half_edge_dest[safe_twin]
 
+        should_flip = (
+            (state.half_edge_idx[he] >= 0)
+            & (state.half_edge_face[he] != -1)
+            & (twin >= 0)
+            & (state.half_edge_face[safe_twin] != -1)
+            & (he_bc >= 0) & (he_ad >= 0)
+            & (he_ca >= 0) & (he_db >= 0)
+            & (dest < twin_dest)
+            & (sin_sum < -EPSILON)
+        )
+
+        state = jax.lax.cond(
+            should_flip,
+            lambda s: flip_edge(s, he),
+            lambda s: s,
+            state,
+        )
+        return state, None
+
+    indices = jnp.arange(MAX_HALF_EDGES, dtype=jnp.int32)
+    state, _ = jax.lax.scan(body, state, indices)
     return state
 
 
@@ -810,7 +810,7 @@ def split_long_edges(state, params, key, max_splits=20):
             state = add_internal_triangles(state, src, dst)
         n_verts += 1
 
-    return state, key
+    return state, key, n_verts
 
 
 # ── External Forces (Predict Step) ──────────────────────────────────────────
@@ -1573,6 +1573,16 @@ def seed_boundary_state(state, channel=0, value=1.0):
     return state._replace(vertex_state=state.vertex_state.at[:, channel].set(new_ch))
 
 
+def seed_random_state(state, key, channel=0, low=0.0, high=1.0):
+    """Set channel `channel` of vertex_state to random uniform [low, high] on
+    active vertices (vertex_idx != -1). Used for closed meshes (e.g. sphere)
+    where there is no boundary to seed."""
+    active = state.vertex_idx != -1
+    rnd = jax.random.uniform(key, (MAX_VERTICES,), minval=low, maxval=high)
+    new_ch = jnp.where(active, rnd, state.vertex_state[:, channel])
+    return state._replace(vertex_state=state.vertex_state.at[:, channel].set(new_ch))
+
+
 def main():
     width, height = 800, 800
     key = jax.random.PRNGKey(42)
@@ -1620,10 +1630,9 @@ def main():
         )
 
         if frame % 10 == 0:
-            state, key = split_long_edges(state, params, key)
+            state, key, n_verts = split_long_edges(state, params, key)
             if frame % 20 == 0:
                 state = refine_mesh(state)
-            n_verts = int(jnp.sum(state.vertex_idx != -1))
             n_faces = int(jnp.sum(state.face_idx != -1))
             if frame % 50 == 0:
                 _, max_angle, mean_angle, _ = measure_dihedral_angles(state)

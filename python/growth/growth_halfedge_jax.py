@@ -1,7 +1,19 @@
+"""
+growth_halfedge_jax.py — Differential growth on a half-edge mesh in JAX.
+
+Combines:
+- Half-edge data structure (2-manifold with boundary)
+- Intrinsic triangulation (per-half-edge intrinsic rest lengths decoupled from 3D embedding)
+- XPBD constraint projection (springs, dihedral bending, collision)
+- Growth control via either:
+    * "lenia"   — Chebyshev polynomial graph CA, scalar channel
+    * "nca"     — MeshNCA-style MLP over per-vertex feature vectors
+- nvdiffrast rendering
+"""
+
 import collections
 import functools
 
-import glm
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -11,1212 +23,1184 @@ import torch
 import nvdiffrast.torch as dr
 
 
-MAX_VERTICES = 1000
-MAX_HALF_EDGES = MAX_VERTICES * 6  # Triangular mesh needs ~6 half-edges per vertex
-MAX_FACES = MAX_VERTICES * 2  # Triangular mesh needs ~2 faces per vertex
-EPSILON = 0.000001
+# ── Constants ────────────────────────────────────────────────────────────────
+
+EPSILON = 1e-6
+MAX_VERTICES = 12000
+MAX_HALF_EDGES = MAX_VERTICES * 6
+MAX_FACES = MAX_VERTICES * 2
+MAX_CHEB_ORDER = 16
+MAX_FAN_SIZE = 20
+
+# Spatial hash for repulsion / collision
+NUM_HASH_BUCKETS = 12289
+SLOTS_PER_CELL = 12
+
+# World bounds for enforce_boundary
+WORLD_MIN = (0.0, 0.0, 0.0)
+WORLD_MAX = (800.0, 800.0, 200.0)
+
+
+# ── State ────────────────────────────────────────────────────────────────────
 
 MeshState = collections.namedtuple('MeshState', [
-    'face_idx',
-    'face_half_edge',
     'vertex_idx',
     'vertex_half_edge',
     'vertex_pos',
+    'vertex_state',
     'half_edge_idx',
     'half_edge_twin',
     'half_edge_dest',
     'half_edge_face',
     'half_edge_next',
     'half_edge_prev',
-    'vertex_state'
+    'half_edge_intrinsic_len',
+    'face_idx',
+    'face_half_edge',
 ])
+
 
 MeshParams = collections.namedtuple('MeshParams', [
+    # XPBD / physics
     'spring_len',
-    'elastic_constant',
-    'repulsion_distance',
+    'compliance',
+    'bending_compliance',
+    'repulsion_dist',
     'repulsion_strength',
     'bulge_strength',
-    'planar_strength',
-    'num_dims',
+    'stiffness',
+    'damping',
+    'dt',
+    'max_edge_len',
+    # Lenia CA (used when growth_mode == "lenia")
+    'kernel_mu',
+    'kernel_sigma',
+    'growth_mu',
+    'growth_sigma',
+    # Common growth
+    'growth_rate',
+    'state_dt',
+    # MeshNCA (used when growth_mode == "nca")
     'vertex_state_mlp_params',
-    'num_colour_channels'
+    # General
+    'num_colour_channels',
 ])
 
-@jax.jit
-def get_face_indices(state: MeshState, all_half_edges_with_faces):
-    # Build triangles for all half-edges with faces
-    triangle_half_edges = jnp.stack([
-        all_half_edges_with_faces,
-        state.half_edge_next[all_half_edges_with_faces],
-        state.half_edge_next[state.half_edge_next[all_half_edges_with_faces]],
-    ], -1)
-    triangle_vertices = state.half_edge_dest[triangle_half_edges]
 
-    # Front face indices (original order)
-    indices_front = triangle_vertices.reshape(-1)
+def default_params(**overrides):
+    defaults = dict(
+        spring_len=30.0,
+        compliance=0.0,
+        bending_compliance=0.001,
+        repulsion_dist=80.0,
+        repulsion_strength=4.0,
+        bulge_strength=5.0,
+        stiffness=400.0,
+        damping=10.0,
+        dt=0.02,
+        max_edge_len=50.0,
+        kernel_mu=4.0,
+        kernel_sigma=1.0,
+        growth_mu=0.5,
+        growth_sigma=0.2,
+        growth_rate=1.0,
+        state_dt=0.02,
+        vertex_state_mlp_params={},
+        num_colour_channels=1,
+    )
+    defaults.update(overrides)
+    return MeshParams(**defaults)
 
-    # Back face indices (swap v1 and v2 to reverse winding)
-    triangle_vertices_back = triangle_vertices[:, [0, 2, 1]]
-    indices_back = triangle_vertices_back.reshape(-1)
 
-    # Flatten to get index array
-    indices = jnp.concatenate([indices_front, indices_back])
-    return indices
+def create_initial_state(state_dims=1, key=None):
+    """Create empty mesh state with multi-channel vertex_state.
 
-def create_initial_state(subkey, num_dims=2, state_dims=4):
-    """Create initial mesh state"""
+    state_dims=1 is typical for Lenia mode; NCA uses larger state_dims.
+    """
+    if key is None:
+        vstate = jnp.zeros((MAX_VERTICES, state_dims), jnp.float32)
+    else:
+        vstate = jax.random.normal(key, (MAX_VERTICES, state_dims), jnp.float32)
 
     return MeshState(
-        face_idx=jnp.full((MAX_FACES,), -1, dtype=jnp.int32),
-        face_half_edge=jnp.full((MAX_FACES,), -1, dtype=jnp.int32),
-        vertex_idx=jnp.full((MAX_VERTICES,), -1, dtype=jnp.int32),
-        vertex_half_edge=jnp.full((MAX_VERTICES,), -1, dtype=jnp.int32),
-        vertex_pos=jnp.full((MAX_VERTICES, num_dims), -1, dtype=jnp.float32),
-        half_edge_idx=jnp.full((MAX_HALF_EDGES,), -1, dtype=jnp.int32),
-        half_edge_twin=jnp.full((MAX_HALF_EDGES,), -1, dtype=jnp.int32),
-        half_edge_dest=jnp.full((MAX_HALF_EDGES,), -1, dtype=jnp.int32),
-        half_edge_face=jnp.full((MAX_HALF_EDGES,), -1, dtype=jnp.int32),
-        half_edge_next=jnp.full((MAX_HALF_EDGES,), -1, dtype=jnp.int32),
-        half_edge_prev=jnp.full((MAX_HALF_EDGES,), -1, dtype=jnp.int32),
-        vertex_state=jax.random.normal(subkey, (MAX_VERTICES, state_dims), dtype=jnp.float32)
+        vertex_idx=jnp.full(MAX_VERTICES, -1, jnp.int32),
+        vertex_half_edge=jnp.full(MAX_VERTICES, -1, jnp.int32),
+        vertex_pos=jnp.zeros((MAX_VERTICES, 3), jnp.float32),
+        vertex_state=vstate,
+        half_edge_idx=jnp.full(MAX_HALF_EDGES, -1, jnp.int32),
+        half_edge_twin=jnp.full(MAX_HALF_EDGES, -1, jnp.int32),
+        half_edge_dest=jnp.full(MAX_HALF_EDGES, -1, jnp.int32),
+        half_edge_face=jnp.full(MAX_HALF_EDGES, -1, jnp.int32),
+        half_edge_next=jnp.full(MAX_HALF_EDGES, -1, jnp.int32),
+        half_edge_prev=jnp.full(MAX_HALF_EDGES, -1, jnp.int32),
+        half_edge_intrinsic_len=jnp.zeros(MAX_HALF_EDGES, jnp.float32),
+        face_idx=jnp.full(MAX_FACES, -1, jnp.int32),
+        face_half_edge=jnp.full(MAX_FACES, -1, jnp.int32),
     )
 
-@jax.jit
-def calculate_spring_force(state, params):
-    """Calculate spring forces"""
-    edges = jnp.stack([state.half_edge_dest, state.half_edge_dest[state.half_edge_prev]])
-    edge_pos = state.vertex_pos[edges]
-    edge_vector = edge_pos[0] - edge_pos[1]
-    edge_lengths = jnp.linalg.norm(edge_vector, axis=1)
-    
-    safe_lengths = jnp.maximum(edge_lengths, EPSILON)
-    edge_force = -1 * (edge_lengths[:, None] - params.spring_len) * params.elastic_constant * (edge_vector / safe_lengths[:, None])
-    
-    # Mask out invalid edges
-    valid_mask = (state.half_edge_idx != -1) & (edges[0] != -1) & (edges[1] != -1)
-    edge_force = jnp.where(valid_mask[:, None], edge_force, 0)
-    
-    # Accumulate forces at vertices
-    vertex_force = jnp.zeros_like(state.vertex_pos)
-    vertex_force = vertex_force.at[edges[0]].add(edge_force)
-    vertex_force = vertex_force.at[edges[1]].add(-edge_force)
-    
-    return vertex_force
 
-@jax.jit
-def calculate_repulsion_force(state: MeshState, params: MeshParams):
-    """Calculate repulsion forces"""
-    active_mask = state.vertex_idx != -1
-    
-    vertex_diff = state.vertex_pos[:, None, :] - state.vertex_pos[None, :, :]
-    vertex_dist = jnp.sqrt(jnp.sum(vertex_diff ** 2, axis=-1) + EPSILON)
-    
-    dist_ratio = jnp.maximum(0, (params.repulsion_distance - vertex_dist) / params.repulsion_distance)
-    repulsion_force = (dist_ratio ** 2)[:, :, None] * (vertex_diff / vertex_dist[:, :, None])
-    
-    # Mask out inactive vertices and self-interactions
-    mask = jnp.outer(active_mask, active_mask) & ~jnp.eye(MAX_VERTICES, dtype=bool)
-    repulsion_force = jnp.where(mask[:, :, None], repulsion_force, 0)
-    
-    repulsion_force_mag = jnp.linalg.norm(repulsion_force, axis=-1).sum(axis=1)
-    repulsion_force_sum = repulsion_force.sum(axis=1)
-    
-    return repulsion_force_mag, repulsion_force_sum
-
-@jax.jit
-def calculate_planar_force(state, params):
-    """Calculate planar forces to keep mesh flat"""
-    # for each vertex, sum its neighbour positions and get its edge count
-    vertex_sum = jnp.zeros_like(state.vertex_pos)
-    edge_count = jnp.zeros((state.vertex_idx.shape[0],), dtype=int)
-    start_half_edge = state.vertex_half_edge.copy()
-    start_vertex = state.half_edge_dest[start_half_edge]
-    vertex_a = start_vertex.copy()
-    half_edge_a = start_half_edge.copy()
-    iterating = jnp.ones_like(half_edge_a)
-
-    # TODO maybe no planar force for boundary vertices?
-    
-    def cond_func(carry):
-        vertex_sum, edge_count, half_edge_a, vertex_a, iterating = carry
-        return jnp.any(iterating)
-    
-    def body_func(carry):
-        vertex_sum, edge_count, half_edge_a, vertex_a, iterating = carry
-        half_edge_b = state.half_edge_next[state.half_edge_twin[half_edge_a]]
-        vertex_b = state.half_edge_dest[half_edge_b]
-        iterating = iterating & (vertex_b != start_vertex)
-        vertex_sum += (state.vertex_pos[vertex_b] * iterating[:, np.newaxis])
-        edge_count += iterating
-        return (vertex_sum, edge_count, half_edge_b, vertex_b, iterating)
-
-    vertex_sum, edge_count, _, _, _ = jax.lax.while_loop(
-        cond_func,
-        body_func,
-        (vertex_sum, edge_count, half_edge_a, vertex_a, iterating)
-    )
-
-    neighbour_avg = vertex_sum / (edge_count[:, np.newaxis] + EPSILON)
-    planar_force = (neighbour_avg - state.vertex_pos) * (state.vertex_idx != -1)[:, np.newaxis]
-    return planar_force
-
-
-@jax.jit
-def calculate_bulge_force(state: MeshState, params: MeshParams):
-    """Calculate bulge forces for boundary edges"""
-    # Find boundary half edges
-    boundary_mask = (state.half_edge_face == -1) & (state.half_edge_idx != -1)
-    
-    # Get edge vectors
-    edges = jnp.stack([
-        state.half_edge_dest[state.half_edge_twin],
-        state.half_edge_dest,
-    ])
-    edge_pos = state.vertex_pos[edges]
-    edge_vector = edge_pos[1] - edge_pos[0]
-
-    next_edge = jnp.stack([
-        state.half_edge_dest[state.half_edge_twin],
-        state.half_edge_dest[state.half_edge_next[state.half_edge_twin]],
-
-    ])
-    next_edge_pos = state.vertex_pos[next_edge]
-    next_edge_vector = next_edge_pos[1] - next_edge_pos[0]
-
-    # calculate normals
-    surface_normal = jnp.cross(edge_vector, next_edge_vector)
-    edge_normal = jnp.cross(edge_vector, surface_normal)
-    
-    edge_normal = edge_normal / (jnp.linalg.norm(edge_normal, axis=-1, keepdims=True) + EPSILON)
-    
-    # Apply only to boundary edges
-    edge_normal = jnp.where(boundary_mask[:, None], edge_normal, 0)
-    
-    # Accumulate at vertices
-    vertex_force = jnp.zeros_like(state.vertex_pos)
-    vertex_force = vertex_force.at[edges[0]].add(edge_normal)
-    vertex_force = vertex_force.at[edges[1]].add(edge_normal)
-    
-    # Normalize
-    force_norm = jnp.linalg.norm(vertex_force, axis=-1, keepdims=True)
-    vertex_force = vertex_force / jnp.maximum(force_norm, EPSILON)
-    
-    return vertex_force
-
-@jax.jit
-def update_positions(state, params, dt=0.1):
-    """Update vertex positions based on forces"""
-    spring_force = calculate_spring_force(state, params)
-    repulsion_mag, repulsion_force = calculate_repulsion_force(state, params)
-    bulge_force = calculate_bulge_force(state, params)
-    planar_force = calculate_planar_force(state, params)
-    
-    total_force = (spring_force + 
-                   params.repulsion_strength * repulsion_force + 
-                   params.bulge_strength * bulge_force +
-                   params.planar_strength * planar_force)
-    
-    # Only update active vertices
-    active_mask = state.vertex_idx != -1
-    new_positions = state.vertex_pos + dt * total_force * active_mask[:, None]
-    
-    # Update suitability
-    # min_repulsion = jnp.min(jnp.where(repulsion_mag > 0, repulsion_mag, jnp.inf))
-    # min_repulsion = jnp.where(jnp.isfinite(min_repulsion), min_repulsion, 1.0)
-    # repulsion_norm = repulsion_mag / min_repulsion
-    # new_suitability = 1 / (1 + repulsion_norm ** 2) * active_mask.astype(jnp.float32)
-    
-    return state._replace(vertex_pos=new_positions), repulsion_mag
-
-def make_first_triangle(state, width, height, params):
-    """Initialize the first triangle"""
-    # Vertices
-    vertex_positions = jnp.array([
-        [width/2, height/2, 0],
-        [width/2 + params.spring_len, height/2, 0],
-        [width/2 + params.spring_len/2, height/2 + params.spring_len * jnp.sqrt(3)/2, 0]
-    ])
-
-    vertex_idx = state.vertex_idx.at[:3].set(jnp.arange(3))
-    vertex_pos = state.vertex_pos.at[:3].set(vertex_positions)
-
-    # Half edges: inner triangle (0,1,2) and outer boundary (3,4,5)
-    half_edge_idx = state.half_edge_idx.at[:6].set(jnp.arange(6))
-
-    # Set twins
-    half_edge_twin = state.half_edge_twin.at[0].set(3).at[3].set(0)
-    half_edge_twin = half_edge_twin.at[1].set(5).at[5].set(1)
-    half_edge_twin = half_edge_twin.at[2].set(4).at[4].set(2)
-
-    # Set destinations
-    half_edge_dest = state.half_edge_dest.at[0].set(1).at[1].set(2).at[2].set(0)
-    half_edge_dest = half_edge_dest.at[3].set(0).at[4].set(2).at[5].set(1)
-
-    # Set next/prev
-    half_edge_next = state.half_edge_next.at[0].set(1).at[1].set(2).at[2].set(0)
-    half_edge_next = half_edge_next.at[3].set(4).at[4].set(5).at[5].set(3)
-
-    half_edge_prev = state.half_edge_prev.at[0].set(2).at[1].set(0).at[2].set(1)
-    half_edge_prev = half_edge_prev.at[3].set(5).at[4].set(3).at[5].set(4)
-
-    # Set face (0 for inner triangle, -1 for boundary)
-    half_edge_face = state.half_edge_face.at[0].set(0).at[1].set(0).at[2].set(0)
-
-    # Set vertex half edges
-    vertex_half_edge = state.vertex_half_edge.at[0].set(0).at[1].set(1).at[2].set(2)
-
-    # Set face
-    face_idx = state.face_idx.at[0].set(0)
-    face_half_edge = state.face_half_edge.at[0].set(0)
-
-    return state._replace(
-        vertex_idx=vertex_idx,
-        vertex_pos=vertex_pos,
-        vertex_half_edge=vertex_half_edge,
-        half_edge_idx=half_edge_idx,
-        half_edge_twin=half_edge_twin,
-        half_edge_dest=half_edge_dest,
-        half_edge_face=half_edge_face,
-        half_edge_next=half_edge_next,
-        half_edge_prev=half_edge_prev,
-        face_idx=face_idx,
-        face_half_edge=face_half_edge
-    )
-
-def make_circle(state, width, height, params, n_rings=3, segments_inner=6):
-    """Initialize a circular disc mesh with multiple concentric rings
-
-    Args:
-        state: Initial mesh state
-        width, height: Screen dimensions
-        params: Mesh parameters
-        n_rings: Number of concentric rings (default 3, giving radius ~3*spring_len)
-        segments_inner: Number of segments in innermost ring (outer rings have proportionally more)
-    """
-    center_x, center_y = width/2, height/2
-    spring_len = params.spring_len
-
-    # Start building the mesh with center vertex
-    vertex_positions_list = [jnp.array([center_x, center_y, 0])]
-
-    # Create vertices for each ring
-    ring_vertex_counts = []
-    for ring_idx in range(n_rings):
-        radius = spring_len * (ring_idx + 1)
-        # Each ring has more segments proportional to its radius to maintain edge length
-        n_segments = segments_inner * (ring_idx + 1)
-        ring_vertex_counts.append(n_segments)
-
-        angles = jnp.linspace(0, 2 * jnp.pi, n_segments, endpoint=False)
-        x = center_x + radius * jnp.cos(angles)
-        y = center_y + radius * jnp.sin(angles)
-        z = jnp.zeros(n_segments)
-        ring_positions = jnp.stack([x, y, z], axis=1)
-        vertex_positions_list.append(ring_positions)
-
-    # Concatenate all vertices
-    vertex_positions = jnp.concatenate([jnp.expand_dims(vertex_positions_list[0], 0)] +
-                                       [vertex_positions_list[i+1] for i in range(n_rings)])
-    n_vertices = len(vertex_positions)
-
-    # Initialize mesh arrays
-    vertex_idx = state.vertex_idx.at[:n_vertices].set(jnp.arange(n_vertices))
-    vertex_pos = state.vertex_pos.at[:n_vertices].set(vertex_positions)
-
-    # Build connectivity using numpy for flexibility (will convert to JAX arrays)
-    edges_list = []
-    faces_list = []
-
-    # Get vertex index for ring i, segment j
-    def get_vertex_idx(ring, segment):
-        if ring == -1:
-            return 0  # Center vertex
-        ring_start = 1 + sum(ring_vertex_counts[:ring])
-        return ring_start + (segment % ring_vertex_counts[ring])
-
-    # Connect center to first ring
-    n_segments_ring0 = ring_vertex_counts[0]
-    for i in range(n_segments_ring0):
-        v0 = 0  # center
-        v1 = get_vertex_idx(0, i)
-        v2 = get_vertex_idx(0, i + 1)
-        faces_list.append([v0, v1, v2])
-
-    # Connect rings to each other
-    for ring_idx in range(n_rings - 1):
-        n_inner = ring_vertex_counts[ring_idx]
-        n_outer = ring_vertex_counts[ring_idx + 1]
-
-        # For each inner vertex, connect to outer ring
-        inner_idx = 0
-        outer_idx = 0
-
-        while inner_idx < n_inner or outer_idx < n_outer:
-            v_inner_curr = get_vertex_idx(ring_idx, inner_idx)
-            v_inner_next = get_vertex_idx(ring_idx, inner_idx + 1)
-            v_outer_curr = get_vertex_idx(ring_idx + 1, outer_idx)
-            v_outer_next = get_vertex_idx(ring_idx + 1, outer_idx + 1)
-
-            # Calculate angles to decide which triangle to add
-            inner_angle_curr = inner_idx / n_inner
-            inner_angle_next = (inner_idx + 1) / n_inner
-            outer_angle_curr = outer_idx / n_outer
-            outer_angle_next = (outer_idx + 1) / n_outer
-
-            # Choose which diagonal to use
-            if outer_angle_next < inner_angle_next:
-                # Add triangle: inner_curr, outer_curr, outer_next
-                faces_list.append([v_inner_curr, v_outer_curr, v_outer_next])
-                outer_idx += 1
-            else:
-                # Add triangle: inner_curr, outer_curr, inner_next
-                faces_list.append([v_inner_curr, v_outer_curr, v_inner_next])
-                # If we're not done, also add the other triangle
-                if outer_angle_curr < inner_angle_next:
-                    faces_list.append([v_inner_next, v_outer_curr, v_outer_next])
-                    outer_idx += 1
-                inner_idx += 1
-
-    # Now build half-edge structure from faces
-    n_faces = len(faces_list)
-    edge_dict = {}  # (v1, v2) -> half_edge_idx
-    half_edge_list = []
-
-    for face_idx, face in enumerate(faces_list):
-        v0, v1, v2 = face
-        face_edges = [(v0, v1), (v1, v2), (v2, v0)]
-        face_half_edges = []
-
-        for v_from, v_to in face_edges:
-            he_idx = len(half_edge_list)
-            half_edge_list.append({
-                'dest': v_to,
-                'face': face_idx,
-                'twin': None,
-                'next': None,
-                'prev': None
-            })
-            edge_dict[(v_from, v_to)] = he_idx
-            face_half_edges.append(he_idx)
-
-        # Set next/prev within face
-        for i in range(3):
-            half_edge_list[face_half_edges[i]]['next'] = face_half_edges[(i + 1) % 3]
-            half_edge_list[face_half_edges[i]]['prev'] = face_half_edges[(i - 1) % 3]
-
-    # Create boundary half-edges and set twins
-    boundary_half_edges = []
-    for (v_from, v_to), he_idx in edge_dict.items():
-        twin_key = (v_to, v_from)
-        if twin_key in edge_dict:
-            # Internal edge
-            half_edge_list[he_idx]['twin'] = edge_dict[twin_key]
+def make_mlp_params(key, state_dims, hidden_state_dims=32, num_mlp_layers=2, scale=0.1):
+    """Build MLP weights for MeshNCA."""
+    num_sph = 4  # spherical harmonics up to degree 1
+    keys = jax.random.split(key, num_mlp_layers)
+    params = {}
+    for i in range(num_mlp_layers):
+        if i == 0:
+            in_dim = state_dims + num_sph * state_dims
         else:
-            # Boundary edge - create boundary half-edge
-            boundary_he_idx = len(half_edge_list)
-            half_edge_list.append({
-                'dest': v_from,
-                'face': -1,
-                'twin': he_idx,
-                'next': None,  # Will set later
-                'prev': None   # Will set later
+            in_dim = hidden_state_dims
+        out_dim = state_dims if i == num_mlp_layers - 1 else hidden_state_dims
+        w = scale * jax.random.normal(keys[i], (in_dim, out_dim))
+        b = jnp.zeros((out_dim,))
+        params[f'layer{i+1}'] = (w, b)
+    return params
+
+
+# ── Mesh Builders ────────────────────────────────────────────────────────────
+
+def _build_half_edges(positions, faces):
+    """Build half-edge connectivity arrays from positions + triangle faces.
+
+    Returns numpy arrays sized to MAX_HALF_EDGES, plus n_he, n_verts, n_faces.
+    Pure CPU/numpy. Computes intrinsic edge lengths from extrinsic positions.
+    """
+    n_verts = len(positions)
+    n_faces_input = len(faces)
+    pos_np = np.array(positions, dtype=np.float32)
+
+    edge_dict = {}
+    he_list = []
+
+    for fi, (v0, v1, v2) in enumerate(faces):
+        he_start = len(he_list)
+        for j, (src, dst) in enumerate([(v0, v1), (v1, v2), (v2, v0)]):
+            he_list.append({
+                'dest': int(dst), 'face': fi, 'twin': -1,
+                'next': he_start + (j + 1) % 3,
+                'prev': he_start + (j + 2) % 3,
             })
-            half_edge_list[he_idx]['twin'] = boundary_he_idx
-            boundary_half_edges.append((v_to, v_from, boundary_he_idx))
+            edge_dict[(int(src), int(dst))] = he_start + j
 
-    # Connect boundary half-edges
-    boundary_dict = {(v_from, v_to): he_idx for v_from, v_to, he_idx in boundary_half_edges}
-    for v_from, v_to, he_idx in boundary_half_edges:
-        # Find next boundary half-edge (starts at v_to)
-        for (v_next_from, v_next_to), next_he_idx in boundary_dict.items():
-            if v_next_from == v_to:
-                half_edge_list[he_idx]['next'] = next_he_idx
-                half_edge_list[next_he_idx]['prev'] = he_idx
+    boundary_edges = []
+    for (src, dst), he in edge_dict.items():
+        twin_key = (dst, src)
+        if twin_key in edge_dict:
+            he_list[he]['twin'] = edge_dict[twin_key]
+        else:
+            bhe = len(he_list)
+            he_list.append({
+                'dest': src, 'face': -1, 'twin': he,
+                'next': -1, 'prev': -1,
+            })
+            he_list[he]['twin'] = bhe
+            boundary_edges.append((dst, src, bhe))
+
+    bnd_dict = {(s, d): i for s, d, i in boundary_edges}
+    for src, dst, bhe in boundary_edges:
+        for (ns, _nd), nbhe in bnd_dict.items():
+            if ns == dst:
+                he_list[bhe]['next'] = nbhe
+                he_list[nbhe]['prev'] = bhe
                 break
 
-    # Convert to JAX arrays
-    n_half_edges = len(half_edge_list)
-    half_edge_idx = state.half_edge_idx.at[:n_half_edges].set(jnp.arange(n_half_edges))
-    half_edge_dest = state.half_edge_dest
-    half_edge_face = state.half_edge_face
-    half_edge_twin = state.half_edge_twin
-    half_edge_next = state.half_edge_next
-    half_edge_prev = state.half_edge_prev
+    n_he = len(he_list)
+    assert n_he <= MAX_HALF_EDGES, f"Too many half-edges: {n_he} > {MAX_HALF_EDGES}"
+    assert n_verts <= MAX_VERTICES, f"Too many vertices: {n_verts} > {MAX_VERTICES}"
+    assert n_faces_input <= MAX_FACES, f"Too many faces: {n_faces_input} > {MAX_FACES}"
 
-    for he_idx, he_data in enumerate(half_edge_list):
-        half_edge_dest = half_edge_dest.at[he_idx].set(he_data['dest'])
-        half_edge_face = half_edge_face.at[he_idx].set(he_data['face'])
-        half_edge_twin = half_edge_twin.at[he_idx].set(he_data['twin'])
-        half_edge_next = half_edge_next.at[he_idx].set(he_data['next'])
-        half_edge_prev = half_edge_prev.at[he_idx].set(he_data['prev'])
+    he_dest = np.full(MAX_HALF_EDGES, -1, np.int32)
+    he_face = np.full(MAX_HALF_EDGES, -1, np.int32)
+    he_twin = np.full(MAX_HALF_EDGES, -1, np.int32)
+    he_next = np.full(MAX_HALF_EDGES, -1, np.int32)
+    he_prev = np.full(MAX_HALF_EDGES, -1, np.int32)
+    he_idx = np.full(MAX_HALF_EDGES, -1, np.int32)
+    he_intrinsic = np.zeros(MAX_HALF_EDGES, np.float32)
 
-    # Set vertex half-edges (one outgoing half-edge per vertex)
-    vertex_half_edge = state.vertex_half_edge
-    for v_idx in range(n_vertices):
-        # Find any half-edge with this vertex as source
-        for (v_from, v_to), he_idx in edge_dict.items():
-            if v_from == v_idx:
-                vertex_half_edge = vertex_half_edge.at[v_idx].set(he_idx)
-                break
+    for i, he in enumerate(he_list):
+        he_idx[i] = i
+        he_dest[i] = he['dest']
+        he_face[i] = he['face']
+        he_twin[i] = he['twin']
+        he_next[i] = he['next']
+        he_prev[i] = he['prev']
 
-    # Set face data
-    face_idx = state.face_idx.at[:n_faces].set(jnp.arange(n_faces))
-    face_half_edge_array = state.face_half_edge
-    for f_idx, face in enumerate(faces_list):
-        v0, v1, v2 = face
-        he_idx = edge_dict[(v0, v1)]
-        face_half_edge_array = face_half_edge_array.at[f_idx].set(he_idx)
+    for i in range(n_he):
+        dst = he_dest[i]
+        twin = he_twin[i]
+        if dst < 0 or twin < 0:
+            continue
+        src = he_dest[twin]
+        if src < 0:
+            continue
+        d = pos_np[dst] - pos_np[src]
+        he_intrinsic[i] = float(np.linalg.norm(d))
 
-    return state._replace(
-        vertex_idx=vertex_idx,
-        vertex_pos=vertex_pos,
-        vertex_half_edge=vertex_half_edge,
-        half_edge_idx=half_edge_idx,
-        half_edge_twin=half_edge_twin,
-        half_edge_dest=half_edge_dest,
-        half_edge_face=half_edge_face,
-        half_edge_next=half_edge_next,
-        half_edge_prev=half_edge_prev,
-        face_idx=face_idx,
-        face_half_edge=face_half_edge_array
+    v_he = np.full(MAX_VERTICES, -1, np.int32)
+    for (src, _dst), he in edge_dict.items():
+        if v_he[src] == -1:
+            v_he[src] = he
+
+    f_idx = np.full(MAX_FACES, -1, np.int32)
+    f_he = np.full(MAX_FACES, -1, np.int32)
+    for fi in range(n_faces_input):
+        f_idx[fi] = fi
+        v0, v1, _v2 = faces[fi]
+        f_he[fi] = edge_dict[(int(v0), int(v1))]
+
+    return (he_idx, he_dest, he_face, he_twin, he_next, he_prev, he_intrinsic,
+            v_he, f_idx, f_he, n_verts, n_faces_input, n_he)
+
+
+def build_mesh_from_faces(positions, faces, state_dims=1, key=None):
+    """Build MeshState from positions and triangle faces."""
+    state = create_initial_state(state_dims=state_dims, key=key)
+
+    (he_idx, he_dest, he_face, he_twin, he_next, he_prev, he_intrinsic,
+     v_he, f_idx, f_he, n_verts, _, _) = _build_half_edges(positions, faces)
+
+    state = state._replace(
+        vertex_idx=state.vertex_idx.at[:n_verts].set(jnp.arange(n_verts)),
+        vertex_pos=state.vertex_pos.at[:n_verts].set(
+            jnp.array(positions, dtype=jnp.float32)
+        ),
+        vertex_half_edge=jnp.array(v_he),
+        half_edge_idx=jnp.array(he_idx),
+        half_edge_dest=jnp.array(he_dest),
+        half_edge_face=jnp.array(he_face),
+        half_edge_twin=jnp.array(he_twin),
+        half_edge_next=jnp.array(he_next),
+        half_edge_prev=jnp.array(he_prev),
+        half_edge_intrinsic_len=jnp.array(he_intrinsic),
+        face_idx=jnp.array(f_idx),
+        face_half_edge=jnp.array(f_he),
     )
 
-def make_sphere(state, width, height, params, n_lat=6, n_lon=8, radius_multiplier=2.0):
-    """Initialize a spherical mesh using UV sphere approach
+    return state
 
-    Args:
-        state: Initial mesh state
-        width, height: Screen dimensions
-        params: Mesh parameters
-        n_lat: Number of latitude divisions (excluding poles)
-        n_lon: Number of longitude divisions
-        radius_multiplier: Sphere radius as multiple of spring_len
-    """
-    center_x, center_y, center_z = width/2, height/2, 0.0
-    radius = params.spring_len * radius_multiplier
 
-    # Create vertices
-    vertex_positions_list = []
+def make_disc(n_rings=5, spring_len=30.0, center=(400.0, 400.0, 0.0),
+              state_dims=1, key=None):
+    """Flat hexagonal disc."""
+    cx, cy, cz = center
+    positions = [[cx, cy, cz]]
+    faces = []
 
-    # Top pole
-    vertex_positions_list.append(jnp.array([center_x, center_y, center_z + radius]))
+    ring_counts = []
+    for ring in range(n_rings):
+        r = spring_len * (ring + 1)
+        n = 6 * (ring + 1)
+        ring_counts.append(n)
+        angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        for a in angles:
+            positions.append([cx + r * np.cos(a), cy + r * np.sin(a), cz])
 
-    # Latitude rings (from top to bottom, excluding poles)
-    for lat_idx in range(n_lat):
-        # Angle from north pole (0 to pi)
-        theta = jnp.pi * (lat_idx + 1) / (n_lat + 1)
-        z = center_z + radius * jnp.cos(theta)
-        ring_radius = radius * jnp.sin(theta)
-
-        # Longitude divisions around the ring
-        for lon_idx in range(n_lon):
-            phi = 2 * jnp.pi * lon_idx / n_lon
-            x = center_x + ring_radius * jnp.cos(phi)
-            y = center_y + ring_radius * jnp.sin(phi)
-            vertex_positions_list.append(jnp.array([x, y, z]))
-
-    # Bottom pole
-    vertex_positions_list.append(jnp.array([center_x, center_y, center_z - radius]))
-
-    # Concatenate all vertices
-    vertex_positions = jnp.stack(vertex_positions_list)
-    n_vertices = len(vertex_positions)
-
-    # Initialize mesh arrays
-    vertex_idx = state.vertex_idx.at[:n_vertices].set(jnp.arange(n_vertices))
-    vertex_pos = state.vertex_pos.at[:n_vertices].set(vertex_positions)
-
-    # Helper function to get vertex index
-    def get_vertex_idx(lat, lon):
-        """Get vertex index for latitude ring and longitude position"""
-        if lat == -1:  # North pole
+    def vidx(ring, seg):
+        if ring == -1:
             return 0
-        elif lat == n_lat:  # South pole
-            return 1 + n_lat * n_lon
-        else:  # Regular ring
-            return 1 + lat * n_lon + (lon % n_lon)
+        start = 1 + sum(ring_counts[:ring])
+        return start + (seg % ring_counts[ring])
 
-    # Build faces
-    faces_list = []
+    for i in range(ring_counts[0]):
+        faces.append([0, vidx(0, i), vidx(0, i + 1)])
 
-    # Top cap - triangles connecting north pole to first ring
+    for ri in range(n_rings - 1):
+        ni = ring_counts[ri]
+        no = ring_counts[ri + 1]
+        ii, oi = 0, 0
+        while ii < ni or oi < no:
+            vi = vidx(ri, ii)
+            vin = vidx(ri, ii + 1)
+            vo = vidx(ri + 1, oi)
+            von = vidx(ri + 1, oi + 1)
+            ia = ii / ni
+            ian = (ii + 1) / ni
+            oa = oi / no
+            oan = (oi + 1) / no
+            if oan < ian:
+                faces.append([vi, vo, von])
+                oi += 1
+            else:
+                faces.append([vi, vo, vin])
+                if oa < ian:
+                    faces.append([vin, vo, von])
+                    oi += 1
+                ii += 1
+
+    return build_mesh_from_faces(
+        np.array(positions), np.array(faces), state_dims=state_dims, key=key,
+    )
+
+
+def make_circle(width, height, params, n_rings=3, segments_inner=6,
+                state_dims=1, key=None):
+    """Concentric-ring disc centered on screen."""
+    spring_len = float(params.spring_len)
+    return make_disc(
+        n_rings=n_rings,
+        spring_len=spring_len,
+        center=(width / 2, height / 2, 0.0),
+        state_dims=state_dims,
+        key=key,
+    )
+
+
+def make_sphere(width, height, params, n_lat=6, n_lon=8, radius_multiplier=2.0,
+                state_dims=1, key=None):
+    """Closed UV sphere."""
+    cx, cy, cz = width / 2, height / 2, 0.0
+    radius = float(params.spring_len) * radius_multiplier
+
+    positions = [[cx, cy, cz + radius]]
+    for lat_idx in range(n_lat):
+        theta = np.pi * (lat_idx + 1) / (n_lat + 1)
+        z = cz + radius * np.cos(theta)
+        ring_radius = radius * np.sin(theta)
+        for lon_idx in range(n_lon):
+            phi = 2 * np.pi * lon_idx / n_lon
+            x = cx + ring_radius * np.cos(phi)
+            y = cy + ring_radius * np.sin(phi)
+            positions.append([x, y, z])
+    positions.append([cx, cy, cz - radius])
+    south_pole = len(positions) - 1
+
+    def vidx(lat, lon):
+        if lat == -1:
+            return 0
+        if lat == n_lat:
+            return south_pole
+        return 1 + lat * n_lon + (lon % n_lon)
+
+    faces = []
     for lon_idx in range(n_lon):
-        v0 = get_vertex_idx(-1, 0)  # North pole
-        v1 = get_vertex_idx(0, lon_idx)
-        v2 = get_vertex_idx(0, lon_idx + 1)
-        faces_list.append([v0, v1, v2])
-
-    # Middle bands - quads between latitude rings (split into triangles)
+        faces.append([vidx(-1, 0), vidx(0, lon_idx), vidx(0, lon_idx + 1)])
     for lat_idx in range(n_lat - 1):
         for lon_idx in range(n_lon):
-            # Vertices of the quad
-            v_tl = get_vertex_idx(lat_idx, lon_idx)      # top-left
-            v_tr = get_vertex_idx(lat_idx, lon_idx + 1)  # top-right
-            v_bl = get_vertex_idx(lat_idx + 1, lon_idx)      # bottom-left
-            v_br = get_vertex_idx(lat_idx + 1, lon_idx + 1)  # bottom-right
-
-            # Split quad into two triangles
-            faces_list.append([v_tl, v_bl, v_tr])
-            faces_list.append([v_tr, v_bl, v_br])
-
-    # Bottom cap - triangles connecting south pole to last ring
+            v_tl = vidx(lat_idx, lon_idx)
+            v_tr = vidx(lat_idx, lon_idx + 1)
+            v_bl = vidx(lat_idx + 1, lon_idx)
+            v_br = vidx(lat_idx + 1, lon_idx + 1)
+            faces.append([v_tl, v_bl, v_tr])
+            faces.append([v_tr, v_bl, v_br])
     for lon_idx in range(n_lon):
-        v0 = get_vertex_idx(n_lat, 0)  # South pole
-        v1 = get_vertex_idx(n_lat - 1, lon_idx + 1)
-        v2 = get_vertex_idx(n_lat - 1, lon_idx)
-        faces_list.append([v0, v1, v2])
+        faces.append([vidx(n_lat, 0), vidx(n_lat - 1, lon_idx + 1), vidx(n_lat - 1, lon_idx)])
 
-    # Build half-edge structure from faces
-    n_faces = len(faces_list)
-    edge_dict = {}  # (v1, v2) -> half_edge_idx
-    half_edge_list = []
-
-    for face_idx, face in enumerate(faces_list):
-        v0, v1, v2 = face
-        face_edges = [(v0, v1), (v1, v2), (v2, v0)]
-        face_half_edges = []
-
-        for v_from, v_to in face_edges:
-            he_idx = len(half_edge_list)
-            half_edge_list.append({
-                'dest': v_to,
-                'face': face_idx,
-                'twin': None,
-                'next': None,
-                'prev': None
-            })
-            edge_dict[(v_from, v_to)] = he_idx
-            face_half_edges.append(he_idx)
-
-        # Set next/prev within face
-        for i in range(3):
-            half_edge_list[face_half_edges[i]]['next'] = face_half_edges[(i + 1) % 3]
-            half_edge_list[face_half_edges[i]]['prev'] = face_half_edges[(i - 1) % 3]
-
-    # Set twins (all edges should have twins in a closed sphere)
-    for (v_from, v_to), he_idx in edge_dict.items():
-        twin_key = (v_to, v_from)
-        if twin_key in edge_dict:
-            half_edge_list[he_idx]['twin'] = edge_dict[twin_key]
-        else:
-            # This shouldn't happen for a closed sphere, but handle it gracefully
-            print(f"Warning: No twin found for edge {v_from} -> {v_to}")
-            half_edge_list[he_idx]['twin'] = he_idx  # Self-twin as fallback
-
-    # Convert to JAX arrays
-    n_half_edges = len(half_edge_list)
-    half_edge_idx = state.half_edge_idx.at[:n_half_edges].set(jnp.arange(n_half_edges))
-    half_edge_dest = state.half_edge_dest
-    half_edge_face = state.half_edge_face
-    half_edge_twin = state.half_edge_twin
-    half_edge_next = state.half_edge_next
-    half_edge_prev = state.half_edge_prev
-
-    for he_idx, he_data in enumerate(half_edge_list):
-        half_edge_dest = half_edge_dest.at[he_idx].set(he_data['dest'])
-        half_edge_face = half_edge_face.at[he_idx].set(he_data['face'])
-        half_edge_twin = half_edge_twin.at[he_idx].set(he_data['twin'])
-        half_edge_next = half_edge_next.at[he_idx].set(he_data['next'])
-        half_edge_prev = half_edge_prev.at[he_idx].set(he_data['prev'])
-
-    # Set vertex half-edges (one outgoing half-edge per vertex)
-    vertex_half_edge = state.vertex_half_edge
-    for v_idx in range(n_vertices):
-        # Find any half-edge with this vertex as source
-        for (v_from, v_to), he_idx in edge_dict.items():
-            if v_from == v_idx:
-                vertex_half_edge = vertex_half_edge.at[v_idx].set(he_idx)
-                break
-
-    # Set face data
-    face_idx = state.face_idx.at[:n_faces].set(jnp.arange(n_faces))
-    face_half_edge_array = state.face_half_edge
-    for f_idx, face in enumerate(faces_list):
-        v0, v1, v2 = face
-        he_idx = edge_dict[(v0, v1)]
-        face_half_edge_array = face_half_edge_array.at[f_idx].set(he_idx)
-
-    return state._replace(
-        vertex_idx=vertex_idx,
-        vertex_pos=vertex_pos,
-        vertex_half_edge=vertex_half_edge,
-        half_edge_idx=half_edge_idx,
-        half_edge_twin=half_edge_twin,
-        half_edge_dest=half_edge_dest,
-        half_edge_face=half_edge_face,
-        half_edge_next=half_edge_next,
-        half_edge_prev=half_edge_prev,
-        face_idx=face_idx,
-        face_half_edge=face_half_edge_array
+    return build_mesh_from_faces(
+        np.array(positions), np.array(faces), state_dims=state_dims, key=key,
     )
 
-def get_vertex_half_edge(state, vertex_a, vertex_b):
-    """Get half edge from vertex_a to vertex_b"""
-    start_he = state.vertex_half_edge[vertex_a]
 
-    def cond_func(carry):
-        he, first_iter = carry
-        # Continue if: (dest != vertex_b) AND (not back at start OR first iteration)
-        return jnp.logical_and(
-            state.half_edge_dest[he] != vertex_b,
-            jnp.logical_or(he != start_he, first_iter)
-        )
+# ── Topology Operations ──────────────────────────────────────────────────────
 
-    def body_func(carry):
+def _get_he_ab(state, va, vb):
+    """Find half-edge from va to vb by walking va's fan."""
+    start = state.vertex_half_edge[va]
+
+    def cond(carry):
+        he, first = carry
+        return (state.half_edge_dest[he] != vb) & (first | (he != start))
+
+    def body(carry):
         he, _ = carry
-        next_he = state.half_edge_next[state.half_edge_twin[he]]
-        return (next_he, False)
+        return state.half_edge_next[state.half_edge_twin[he]], False
 
-    half_edge_ab, _ = jax.lax.while_loop(
-        cond_func,
-        body_func,
-        (start_he, True)
-    )
-    return half_edge_ab
+    he, _ = jax.lax.while_loop(cond, body, (start, True))
+    return he
 
-def add_external_triangle(state, vertex_a, vertex_b):
-    """Add an external triangle (non-JIT for simplicity)"""
-    # Find half edge from a to b
-    half_edge_ab = get_vertex_half_edge(state, vertex_a, vertex_b)
 
-    # Get next available indices
-    new_face_idx = jnp.max(state.face_idx) + 1
-    new_vertex_idx = jnp.max(state.vertex_idx) + 1
-    new_half_edge_idx = jnp.max(state.half_edge_idx) + 1
-    
-    return jax.lax.cond(
-        jnp.logical_or(
-            half_edge_ab == -1,
-            jnp.logical_or(
-                state.half_edge_face[half_edge_ab] != -1,
-                jnp.logical_or(
-                    new_face_idx >= MAX_FACES,
-                    jnp.logical_or(new_vertex_idx >= MAX_VERTICES, new_half_edge_idx + 4 >= MAX_HALF_EDGES)
-                )
-            )
-        ),
-        lambda: state,
-        lambda: _add_external_triangle(state, vertex_a, vertex_b, half_edge_ab, new_face_idx, new_vertex_idx, new_half_edge_idx),
-    )
+def add_external_triangle(state, va, vb):
+    """Add a triangle outside boundary edge va->vb."""
+    he_ab = _get_he_ab(state, va, vb)
+    new_f = jnp.max(state.face_idx) + 1
+    new_v = jnp.max(state.vertex_idx) + 1
+    new_he = jnp.max(state.half_edge_idx) + 1
 
-def _add_external_triangle(state, vertex_a, vertex_b, half_edge_ab, new_face_idx, new_vertex_idx, new_half_edge_idx):
-
-    # Create new vertex at midpoint
-    vertex_c = new_vertex_idx
-    new_pos = (state.vertex_pos[vertex_a] + state.vertex_pos[vertex_b]) / 2
-
-    # New half edges
-    half_edge_bc = new_half_edge_idx
-    half_edge_ca = new_half_edge_idx + 1
-    half_edge_cb = new_half_edge_idx + 2
-    half_edge_ac = new_half_edge_idx + 3
-
-    # Get existing connectivity
-    half_edge_b_next = state.half_edge_next[half_edge_ab]
-    half_edge_a_prev = state.half_edge_prev[half_edge_ab]
-
-    # Build updates
-    updates = {}
-
-    # Update vertex references
-    updates['vertex_idx'] = state.vertex_idx.at[vertex_c].set(vertex_c)
-    updates['vertex_pos'] = state.vertex_pos.at[vertex_c].set(new_pos)
-    updates['vertex_half_edge'] = state.vertex_half_edge.at[vertex_c].set(half_edge_ca)
-
-    # Update face references
-    updates['face_idx'] = state.face_idx.at[new_face_idx].set(new_face_idx)
-    updates['face_half_edge'] = state.face_half_edge.at[new_face_idx].set(half_edge_ab)
-
-    # Update half edge indices
-    half_edge_idx_arr = jnp.array([half_edge_bc, half_edge_ca, half_edge_cb, half_edge_ac])
-    half_edge_idx_updates = jnp.array([half_edge_bc, half_edge_ca, half_edge_cb, half_edge_ac])
-    updates['half_edge_idx'] = state.half_edge_idx.at[half_edge_idx_arr].set(half_edge_idx_updates)
-
-    # Update half edge faces
-    half_edge_face_idx = jnp.array([half_edge_ab, half_edge_bc, half_edge_ca, half_edge_cb, half_edge_ac])
-    half_edge_face_updates = jnp.array([new_face_idx, new_face_idx, new_face_idx, -1, -1])
-    updates['half_edge_face'] = state.half_edge_face.at[half_edge_face_idx].set(half_edge_face_updates)
-
-    # Update half edge destinations
-    half_edge_dest_idx = jnp.array([half_edge_bc, half_edge_ca, half_edge_cb, half_edge_ac])
-    half_edge_dest_updates = jnp.array([vertex_c, vertex_a, vertex_b, vertex_c])
-    updates['half_edge_dest'] = state.half_edge_dest.at[half_edge_dest_idx].set(half_edge_dest_updates)
-
-    # Update half edge twins
-    half_edge_twin_idx = jnp.array([half_edge_bc, half_edge_cb, half_edge_ca, half_edge_ac])
-    half_edge_twin_updates = jnp.array([half_edge_cb, half_edge_bc, half_edge_ac, half_edge_ca])
-    updates['half_edge_twin'] = state.half_edge_twin.at[half_edge_twin_idx].set(half_edge_twin_updates)
-
-    # Update half edge next
-    half_edge_next_idx = jnp.array([half_edge_ab, half_edge_bc, half_edge_ca, half_edge_cb, half_edge_ac, half_edge_a_prev])
-    half_edge_next_updates = jnp.array([half_edge_bc, half_edge_ca, half_edge_ab, half_edge_b_next, half_edge_cb, half_edge_ac])
-    updates['half_edge_next'] = state.half_edge_next.at[half_edge_next_idx].set(half_edge_next_updates)
-
-    # Update half edge prev
-    half_edge_prev_idx = jnp.array([half_edge_ab, half_edge_bc, half_edge_ca, half_edge_cb, half_edge_ac, half_edge_b_next])
-    half_edge_prev_updates = jnp.array([half_edge_ca, half_edge_ab, half_edge_bc, half_edge_ac, half_edge_a_prev, half_edge_cb])
-    updates['half_edge_prev'] = state.half_edge_prev.at[half_edge_prev_idx].set(half_edge_prev_updates)
-
-    return state._replace(**updates)
-
-def add_internal_edge_triangle(state, vertex_a, vertex_b):
-    # assert that there is a half edge from a to b and its twin is on the boundary
-    half_edge_ab = get_vertex_half_edge(state, vertex_a, vertex_b)
-
-    half_edge_ba = state.half_edge_twin[half_edge_ab]
-    # assert state.half_edge_face[half_edge_ab] != -1, "Half edge ab is not internal"
-    # assert state.half_edge_face[half_edge_ba] == -1, "Half edge ba is not on boundary"
-
-    half_edge_bc = state.half_edge_next[half_edge_ab]
-    half_edge_ca = state.half_edge_next[half_edge_bc]
-
-    vertex_c = state.half_edge_dest[half_edge_bc]
-    face_abc = state.half_edge_face[half_edge_ab]
-
-    vertex_d = jnp.max(state.vertex_idx) + 1
-    face_dbc = jnp.max(state.face_idx) + 1
-    half_edge_ad = half_edge_ab
-    half_edge_db = jnp.max(state.half_edge_idx) + 1
-    half_edge_cd = half_edge_db + 1
-    half_edge_dc = half_edge_cd + 1
-    half_edge_bd = half_edge_ba
-    half_edge_da = half_edge_dc + 1
-    face_adc = face_abc
-
-    half_edge_ba_next = state.half_edge_next[half_edge_ba]
-    half_edge_ba_prev = state.half_edge_prev[half_edge_ba]
-    new_vertex_pos = jnp.mean(jnp.stack([state.vertex_pos[vertex_a], state.vertex_pos[vertex_b]], axis=0), axis=0)
-
-    # Build updates
-    updates = {}
-
-    # Update face references
-    face_idx_arr = jnp.array([face_dbc])
-    face_idx_updates = jnp.array([face_dbc])
-    updates['face_idx'] = state.face_idx.at[face_idx_arr].set(face_idx_updates)
-
-    face_he_idx = jnp.array([face_dbc, face_adc])
-    face_he_updates = jnp.array([half_edge_bc, half_edge_ca])
-    updates['face_half_edge'] = state.face_half_edge.at[face_he_idx].set(face_he_updates)
-
-    # Update vertex references
-    updates['vertex_idx'] = state.vertex_idx.at[vertex_d].set(vertex_d)
-    updates['vertex_pos'] = state.vertex_pos.at[vertex_d].set(new_vertex_pos)
-    updates['vertex_half_edge'] = state.vertex_half_edge.at[vertex_d].set(half_edge_db)
-
-    # Update half edge indices
-    half_edge_idx_arr = jnp.array([half_edge_db, half_edge_da, half_edge_dc, half_edge_cd])
-    half_edge_idx_updates = jnp.array([half_edge_db, half_edge_da, half_edge_dc, half_edge_cd])
-    updates['half_edge_idx'] = state.half_edge_idx.at[half_edge_idx_arr].set(half_edge_idx_updates)
-
-    # Update half edge faces
-    half_edge_face_idx = jnp.array([half_edge_ad, half_edge_db, half_edge_da, half_edge_dc, half_edge_cd, half_edge_ca, half_edge_bc])
-    half_edge_face_updates = jnp.array([face_adc, face_dbc, -1, face_adc, face_dbc, face_adc, face_dbc])
-    updates['half_edge_face'] = state.half_edge_face.at[half_edge_face_idx].set(half_edge_face_updates)
-
-    # Update half edge destinations
-    half_edge_dest_idx = jnp.array([half_edge_ad, half_edge_db, half_edge_bd, half_edge_da, half_edge_dc, half_edge_cd])
-    half_edge_dest_updates = jnp.array([vertex_d, vertex_b, vertex_d, vertex_a, vertex_c, vertex_d])
-    updates['half_edge_dest'] = state.half_edge_dest.at[half_edge_dest_idx].set(half_edge_dest_updates)
-
-    # Update half edge twins
-    half_edge_twin_idx = jnp.array([half_edge_ad, half_edge_db, half_edge_bd, half_edge_da, half_edge_dc, half_edge_cd])
-    half_edge_twin_updates = jnp.array([half_edge_da, half_edge_bd, half_edge_db, half_edge_ad, half_edge_cd, half_edge_dc])
-    updates['half_edge_twin'] = state.half_edge_twin.at[half_edge_twin_idx].set(half_edge_twin_updates)
-
-    # Update half edge next
-    half_edge_next_idx = jnp.array([half_edge_ad, half_edge_db, half_edge_ba_prev, half_edge_bd, half_edge_da, half_edge_dc, half_edge_cd, half_edge_ca, half_edge_bc])
-    half_edge_next_updates = jnp.array([half_edge_dc, half_edge_bc, half_edge_bd, half_edge_da, half_edge_ba_next, half_edge_ca, half_edge_db, half_edge_ad, half_edge_cd])
-    updates['half_edge_next'] = state.half_edge_next.at[half_edge_next_idx].set(half_edge_next_updates)
-
-    # Update half edge prev
-    half_edge_prev_idx = jnp.array([half_edge_ad, half_edge_db, half_edge_ba_next, half_edge_da, half_edge_dc, half_edge_cd, half_edge_ca, half_edge_bc])
-    half_edge_prev_updates = jnp.array([half_edge_ca, half_edge_cd, half_edge_da, half_edge_bd, half_edge_ad, half_edge_bc, half_edge_dc, half_edge_db])
-    updates['half_edge_prev'] = state.half_edge_prev.at[half_edge_prev_idx].set(half_edge_prev_updates)
-
-    return state._replace(**updates)
-
-def add_internal_triangles(state, vertex_a, vertex_b):
-    # find half edge from a to b
-    half_edge_ab = get_vertex_half_edge(state, vertex_a, vertex_b)
-    half_edge_ba = state.half_edge_twin[half_edge_ab]
+    overflow = (new_f >= MAX_FACES) | (new_v >= MAX_VERTICES) \
+        | (new_he + 4 >= MAX_HALF_EDGES)
+    invalid = (he_ab == -1) | (state.half_edge_face[he_ab] != -1)
 
     return jax.lax.cond(
-        jnp.logical_or(state.half_edge_face[half_edge_ab] == -1, state.half_edge_face[half_edge_ba] == -1),
+        overflow | invalid,
         lambda: state,
-        lambda: _add_internal_triangles(state, vertex_a, vertex_b, half_edge_ab)
+        lambda: _add_external_triangle(state, va, vb, he_ab, new_f, new_v, new_he),
     )
 
-def _add_internal_triangles(state, vertex_a, vertex_b, half_edge_ab):
 
-    half_edge_ba = state.half_edge_twin[half_edge_ab]
-    vertex_c = state.half_edge_dest[state.half_edge_next[half_edge_ab]]
-    vertex_d = state.half_edge_dest[state.half_edge_next[half_edge_ba]]
-    # assert vertex_c != vertex_d, "Cannot add internal triangles when both faces are the same."
+def _add_external_triangle(state, va, vb, he_ab, nf, nv, nhe):
+    vc = nv
+    he_bc, he_ca, he_cb, he_ac = nhe, nhe + 1, nhe + 2, nhe + 3
+    he_b_next = state.half_edge_next[he_ab]
+    he_a_prev = state.half_edge_prev[he_ab]
+    edge_len = jnp.sqrt(jnp.sum((state.vertex_pos[vb] - state.vertex_pos[va]) ** 2) + EPSILON)
+    z_perturb = (jnp.float32(nv % 97) / 97.0 - 0.5) * edge_len * 0.05
+    new_pos = (state.vertex_pos[va] + state.vertex_pos[vb]) / 2
+    new_pos = new_pos.at[2].add(z_perturb)
+    new_state_val = (state.vertex_state[va] + state.vertex_state[vb]) / 2
 
-    face_abc = state.half_edge_face[half_edge_ab]
-    face_bad = state.half_edge_face[half_edge_ba]
-    face_aec = face_abc
-    face_bed = face_bad
+    u = {}
+    u['vertex_idx'] = state.vertex_idx.at[vc].set(vc)
+    u['vertex_pos'] = state.vertex_pos.at[vc].set(new_pos)
+    u['vertex_half_edge'] = state.vertex_half_edge.at[vc].set(he_ca)
+    u['vertex_state'] = state.vertex_state.at[vc].set(new_state_val)
+    u['face_idx'] = state.face_idx.at[nf].set(nf)
+    u['face_half_edge'] = state.face_half_edge.at[nf].set(he_ab)
+    idx4 = jnp.array([he_bc, he_ca, he_cb, he_ac])
+    u['half_edge_idx'] = state.half_edge_idx.at[idx4].set(idx4)
+    u['half_edge_face'] = state.half_edge_face \
+        .at[jnp.array([he_ab, he_bc, he_ca, he_cb, he_ac])] \
+        .set(jnp.array([nf, nf, nf, -1, -1]))
+    u['half_edge_dest'] = state.half_edge_dest \
+        .at[jnp.array([he_bc, he_ca, he_cb, he_ac])] \
+        .set(jnp.array([vc, va, vb, vc]))
+    u['half_edge_twin'] = state.half_edge_twin \
+        .at[jnp.array([he_bc, he_cb, he_ca, he_ac])] \
+        .set(jnp.array([he_cb, he_bc, he_ac, he_ca]))
+    u['half_edge_next'] = state.half_edge_next \
+        .at[jnp.array([he_ab, he_bc, he_ca, he_cb, he_ac, he_a_prev])] \
+        .set(jnp.array([he_bc, he_ca, he_ab, he_b_next, he_cb, he_ac]))
+    u['half_edge_prev'] = state.half_edge_prev \
+        .at[jnp.array([he_ab, he_bc, he_ca, he_cb, he_ac, he_b_next])] \
+        .set(jnp.array([he_ca, he_ab, he_bc, he_ac, he_a_prev, he_cb]))
+    l_bc = jnp.sqrt(jnp.sum((state.vertex_pos[vb] - new_pos) ** 2) + EPSILON)
+    l_ca = jnp.sqrt(jnp.sum((new_pos - state.vertex_pos[va]) ** 2) + EPSILON)
+    u['half_edge_intrinsic_len'] = state.half_edge_intrinsic_len \
+        .at[jnp.array([he_bc, he_cb, he_ca, he_ac])] \
+        .set(jnp.array([l_bc, l_bc, l_ca, l_ca]))
+    return state._replace(**u)
 
-    half_edge_ae = half_edge_ab
-    half_edge_be = half_edge_ba
 
-    face_ebc = jnp.max(state.face_idx) + 1
-    face_ead = face_ebc + 1
+def add_internal_edge_triangle(state, va, vb):
+    """Split edge va->vb where one side is internal, other is boundary."""
+    he_ab = _get_he_ab(state, va, vb)
+    he_ba = state.half_edge_twin[he_ab]
+    he_bc = state.half_edge_next[he_ab]
+    he_ca = state.half_edge_next[he_bc]
+    vc = state.half_edge_dest[he_bc]
+    f_abc = state.half_edge_face[he_ab]
 
-    vertex_e = jnp.max(state.vertex_idx) + 1
+    vd = jnp.max(state.vertex_idx) + 1
+    f_dbc = jnp.max(state.face_idx) + 1
+    nhe = jnp.max(state.half_edge_idx) + 1
+    he_db, he_cd, he_dc, he_da = nhe, nhe + 1, nhe + 2, nhe + 3
+    he_ad = he_ab
+    he_bd = he_ba
+    f_adc = f_abc
 
-    # edit face aec
-    half_edge_ec = jnp.max(state.half_edge_idx) + 1
-    half_edge_ea = half_edge_ec + 1
-    half_edge_ce = half_edge_ea + 1
-    half_edge_bc = state.half_edge_next[half_edge_ab]
-    half_edge_ca = state.half_edge_next[half_edge_bc]
-    half_edge_ad = state.half_edge_next[half_edge_ba]
-    half_edge_db = state.half_edge_next[half_edge_ad]
+    he_ba_next = state.half_edge_next[he_ba]
+    he_ba_prev = state.half_edge_prev[he_ba]
+    edge_len = jnp.sqrt(jnp.sum((state.vertex_pos[vb] - state.vertex_pos[va]) ** 2) + EPSILON)
+    z_perturb = (jnp.float32(vd % 97) / 97.0 - 0.5) * edge_len * 0.05
+    new_pos = (state.vertex_pos[va] + state.vertex_pos[vb]) / 2
+    new_pos = new_pos.at[2].add(z_perturb)
+    new_state_val = (state.vertex_state[va] + state.vertex_state[vb]) / 2
 
-    # edit face ebc
-    half_edge_eb = half_edge_ce + 1
+    l_ab = state.half_edge_intrinsic_len[he_ab]
+    l_bc_i = state.half_edge_intrinsic_len[he_bc]
+    l_ca_i = state.half_edge_intrinsic_len[he_ca]
 
-    # edit face ead
-    half_edge_de = half_edge_eb + 1
-    half_edge_ed = half_edge_de + 1
+    u = {}
+    u['vertex_idx'] = state.vertex_idx.at[vd].set(vd)
+    u['vertex_pos'] = state.vertex_pos.at[vd].set(new_pos)
+    u['vertex_half_edge'] = state.vertex_half_edge.at[vd].set(he_db)
+    u['vertex_state'] = state.vertex_state.at[vd].set(new_state_val)
 
-    new_vertex_pos = jnp.mean(jnp.stack([state.vertex_pos[vertex_a], state.vertex_pos[vertex_b]], axis=0), axis=0)
+    u['face_idx'] = state.face_idx.at[f_dbc].set(f_dbc)
+    u['face_half_edge'] = state.face_half_edge \
+        .at[jnp.array([f_dbc, f_adc])].set(jnp.array([he_bc, he_ca]))
 
-    # Build updates
-    updates = {}
+    idx4 = jnp.array([he_db, he_da, he_dc, he_cd])
+    u['half_edge_idx'] = state.half_edge_idx.at[idx4].set(idx4)
+    u['half_edge_face'] = state.half_edge_face \
+        .at[jnp.array([he_ad, he_db, he_da, he_dc, he_cd, he_ca, he_bc])] \
+        .set(jnp.array([f_adc, f_dbc, -1, f_adc, f_dbc, f_adc, f_dbc]))
+    u['half_edge_dest'] = state.half_edge_dest \
+        .at[jnp.array([he_ad, he_db, he_bd, he_da, he_dc, he_cd])] \
+        .set(jnp.array([vd, vb, vd, va, vc, vd]))
+    u['half_edge_twin'] = state.half_edge_twin \
+        .at[jnp.array([he_ad, he_db, he_bd, he_da, he_dc, he_cd])] \
+        .set(jnp.array([he_da, he_bd, he_db, he_ad, he_cd, he_dc]))
+    u['half_edge_next'] = state.half_edge_next \
+        .at[jnp.array([he_ad, he_db, he_ba_prev, he_bd, he_da,
+                        he_dc, he_cd, he_ca, he_bc])] \
+        .set(jnp.array([he_dc, he_bc, he_bd, he_da, he_ba_next,
+                        he_ca, he_db, he_ad, he_cd]))
+    u['half_edge_prev'] = state.half_edge_prev \
+        .at[jnp.array([he_ad, he_db, he_ba_next, he_da,
+                        he_dc, he_cd, he_ca, he_bc])] \
+        .set(jnp.array([he_ca, he_cd, he_da, he_bd,
+                        he_ad, he_bc, he_dc, he_db]))
+    l_ad = l_ab * 0.5
+    l_db = l_ab * 0.5
+    l_dc_sq = (2.0 * l_ca_i * l_ca_i + 2.0 * l_bc_i * l_bc_i - l_ab * l_ab) / 4.0
+    l_dc = jnp.sqrt(jnp.maximum(l_dc_sq, 0.0))
+    u['half_edge_intrinsic_len'] = state.half_edge_intrinsic_len \
+        .at[jnp.array([he_ad, he_da, he_db, he_bd, he_dc, he_cd])] \
+        .set(jnp.array([l_ad, l_ad, l_db, l_db, l_dc, l_dc]))
+    return state._replace(**u)
 
-    # Update vertex references
-    updates['vertex_idx'] = state.vertex_idx.at[vertex_e].set(vertex_e)
-    updates['vertex_pos'] = state.vertex_pos.at[vertex_e].set(new_vertex_pos)
-    updates['vertex_half_edge'] = state.vertex_half_edge.at[vertex_e].set(half_edge_eb)
 
-    # Update face references
-    face_idx_arr = jnp.array([face_ebc, face_ead])
-    face_idx_updates = jnp.array([face_ebc, face_ead])
-    updates['face_idx'] = state.face_idx.at[face_idx_arr].set(face_idx_updates)
+def add_internal_triangles(state, va, vb):
+    """Split interior edge va->vb, creating 2 new faces."""
+    he_ab = _get_he_ab(state, va, vb)
+    he_ba = state.half_edge_twin[he_ab]
 
-    face_he_idx = jnp.array([face_aec, face_bed, face_ebc, face_ead])
-    face_he_updates = jnp.array([half_edge_ae, half_edge_be, half_edge_eb, half_edge_ea])
-    updates['face_half_edge'] = state.face_half_edge.at[face_he_idx].set(face_he_updates)
-
-    # Update half edge indices
-    half_edge_idx_arr = jnp.array([half_edge_ec, half_edge_ea, half_edge_eb, half_edge_ce, half_edge_de, half_edge_ed])
-    half_edge_idx_updates = jnp.array([half_edge_ec, half_edge_ea, half_edge_eb, half_edge_ce, half_edge_de, half_edge_ed])
-    updates['half_edge_idx'] = state.half_edge_idx.at[half_edge_idx_arr].set(half_edge_idx_updates)
-
-    # Update half edge faces
-    half_edge_face_idx = jnp.array([half_edge_ec, half_edge_eb, half_edge_bc, half_edge_ce, half_edge_ea, half_edge_ad, half_edge_de, half_edge_be, half_edge_ed])
-    half_edge_face_updates = jnp.array([face_aec, face_ebc, face_ebc, face_ebc, face_ead, face_ead, face_ead, face_bed, face_bed])
-    updates['half_edge_face'] = state.half_edge_face.at[half_edge_face_idx].set(half_edge_face_updates)
-
-    # Update half edge destinations
-    half_edge_dest_idx = jnp.array([half_edge_ae, half_edge_ec, half_edge_eb, half_edge_ce, half_edge_ea, half_edge_de, half_edge_be, half_edge_ed])
-    half_edge_dest_updates = jnp.array([vertex_e, vertex_c, vertex_b, vertex_e, vertex_a, vertex_e, vertex_e, vertex_d])
-    updates['half_edge_dest'] = state.half_edge_dest.at[half_edge_dest_idx].set(half_edge_dest_updates)
-
-    # Update half edge twins
-    half_edge_twin_idx = jnp.array([half_edge_ae, half_edge_ec, half_edge_ce, half_edge_eb, half_edge_be, half_edge_ea, half_edge_de, half_edge_ed])
-    half_edge_twin_updates = jnp.array([half_edge_ea, half_edge_ce, half_edge_ec, half_edge_be, half_edge_eb, half_edge_ae, half_edge_ed, half_edge_de])
-    updates['half_edge_twin'] = state.half_edge_twin.at[half_edge_twin_idx].set(half_edge_twin_updates)
-
-    # Update half edge next
-    half_edge_next_idx = jnp.array([half_edge_ae, half_edge_ec, half_edge_ca, half_edge_eb, half_edge_bc, half_edge_ce, half_edge_ea, half_edge_ad, half_edge_de, half_edge_be, half_edge_ed, half_edge_db])
-    half_edge_next_updates = jnp.array([half_edge_ec, half_edge_ca, half_edge_ae, half_edge_bc, half_edge_ce, half_edge_eb, half_edge_ad, half_edge_de, half_edge_ea, half_edge_ed, half_edge_db, half_edge_be])
-    updates['half_edge_next'] = state.half_edge_next.at[half_edge_next_idx].set(half_edge_next_updates)
-
-    # Update half edge prev
-    half_edge_prev_idx = jnp.array([half_edge_ec, half_edge_ca, half_edge_ae, half_edge_eb, half_edge_bc, half_edge_ce, half_edge_ea, half_edge_ad, half_edge_de, half_edge_be, half_edge_ed, half_edge_db])
-    half_edge_prev_updates = jnp.array([half_edge_ae, half_edge_ec, half_edge_ca, half_edge_ce, half_edge_eb, half_edge_bc, half_edge_de, half_edge_ea, half_edge_ad, half_edge_db, half_edge_be, half_edge_ed])
-    updates['half_edge_prev'] = state.half_edge_prev.at[half_edge_prev_idx].set(half_edge_prev_updates)
-
-    return state._replace(**updates)
-
-@jax.jit
-def get_edge_count(state):
-    """Count edges for each vertex using JAX operations"""
-    complete = jnp.zeros((state.vertex_idx.shape[0],), dtype=bool)
-    edge_count = jnp.zeros((state.vertex_idx.shape[0],), dtype=int)
-    start_vertex = state.half_edge_dest[state.vertex_half_edge]
-    this_half_edge = state.vertex_half_edge
-
-    def cond_func(carry):
-        complete, _, _, _ = carry
-        return jnp.any(~complete)
-    
-    def body_func(carry):
-        complete, edge_count, this_half_edge, start_vertex = carry
-        next_half_edge = state.half_edge_next[state.half_edge_twin[this_half_edge]]
-        next_vertex = state.half_edge_dest[next_half_edge]
-        complete = complete | (next_vertex == start_vertex)
-        this_half_edge = next_half_edge
-        edge_count += ~complete
-        return (complete, edge_count, this_half_edge, start_vertex)
-
-    (_, edge_count, _, _) = jax.lax.while_loop(
-        cond_func,
-        body_func,
-        (complete, edge_count, this_half_edge, start_vertex)
-    )
-    return edge_count
-
-def flip_edge(state, half_edge_ab):
-    """Flip an edge in the mesh"""
-    half_edge_ba = state.half_edge_twin[half_edge_ab]
-    
-    # Check if edge can be flipped (both faces must exist)
     return jax.lax.cond(
-        jnp.logical_or(
-            state.half_edge_face[half_edge_ab] == -1, 
-            state.half_edge_face[half_edge_ba] == -1
-        ),
+        (state.half_edge_face[he_ab] == -1) | (state.half_edge_face[he_ba] == -1),
         lambda: state,
-        lambda: _flip_edge(state, half_edge_ab, half_edge_ba)
+        lambda: _add_internal_triangles(state, va, vb, he_ab),
     )
-    
+
+
+def _add_internal_triangles(state, va, vb, he_ab):
+    he_ba = state.half_edge_twin[he_ab]
+    vc = state.half_edge_dest[state.half_edge_next[he_ab]]
+    vd = state.half_edge_dest[state.half_edge_next[he_ba]]
+    f_abc = state.half_edge_face[he_ab]
+    f_bad = state.half_edge_face[he_ba]
+
+    ve = jnp.max(state.vertex_idx) + 1
+    f_ebc = jnp.max(state.face_idx) + 1
+    f_ead = f_ebc + 1
+    nhe = jnp.max(state.half_edge_idx) + 1
+    he_ec, he_ea, he_ce, he_eb, he_de, he_ed = \
+        nhe, nhe + 1, nhe + 2, nhe + 3, nhe + 4, nhe + 5
+    he_ae = he_ab
+    he_be = he_ba
+    f_aec = f_abc
+    f_bed = f_bad
+
+    he_bc = state.half_edge_next[he_ab]
+    he_ca = state.half_edge_next[he_bc]
+    he_ad = state.half_edge_next[he_ba]
+    he_db = state.half_edge_next[he_ad]
+
+    edge_len = jnp.sqrt(jnp.sum((state.vertex_pos[vb] - state.vertex_pos[va]) ** 2) + EPSILON)
+    z_perturb = (jnp.float32(ve % 97) / 97.0 - 0.5) * edge_len * 0.05
+    new_pos = (state.vertex_pos[va] + state.vertex_pos[vb]) / 2
+    new_pos = new_pos.at[2].add(z_perturb)
+    new_state_val = (state.vertex_state[va] + state.vertex_state[vb]) / 2
+
+    l_ab = state.half_edge_intrinsic_len[he_ab]
+    l_bc_i = state.half_edge_intrinsic_len[he_bc]
+    l_ca_i = state.half_edge_intrinsic_len[he_ca]
+    l_ad_i = state.half_edge_intrinsic_len[he_ad]
+    l_db_i = state.half_edge_intrinsic_len[he_db]
+
+    u = {}
+    u['vertex_idx'] = state.vertex_idx.at[ve].set(ve)
+    u['vertex_pos'] = state.vertex_pos.at[ve].set(new_pos)
+    u['vertex_half_edge'] = state.vertex_half_edge.at[ve].set(he_eb)
+    u['vertex_state'] = state.vertex_state.at[ve].set(new_state_val)
+
+    f2 = jnp.array([f_ebc, f_ead])
+    u['face_idx'] = state.face_idx.at[f2].set(f2)
+    u['face_half_edge'] = state.face_half_edge \
+        .at[jnp.array([f_aec, f_bed, f_ebc, f_ead])] \
+        .set(jnp.array([he_ae, he_be, he_eb, he_ea]))
+
+    idx6 = jnp.array([he_ec, he_ea, he_eb, he_ce, he_de, he_ed])
+    u['half_edge_idx'] = state.half_edge_idx.at[idx6].set(idx6)
+
+    u['half_edge_face'] = state.half_edge_face \
+        .at[jnp.array([he_ec, he_eb, he_bc, he_ce, he_ea,
+                        he_ad, he_de, he_be, he_ed])] \
+        .set(jnp.array([f_aec, f_ebc, f_ebc, f_ebc, f_ead,
+                        f_ead, f_ead, f_bed, f_bed]))
+    u['half_edge_dest'] = state.half_edge_dest \
+        .at[jnp.array([he_ae, he_ec, he_eb, he_ce, he_ea, he_de, he_be, he_ed])] \
+        .set(jnp.array([ve, vc, vb, ve, va, ve, ve, vd]))
+    u['half_edge_twin'] = state.half_edge_twin \
+        .at[jnp.array([he_ae, he_ec, he_ce, he_eb, he_be, he_ea, he_de, he_ed])] \
+        .set(jnp.array([he_ea, he_ce, he_ec, he_be, he_eb, he_ae, he_ed, he_de]))
+    u['half_edge_next'] = state.half_edge_next \
+        .at[jnp.array([he_ae, he_ec, he_ca, he_eb, he_bc, he_ce,
+                        he_ea, he_ad, he_de, he_be, he_ed, he_db])] \
+        .set(jnp.array([he_ec, he_ca, he_ae, he_bc, he_ce, he_eb,
+                        he_ad, he_de, he_ea, he_ed, he_db, he_be]))
+    u['half_edge_prev'] = state.half_edge_prev \
+        .at[jnp.array([he_ec, he_ca, he_ae, he_eb, he_bc, he_ce,
+                        he_ea, he_ad, he_de, he_be, he_ed, he_db])] \
+        .set(jnp.array([he_ae, he_ec, he_ca, he_ce, he_eb, he_bc,
+                        he_de, he_ea, he_ad, he_db, he_be, he_ed]))
+    l_ae = l_ab * 0.5
+    l_eb = l_ab * 0.5
+    l_ec_sq = (2.0 * l_ca_i * l_ca_i + 2.0 * l_bc_i * l_bc_i - l_ab * l_ab) / 4.0
+    l_ec = jnp.sqrt(jnp.maximum(l_ec_sq, 0.0))
+    l_ed_sq = (2.0 * l_ad_i * l_ad_i + 2.0 * l_db_i * l_db_i - l_ab * l_ab) / 4.0
+    l_ed = jnp.sqrt(jnp.maximum(l_ed_sq, 0.0))
+    u['half_edge_intrinsic_len'] = state.half_edge_intrinsic_len \
+        .at[jnp.array([he_ae, he_ea, he_eb, he_be, he_ec, he_ce, he_ed, he_de])] \
+        .set(jnp.array([l_ae, l_ae, l_eb, l_eb, l_ec, l_ec, l_ed, l_ed]))
+    return state._replace(**u)
+
+
+def flip_edge(state, he_ab):
+    """Flip interior edge using intrinsic planar unfold for new length."""
+    he_ba = state.half_edge_twin[he_ab]
+    return jax.lax.cond(
+        (state.half_edge_face[he_ab] == -1) | (state.half_edge_face[he_ba] == -1),
+        lambda: state,
+        lambda: _flip_edge(state, he_ab, he_ba),
+    )
+
+
 @jax.jit
-def _flip_edge(state, half_edge_ab, half_edge_ba):
-    # Get vertices
-    vertex_a = state.half_edge_dest[half_edge_ba]
-    vertex_b = state.half_edge_dest[half_edge_ab]
-    
-    # Get surrounding half edges
-    half_edge_bc = state.half_edge_next[half_edge_ab]
-    vertex_c = state.half_edge_dest[half_edge_bc]
-    half_edge_ca = state.half_edge_next[half_edge_bc]
+def _flip_edge(state, he_ab, he_ba):
+    va = state.half_edge_dest[he_ba]
+    vb = state.half_edge_dest[he_ab]
+    he_bc = state.half_edge_next[he_ab]
+    he_ca = state.half_edge_next[he_bc]
+    he_ad = state.half_edge_next[he_ba]
+    he_db = state.half_edge_next[he_ad]
+    f_abc = state.half_edge_face[he_ab]
+    f_bad = state.half_edge_face[he_ba]
 
-    half_edge_ad = state.half_edge_next[half_edge_ba]
-    vertex_d = state.half_edge_dest[half_edge_ad]
-    half_edge_db = state.half_edge_next[half_edge_ad]
-    
-    # Get faces
-    face_abc = state.half_edge_face[half_edge_ab]
-    face_bad = state.half_edge_face[half_edge_ba]
+    lab = state.half_edge_intrinsic_len[he_ab]
+    lbc = state.half_edge_intrinsic_len[he_bc]
+    lca = state.half_edge_intrinsic_len[he_ca]
+    lad = state.half_edge_intrinsic_len[he_ad]
+    ldb = state.half_edge_intrinsic_len[he_db]
+    lcd = _intrinsic_flip_length(lab, lca, lbc, lad, ldb)
 
-    # After flip: faces will be adc and bcd
-    face_adc = face_abc
-    face_bcd = face_bad
-    
-    # The flipped edge becomes dc and cd
-    half_edge_dc = half_edge_ab
-    half_edge_cd = half_edge_ba
-    
-    # Build updates
-    updates = {}
-    
-    # Update face references
-    face_idx = jnp.array([face_adc, face_bcd])
-    face_updates = jnp.array([half_edge_ca, half_edge_db])
-    updates['face_half_edge'] = state.face_half_edge.at[face_idx].set(face_updates)
-    
-    # Update vertex references (in case they pointed to the flipped edge)
-    vertex_idx = jnp.array([vertex_a, vertex_b])
-    vertex_updates = jnp.array([half_edge_ad, half_edge_bc])
-    updates['vertex_half_edge'] = state.vertex_half_edge.at[vertex_idx].set(vertex_updates)
+    he_dc, he_cd = he_ab, he_ba
+    f_adc, f_bcd = f_abc, f_bad
 
-    # Update the flipped edge
-    half_edge_dest_idx = jnp.array([half_edge_dc, half_edge_cd])
-    half_edge_dest_updates = jnp.array([vertex_c, vertex_d])
-    updates['half_edge_dest'] = state.half_edge_dest.at[half_edge_dest_idx].set(half_edge_dest_updates)
-    
-    # Update surrounding half edges
-    half_edge_next_idx = jnp.array([half_edge_dc, half_edge_cd, half_edge_ca, half_edge_ad, half_edge_db, half_edge_bc])
-    half_edge_next_updates = jnp.array([half_edge_ca, half_edge_db, half_edge_ad, half_edge_dc, half_edge_bc, half_edge_cd])
-    updates['half_edge_next'] = state.half_edge_next.at[half_edge_next_idx].set(half_edge_next_updates)
-    
-    half_edge_prev_idx = jnp.array([half_edge_dc, half_edge_cd, half_edge_ca, half_edge_ad, half_edge_db, half_edge_bc])
-    half_edge_prev_updates = jnp.array([half_edge_ad, half_edge_bc, half_edge_dc, half_edge_ca, half_edge_cd, half_edge_db])
-    updates['half_edge_prev'] = state.half_edge_prev.at[half_edge_prev_idx].set(half_edge_prev_updates)
-    
-    half_edge_face_idx = jnp.array([half_edge_dc, half_edge_cd, half_edge_ca, half_edge_ad, half_edge_db, half_edge_bc])
-    half_edge_face_updates = jnp.array([face_adc, face_bcd, face_adc, face_adc, face_bcd, face_bcd])
-    updates['half_edge_face'] = state.half_edge_face.at[half_edge_face_idx].set(half_edge_face_updates)
-    
-    return state._replace(**updates)
+    u = {}
+    u['face_half_edge'] = state.face_half_edge \
+        .at[jnp.array([f_adc, f_bcd])].set(jnp.array([he_ca, he_db]))
+    u['vertex_half_edge'] = state.vertex_half_edge \
+        .at[jnp.array([va, vb])].set(jnp.array([he_ad, he_bc]))
+    u['half_edge_dest'] = state.half_edge_dest \
+        .at[jnp.array([he_dc, he_cd])].set(jnp.array([jnp.int32(state.half_edge_dest[he_bc]),
+                                                        jnp.int32(state.half_edge_dest[he_ad])]))
+    u['half_edge_next'] = state.half_edge_next \
+        .at[jnp.array([he_dc, he_cd, he_ca, he_ad, he_db, he_bc])] \
+        .set(jnp.array([he_ca, he_db, he_ad, he_dc, he_bc, he_cd]))
+    u['half_edge_prev'] = state.half_edge_prev \
+        .at[jnp.array([he_dc, he_cd, he_ca, he_ad, he_db, he_bc])] \
+        .set(jnp.array([he_ad, he_bc, he_dc, he_ca, he_cd, he_db]))
+    u['half_edge_face'] = state.half_edge_face \
+        .at[jnp.array([he_dc, he_cd, he_ca, he_ad, he_db, he_bc])] \
+        .set(jnp.array([f_adc, f_bcd, f_adc, f_adc, f_bcd, f_bcd]))
+    u['half_edge_intrinsic_len'] = state.half_edge_intrinsic_len \
+        .at[jnp.array([he_dc, he_cd])].set(jnp.array([lcd, lcd]))
+    return state._replace(**u)
 
-@jax.jit
+
+def _intrinsic_flip_length(lab, lca, lbc, lad, ldb):
+    """Intrinsic edge length of CD after flipping AB→CD via planar unfold."""
+    cos_a_acb = (lab * lab + lca * lca - lbc * lbc) \
+        / jnp.maximum(2.0 * lab * lca, EPSILON)
+    sin_a_acb = jnp.sqrt(jnp.maximum(1.0 - cos_a_acb * cos_a_acb, 0.0))
+    cx = lca * cos_a_acb
+    cy = lca * sin_a_acb
+    cos_a_adb = (lab * lab + lad * lad - ldb * ldb) \
+        / jnp.maximum(2.0 * lab * lad, EPSILON)
+    sin_a_adb = jnp.sqrt(jnp.maximum(1.0 - cos_a_adb * cos_a_adb, 0.0))
+    dx = lad * cos_a_adb
+    dy = -lad * sin_a_adb
+    return jnp.sqrt((cx - dx) ** 2 + (cy - dy) ** 2)
+
+
+# ── Mesh Refinement ──────────────────────────────────────────────────────────
+
 def refine_mesh(state):
-    """Refine mesh by flipping edges to optimize vertex valences"""
-    edge_count = get_edge_count(state)
+    """Flip non-Delaunay edges using intrinsic edge lengths (CPU loop)."""
+    he_idx_np = np.array(state.half_edge_idx)
+    he_face_np = np.array(state.half_edge_face)
+    he_twin_np = np.array(state.half_edge_twin)
+    he_dest_np = np.array(state.half_edge_dest)
+    he_next_np = np.array(state.half_edge_next)
+    he_ilen_np = np.array(state.half_edge_intrinsic_len)
 
-    # Find internal edges (both faces exist)
-    edges = jnp.stack([state.half_edge_dest, state.half_edge_dest[state.half_edge_twin]], axis=-1)
+    edges_to_check = []
+    for he in range(MAX_HALF_EDGES):
+        if he_idx_np[he] < 0:
+            continue
+        if he_face_np[he] == -1:
+            continue
+        twin = he_twin_np[he]
+        if twin < 0 or he_face_np[twin] == -1:
+            continue
+        if he_dest_np[he] < he_dest_np[twin]:
+            edges_to_check.append(he)
 
-    # get two other vertices
-    vertex_c = state.half_edge_dest[state.half_edge_next]
-    vertex_d = state.half_edge_dest[state.half_edge_next[state.half_edge_twin]]
+    for he in edges_to_check:
+        if int(he_idx_np[he]) < 0:
+            continue
+        twin = int(he_twin_np[he])
+        if twin < 0:
+            continue
+        if int(he_face_np[he]) == -1 or int(he_face_np[twin]) == -1:
+            continue
 
-    quad_half_edges = state.half_edge_idx
+        he_bc = int(he_next_np[he])
+        he_ad = int(he_next_np[twin])
+        if he_bc < 0 or he_ad < 0:
+            continue
+        he_ca = int(he_next_np[he_bc])
+        he_db = int(he_next_np[he_ad])
+        if he_ca < 0 or he_db < 0:
+            continue
 
-    # Pre-compute validity mask (optimization: compute once instead of per-edge in loop)
-    valid_mask = (
-        (edges[:, 0] < edges[:, 1]) &
-        (state.half_edge_face != -1) &
-        (state.half_edge_face[state.half_edge_twin] != -1) &
-        (quad_half_edges != -1)
-    )
+        lab = float(he_ilen_np[he])
+        lbc = float(he_ilen_np[he_bc])
+        lca = float(he_ilen_np[he_ca])
+        lad = float(he_ilen_np[he_ad])
+        ldb = float(he_ilen_np[he_db])
 
-    edges_data = jnp.stack([
-        edges[:, 0],
-        edges[:, 1],
-        vertex_c,
-        vertex_d,
-        quad_half_edges,
-        state.half_edge_face,
-        state.half_edge_face[state.half_edge_twin],
-        valid_mask.astype(jnp.int32),  # Add pre-computed validity
-    ], axis=-1)
+        lab2 = lab * lab
+        cos_c = (lca * lca + lbc * lbc - lab2) / max(2.0 * lca * lbc, EPSILON)
+        sin_c = max(1.0 - cos_c * cos_c, 0.0) ** 0.5
+        cos_d = (lad * lad + ldb * ldb - lab2) / max(2.0 * lad * ldb, EPSILON)
+        sin_d = max(1.0 - cos_d * cos_d, 0.0) ** 0.5
+        sin_sum = sin_c * cos_d + cos_c * sin_d
 
-    # Process each internal edge
-    (state, _), _ = jax.lax.scan(check_flip_edge, (state, edge_count), edges_data)
+        if sin_sum < -EPSILON:
+            state = flip_edge(state, he)
+            he_idx_np = np.array(state.half_edge_idx)
+            he_face_np = np.array(state.half_edge_face)
+            he_twin_np = np.array(state.half_edge_twin)
+            he_dest_np = np.array(state.half_edge_dest)
+            he_next_np = np.array(state.half_edge_next)
+            he_ilen_np = np.array(state.half_edge_intrinsic_len)
+
     return state
 
-def check_flip_edge(state_and_counts, edge_data):
 
-    state, edge_count = state_and_counts
+def split_long_edges(state, params, key, max_splits=20):
+    """Split edges exceeding max_edge_len based on intrinsic lengths."""
+    he_valid_np = np.array(state.half_edge_idx != -1)
+    he_dest_np = np.array(state.half_edge_dest)
+    he_twin_np = np.array(state.half_edge_twin)
+    he_face_np = np.array(state.half_edge_face)
+    he_ilen_np = np.array(state.half_edge_intrinsic_len)
 
-    edge = edge_data[:2]
-    vertex_c, vertex_d, half_edge_idx = edge_data[2], edge_data[3], edge_data[4]
-    is_valid = edge_data[7] == 1  # Use pre-computed validity mask
+    safe_twin_np = np.clip(he_twin_np, 0, None)
+    unique = he_valid_np & (he_twin_np >= 0) & (he_dest_np < he_dest_np[safe_twin_np])
 
-    return jax.lax.cond(
-        is_valid,
-        lambda: _check_flip_edge(state, edge_count, edge, vertex_c, vertex_d, half_edge_idx),
-        lambda: state_and_counts
-    ), None # No output needed for scan
+    avg_ilen = np.where(unique,
+                        (he_ilen_np + he_ilen_np[safe_twin_np]) * 0.5, 0.0)
 
-@jax.jit
-def _check_flip_edge(state, edge_count, edge, vertex_c, vertex_d, half_edge_idx):
+    splits = []
+    for he in range(MAX_HALF_EDGES):
+        if not unique[he]:
+            continue
+        if avg_ilen[he] < float(params.max_edge_len):
+            continue
+        twin = int(safe_twin_np[he])
+        src = int(he_dest_np[twin])
+        dst = int(he_dest_np[he])
+        he_on_boundary = he_face_np[he] == -1
+        twin_on_boundary = he_face_np[twin] == -1
+        splits.append((src, dst, he_on_boundary, twin_on_boundary))
 
-    vertex_quad = jnp.array([edge[0], edge[1], vertex_c, vertex_d])
-    vertex_quad_edge_counts = edge_count[vertex_quad]
-    
-    no_flip_valence_weights = jnp.full((4,), 6)
-    flip_valence_weights = jnp.array([7, 7, 5, 5])
+    rng = np.random.default_rng(int(key[0]) if hasattr(key, '__getitem__') else 42)
+    rng.shuffle(splits)
 
-    # Get current valences
-    no_flip_valence = jnp.sum(jnp.square(vertex_quad_edge_counts - no_flip_valence_weights))
-    flip_valence = jnp.sum(jnp.square(vertex_quad_edge_counts - flip_valence_weights))
-    
-    should_flip = flip_valence < no_flip_valence
-    state = jax.lax.cond(
-        should_flip,
-        lambda: flip_edge(state, half_edge_idx),
-        lambda: state
-    )
+    n_verts = int(np.sum(np.array(state.vertex_idx) != -1))
+    for src, dst, he_bnd, twin_bnd in splits[:max_splits]:
+        if n_verts >= MAX_VERTICES - 5:
+            break
+        if he_bnd or twin_bnd:
+            if twin_bnd:
+                state = add_internal_edge_triangle(state, src, dst)
+            else:
+                state = add_internal_edge_triangle(state, dst, src)
+        else:
+            state = add_internal_triangles(state, src, dst)
+        n_verts += 1
 
-    # Update edge counts: if we flipped, a and b lose one edge, c and d gain one edge
-    edge_count_delta = jnp.zeros_like(edge_count)
-    edge_count_delta = edge_count_delta.at[edge[0]].add(jnp.where(should_flip, -1, 0))
-    edge_count_delta = edge_count_delta.at[edge[1]].add(jnp.where(should_flip, -1, 0))
-    edge_count_delta = edge_count_delta.at[vertex_c].add(jnp.where(should_flip, 1, 0))
-    edge_count_delta = edge_count_delta.at[vertex_d].add(jnp.where(should_flip, 1, 0))
-
-    new_edge_count = edge_count + edge_count_delta
-
-    return state, new_edge_count
-
-@jax.jit
-def maybe_generate_new_triangles(state, params, key, repulsion_mag):
-    """Randomly generate new triangles"""
-    key, subkey = jax.random.split(key)
-    
-    # Only generate with 10% probability
-    return jax.lax.cond(
-        jax.random.uniform(subkey) < 0.1,
-        lambda: generate_new_triangles(state, params, key),
-        lambda: (state, key),
-    )
-    
-
-def generate_new_triangles(state, params, key):
-    # Find active vertices
-
-    key, subkey = jax.random.split(key)
-    out = state.vertex_state[:, 0]
-    # apply sigmoid
-    probs = jax.nn.sigmoid(out)
-    probs *= (state.vertex_idx != -1)
-    divide_vertices = jax.random.bernoulli(subkey, probs)
-    
-    # Get its half edge and destination
-    chosen_half_edges = state.vertex_half_edge
-    chosen_vertices = state.half_edge_dest[state.half_edge_twin[chosen_half_edges]]
-    dest_vertices = state.half_edge_dest[chosen_half_edges]
-
-    # Check if on boundary
-    chosen_on_boundary = state.half_edge_face[chosen_half_edges] == -1
-    twin_on_boundary = state.half_edge_face[state.half_edge_twin[chosen_half_edges]] == -1
-    
-    key, subkey = jax.random.split(key)
-
-    state, _ = jax.lax.scan(
-        lambda s, args: generate_new_triangle(*args, s),
-        state,
-        (divide_vertices, chosen_vertices, dest_vertices, chosen_on_boundary, twin_on_boundary)
-    )
     return state, key
 
-def generate_new_triangle(divide_vertex, chosen_vertex, dest_vertex, chosen_on_boundary, twin_on_boundary, state):
-    state = jax.lax.cond(
-        divide_vertex,
-        lambda: jax.lax.cond(
-            jnp.logical_or(chosen_on_boundary, twin_on_boundary),
-            lambda: add_boundary_triangle(state, chosen_vertex, dest_vertex, chosen_on_boundary, twin_on_boundary),
-            lambda: add_internal_triangles(state, chosen_vertex, dest_vertex),
-        ),
-        lambda: state
+
+# ── External Forces (Predict Step) ──────────────────────────────────────────
+
+@jax.jit
+def compute_external_forces(state, params):
+    """Bulge (boundary outward push) + Laplacian smoothing."""
+    pos = state.vertex_pos
+    active = (state.vertex_idx != -1)[:, None].astype(jnp.float32)
+
+    boundary = (state.half_edge_face == -1) & (state.half_edge_idx != -1)
+    safe_twin = jnp.clip(state.half_edge_twin, 0)
+    src_idx = state.half_edge_dest[safe_twin]
+    dst_idx = state.half_edge_dest
+
+    edge_vec = pos[dst_idx] - pos[src_idx]
+    safe_twin_next = jnp.clip(state.half_edge_next[safe_twin], 0)
+    next_dst = state.half_edge_dest[safe_twin_next]
+    next_vec = pos[next_dst] - pos[src_idx]
+
+    surface_n = jnp.cross(edge_vec, next_vec)
+    edge_n = jnp.cross(edge_vec, surface_n)
+    edge_n_len = jnp.linalg.norm(edge_n, axis=-1, keepdims=True)
+    edge_n = edge_n / jnp.maximum(edge_n_len, EPSILON)
+    edge_n = jnp.where(boundary[:, None], edge_n, 0.0)
+
+    bulge = jnp.zeros_like(pos)
+    bulge = bulge.at[src_idx].add(edge_n)
+    bulge = bulge.at[dst_idx].add(edge_n)
+    fnorm = jnp.linalg.norm(bulge, axis=-1, keepdims=True)
+    bulge = bulge / jnp.maximum(fnorm, EPSILON)
+
+    he_valid = state.half_edge_idx != -1
+    safe_dest = jnp.clip(state.half_edge_dest, 0)
+    he_src = safe_dest[safe_twin]
+    dst_pos = pos[safe_dest]
+
+    neighbor_sum = jnp.zeros_like(pos).at[he_src].add(
+        jnp.where(he_valid[:, None], dst_pos, 0.0)
     )
+    degree = jnp.zeros(MAX_VERTICES).at[he_src].add(he_valid.astype(jnp.float32))
+    centroid = neighbor_sum / jnp.maximum(degree[:, None], 1.0)
+    laplacian = centroid - pos
 
-    return state, None
+    forces = params.bulge_strength * bulge \
+        + params.stiffness * 0.5 * laplacian * active
+    return forces
 
-def add_boundary_triangle(state, chosen_vertex, dest_vertex, chosen_on_boundary, twin_on_boundary):
-    # Add triangle based on boundary status
-    # state = jax.lax.cond(
-    #     jax.random.uniform(subkey) < 0.0,
-    #     lambda: jax.lax.cond(
-    #         chosen_on_boundary,
-    #         lambda: add_external_triangle(state, chosen_vertex, dest_vertex),
-    #         lambda: add_external_triangle(state, dest_vertex, chosen_vertex)
-    #     ),
-    #     lambda: jax.lax.cond(
-    #         twin_on_boundary,
-    #         lambda: add_internal_edge_triangle(state, chosen_vertex, dest_vertex),
-    #         lambda: add_internal_edge_triangle(state, dest_vertex, chosen_vertex)
-    #     )
-    # )
 
-    state = jax.lax.cond(
-        twin_on_boundary,
-        lambda: add_internal_edge_triangle(state, chosen_vertex, dest_vertex),
-        lambda: add_internal_edge_triangle(state, dest_vertex, chosen_vertex)
-    )
+@jax.jit
+def predict_positions(state, forces, params):
+    """Overdamped position prediction: p += (dt/damping) * f, clamped."""
+    active = (state.vertex_idx != -1)[:, None].astype(jnp.float32)
+    displacement = (params.dt / params.damping) * forces
+    max_disp = params.spring_len * 0.25
+    disp_len = jnp.linalg.norm(displacement, axis=-1, keepdims=True)
+    displacement = jnp.where(disp_len > max_disp,
+                              displacement * max_disp / disp_len,
+                              displacement)
+    return state.vertex_pos + displacement * active
 
-    return state
 
-def rsh_cart_1(xyz):
-    """Computes all real spherical harmonics up to degree 1.
+# ── Spatial Hash for Collision ──────────────────────────────────────────────
 
-    This is an autogenerated method. See
-    https://github.com/cheind/torch-spherical-harmonics
-    for more information.
+_HASH_OFFSETS_3D = jnp.array(
+    [[dx, dy, dz] for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)],
+    dtype=jnp.int32,
+)
+_EARLIER_MASK = jnp.tril(jnp.ones((27, 27), dtype=bool), k=-1)
 
-    Params:
-        xyz: (N,...,3) tensor of points on the unit sphere
 
-    Returns:
-        rsh: (N,...,4) real spherical harmonics
-            projections of input. Ynm is found at index
-            `n*(n+1) + m`, with `0 <= n <= degree` and
-            `-n <= m <= n`.
+def _hash_cells(cell_coords):
+    s = cell_coords + 10000
+    h = s[:, 0] * 73856093 + s[:, 1] * 19349663 + s[:, 2] * 83492791
+    return jnp.abs(h) % NUM_HASH_BUCKETS
+
+
+def _hash_cells_2d(cell_coords):
+    s = cell_coords + 10000
+    h = s[:, :, 0] * 73856093 + s[:, :, 1] * 19349663 + s[:, :, 2] * 83492791
+    return jnp.abs(h) % NUM_HASH_BUCKETS
+
+
+def _build_spatial_hash(pos, active, cell_size):
+    cell_coords = jnp.floor(pos / cell_size).astype(jnp.int32)
+    bucket = jnp.where(active, _hash_cells(cell_coords), NUM_HASH_BUCKETS)
+    sort_order = jnp.argsort(bucket)
+    sorted_bucket = bucket[sort_order]
+    all_buckets = jnp.arange(NUM_HASH_BUCKETS, dtype=jnp.int32)
+    bstart = jnp.searchsorted(sorted_bucket, all_buckets, side='left')
+    bend = jnp.searchsorted(sorted_bucket, all_buckets, side='right')
+    return sort_order, bstart, bend, cell_coords
+
+
+def _gather_candidates(cell_coords, active, sort_order, bstart, bend):
+    N = MAX_VERTICES
+    nbr_cells = cell_coords[:, None, :] + _HASH_OFFSETS_3D[None, :, :]
+    nbr_buckets = _hash_cells_2d(nbr_cells)
+
+    nb_starts = bstart[nbr_buckets]
+    nb_ends = bend[nbr_buckets]
+
+    bucket_match = nbr_buckets[:, :, None] == nbr_buckets[:, None, :]
+    has_dup = (bucket_match & _EARLIER_MASK[None, :, :]).any(axis=2)
+    nb_sizes = jnp.where(has_dup, 0, nb_ends - nb_starts)
+
+    local = jnp.arange(SLOTS_PER_CELL, dtype=jnp.int32)
+    cand_sorted = nb_starts[:, :, None] + local[None, None, :]
+    cand_sorted = jnp.clip(cand_sorted, 0, N - 1)
+    cand_valid = local[None, None, :] < nb_sizes[:, :, None]
+
+    cand_idx = sort_order[cand_sorted]
+    K = SLOTS_PER_CELL * 27
+    cand_idx = cand_idx.reshape(N, K)
+    cand_valid = cand_valid.reshape(N, K)
+
+    cand_active = active[cand_idx]
+    not_self = cand_idx != jnp.arange(N)[:, None]
+    mask = cand_valid & cand_active & not_self & active[:, None]
+
+    return cand_idx, mask
+
+
+@jax.jit
+def build_neighbor_list(state):
+    """(MAX_VERTICES, MAX_FAN_SIZE) of mesh-neighbor vertex indices (-1 pad).
+
+    Used by collision to skip direct mesh neighbors.
     """
+    he_valid = state.half_edge_idx != -1
+    safe_twin = jnp.clip(state.half_edge_twin, 0)
+    safe_dest = jnp.clip(state.half_edge_dest, 0)
+    he_src = safe_dest[safe_twin]
+
+    neighbors = jnp.full((MAX_VERTICES, MAX_FAN_SIZE), -1, jnp.int32)
+    count = jnp.zeros(MAX_VERTICES, jnp.int32)
+
+    def add_edge(carry, he_i):
+        nbrs, cnt = carry
+        src = he_src[he_i]
+        dst = safe_dest[he_i]
+        valid = he_valid[he_i]
+        slot = cnt[src]
+        in_range = slot < MAX_FAN_SIZE
+        do_write = valid & in_range
+        nbrs = nbrs.at[src, slot].set(jnp.where(do_write, dst, nbrs[src, slot]))
+        cnt = cnt.at[src].add(jnp.where(do_write, 1, 0))
+        return (nbrs, cnt), None
+
+    (neighbors, _), _ = jax.lax.scan(
+        add_edge, (neighbors, count), jnp.arange(MAX_HALF_EDGES)
+    )
+    return neighbors
+
+
+# ── XPBD Constraints ─────────────────────────────────────────────────────────
+
+@jax.jit
+def project_springs(pos, state, params):
+    """XPBD spring: enforce dist = intrinsic rest length (Jacobi over half-edges)."""
+    he_valid = state.half_edge_idx != -1
+    safe_twin = jnp.clip(state.half_edge_twin, 0)
+    safe_dest = jnp.clip(state.half_edge_dest, 0)
+    he_src = safe_dest[safe_twin]
+
+    alpha_tilde = params.compliance / (params.dt * params.dt + EPSILON)
+
+    src_pos = pos[he_src]
+    dst_pos = pos[safe_dest]
+    d = src_pos - dst_pos
+    dist = jnp.sqrt(jnp.sum(d * d, axis=-1) + EPSILON)
+    dist_safe = jnp.maximum(dist, EPSILON)
+
+    rest = (state.half_edge_intrinsic_len + state.half_edge_intrinsic_len[safe_twin]) * 0.5
+    C = dist - rest
+    dlambda = -C / (2.0 + alpha_tilde)
+    edge_corr = dlambda[:, None] * (d / dist_safe[:, None])
+
+    max_corr = rest * 0.2
+    corr_mag = jnp.linalg.norm(edge_corr, axis=-1, keepdims=True)
+    edge_corr = jnp.where(corr_mag > max_corr[:, None],
+                           edge_corr * max_corr[:, None] / corr_mag,
+                           edge_corr)
+    edge_corr = jnp.where(he_valid[:, None], edge_corr, 0.0)
+
+    correction = jnp.zeros_like(pos).at[he_src].add(edge_corr)
+    degree = jnp.zeros(MAX_VERTICES).at[he_src].add(he_valid.astype(jnp.float32))
+    degree = jnp.maximum(degree, 1.0)
+
+    active = (state.vertex_idx != -1)[:, None].astype(jnp.float32)
+    return pos + (correction / degree[:, None]) * active
+
+
+@jax.jit
+def project_bending(pos, state, params):
+    """XPBD dihedral bending (Jacobi over unique interior edges)."""
+    he_valid = state.half_edge_idx != -1
+    safe_twin = jnp.clip(state.half_edge_twin, 0)
+    safe_dest = jnp.clip(state.half_edge_dest, 0)
+    safe_next = jnp.clip(state.half_edge_next, 0)
+    he_src = safe_dest[safe_twin]
+
+    he_face = state.half_edge_face
+    twin_face = he_face[safe_twin]
+    he_idx = jnp.arange(MAX_HALF_EDGES)
+    interior = he_valid & (he_face >= 0) & (twin_face >= 0) \
+        & (state.half_edge_twin >= 0) & (he_idx < state.half_edge_twin)
+
+    alpha_tilde = params.bending_compliance / (params.dt * params.dt + EPSILON)
+
+    src_pos = pos[he_src]
+    dst_pos = pos[safe_dest]
+    diff = dst_pos - src_pos
+    dist = jnp.sqrt(jnp.sum(diff * diff, axis=-1) + EPSILON)
+    dist_safe = jnp.maximum(dist, EPSILON)
+    e_hat = diff / dist_safe[:, None]
+
+    opp_c = safe_dest[safe_next]
+    safe_twin_next = jnp.clip(state.half_edge_next[safe_twin], 0)
+    opp_d = safe_dest[safe_twin_next]
+
+    pc = pos[opp_c]
+    pd = pos[opp_d]
+
+    fn1 = jnp.cross(diff, pc - src_pos)
+    fn2 = jnp.cross(src_pos - dst_pos, pd - dst_pos)
+    a1 = jnp.sqrt(jnp.sum(fn1 * fn1, axis=-1) + EPSILON)
+    a2 = jnp.sqrt(jnp.sum(fn2 * fn2, axis=-1) + EPSILON)
+    n1 = fn1 / a1[:, None]
+    n2 = fn2 / a2[:, None]
+
+    cos_theta = jnp.sum(n1 * n2, axis=-1)
+    sin_theta = jnp.sum(jnp.cross(n1, n2) * e_hat, axis=-1)
+    theta = jnp.arctan2(
+        jnp.where(interior, sin_theta, 0.0),
+        jnp.where(interior, cos_theta, 1.0),
+    )
+
+    vc = src_pos - pc
+    jc = dst_pos - pc
+    area_c = jnp.sqrt(jnp.sum(jnp.cross(vc, jc) ** 2, axis=-1) + EPSILON)
+    cot_c = jnp.clip(jnp.sum(vc * jc, axis=-1) / area_c, -5.0, 5.0)
+
+    vd = src_pos - pd
+    jd = dst_pos - pd
+    area_d = jnp.sqrt(jnp.sum(jnp.cross(vd, jd) ** 2, axis=-1) + EPSILON)
+    cot_d = jnp.clip(jnp.sum(vd * jd, axis=-1) / area_d, -5.0, 5.0)
+
+    g_a = (cot_c[:, None] * n1 + cot_d[:, None] * n2) / dist_safe[:, None]
+    g_c = dist_safe[:, None] * n1 / a1[:, None]
+    g_d = dist_safe[:, None] * n2 / a2[:, None]
+    g_b = -(g_a + g_c + g_d)
+
+    sum_sq = jnp.sum(g_a * g_a, axis=-1) + jnp.sum(g_b * g_b, axis=-1) \
+        + jnp.sum(g_c * g_c, axis=-1) + jnp.sum(g_d * g_d, axis=-1)
+
+    dlambda = -theta / (sum_sq + alpha_tilde + EPSILON)
+    dlambda = jnp.where(interior, dlambda, 0.0)
+
+    int_mask = interior[:, None].astype(jnp.float32)
+    corr_a = (dlambda[:, None] * g_a) * int_mask
+    corr_b = (dlambda[:, None] * g_b) * int_mask
+    corr_c = (dlambda[:, None] * g_c) * int_mask
+    corr_d = (dlambda[:, None] * g_d) * int_mask
+
+    correction = jnp.zeros_like(pos)
+    correction = correction.at[he_src].add(corr_a)
+    correction = correction.at[safe_dest].add(corr_b)
+    correction = correction.at[opp_c].add(corr_c)
+    correction = correction.at[opp_d].add(corr_d)
+
+    count = jnp.zeros(MAX_VERTICES)
+    int_f = interior.astype(jnp.float32)
+    count = count.at[he_src].add(int_f)
+    count = count.at[safe_dest].add(int_f)
+    count = count.at[opp_c].add(int_f)
+    count = count.at[opp_d].add(int_f)
+    count = jnp.maximum(count, 1.0)
+
+    avg_corr = correction / count[:, None]
+    corr_mag = jnp.linalg.norm(avg_corr, axis=-1, keepdims=True)
+    max_corr = params.spring_len * 0.1
+    avg_corr = jnp.where(corr_mag > max_corr, avg_corr * max_corr / corr_mag, avg_corr)
+
+    active = (state.vertex_idx != -1)[:, None].astype(jnp.float32)
+    return pos + avg_corr * active
+
+
+@jax.jit
+def project_collision(pos, state, params, sort_order, bstart, bend,
+                      cell_coords, neighbor_list):
+    """XPBD collision: push apart non-neighbor vertices within repulsion_dist."""
+    N = MAX_VERTICES
+    active = state.vertex_idx != -1
+    cand_idx, mask = _gather_candidates(cell_coords, active, sort_order, bstart, bend)
+
+    is_neighbor = jnp.any(
+        cand_idx[:, :, None] == neighbor_list[:, None, :], axis=-1
+    )
+    mask = mask & ~is_neighbor
+
+    cand_pos = pos[cand_idx]
+    diff = pos[:, None, :] - cand_pos
+    dist = jnp.sqrt(jnp.sum(diff ** 2, axis=-1) + EPSILON)
+
+    penetration = params.repulsion_dist - dist
+    in_range = (penetration > 0) & mask
+
+    dlambda = -penetration / 2.0
+    ratio = penetration / params.repulsion_dist
+    corr = -dlambda[:, :, None] * (diff / dist[:, :, None]) * ratio[:, :, None]
+
+    corr_mag = jnp.linalg.norm(corr, axis=-1, keepdims=True)
+    max_corr = params.repulsion_dist * 0.2
+    corr = jnp.where(corr_mag > max_corr, corr * max_corr / corr_mag, corr)
+    corr = jnp.where(in_range[:, :, None], corr, 0.0)
+
+    num_collisions = jnp.sum(in_range.astype(jnp.float32), axis=1, keepdims=True)
+    total_corr = corr.sum(axis=1)
+    avg_corr = jnp.where(num_collisions > 0,
+                          params.repulsion_strength * total_corr / jnp.maximum(num_collisions, 1.0),
+                          0.0)
+
+    active_f = active[:, None].astype(jnp.float32)
+    return pos + avg_corr * active_f
+
+
+# ── Lenia CA (Chebyshev) ────────────────────────────────────────────────────
+
+def chebyshev_ring_coeffs(mu, sigma, max_order=MAX_CHEB_ORDER):
+    """Chebyshev expansion coefficients for a Gaussian ring kernel."""
+    k = np.arange(max_order)
+    c_raw = np.exp(-(k - mu) ** 2 / (2 * sigma ** 2 + 1e-8))
+    total = c_raw.sum()
+    cumsum = np.cumsum(c_raw)
+    order = int(np.searchsorted(cumsum, 0.95 * total)) + 1
+    order = max(order, 2)
+    c = np.zeros(max_order)
+    c[:order] = c_raw[:order] / c_raw[:order].sum()
+    return jnp.array(c, dtype=jnp.float32), order
+
+
+@jax.jit
+def chebyshev_ca_step(state, coeffs, params):
+    """One Chebyshev graph CA step on channel 0 of vertex_state."""
+    he_valid = state.half_edge_idx != -1
+    safe_twin = jnp.clip(state.half_edge_twin, 0)
+    he_src = state.half_edge_dest[safe_twin]
+    he_dst = state.half_edge_dest
+    v_active = (state.vertex_idx != -1).astype(jnp.float32)
+
+    degree = jnp.zeros(MAX_VERTICES).at[he_src].add(he_valid.astype(jnp.float32))
+    safe_degree = jnp.maximum(degree, 1.0)
+
+    def W(f):
+        s = jnp.zeros(MAX_VERTICES).at[he_src].add(
+            jnp.where(he_valid, f[he_dst], 0.0)
+        )
+        return s / safe_degree
+
+    s = state.vertex_state[:, 0]
+
+    t_prev = s
+    t_curr = W(s)
+    result = coeffs[0] * t_prev + coeffs[1] * t_curr
+
+    def step(carry, ck):
+        tp, tc, res = carry
+        tn = 2.0 * W(tc) - tp
+        return (tc, tn, res + ck * tn), None
+
+    (_, _, result), _ = jax.lax.scan(step, (t_prev, t_curr, result), coeffs[2:])
+
+    x = result - params.growth_mu
+    sigma = params.growth_sigma + EPSILON
+    g = 2.0 * jnp.exp(-0.5 * x * x / (sigma * sigma)) - 1.0
+
+    ch0 = s + params.state_dt * g
+    ch0 = jnp.clip(ch0, 0.0, 1.0) * v_active
+    new_state = state.vertex_state.at[:, 0].set(ch0)
+    return state._replace(vertex_state=new_state)
+
+
+# ── MeshNCA ──────────────────────────────────────────────────────────────────
+
+def _rsh_cart_1(xyz):
+    """Real spherical harmonics up to degree 1 (shape ..., 4)."""
     x = xyz[..., 0]
     y = xyz[..., 1]
     z = xyz[..., 2]
-
     return jnp.stack(
         [
             jnp.full(xyz.shape[:-1], 0.282094791773878),
@@ -1228,355 +1212,286 @@ def rsh_cart_1(xyz):
     )
 
 
-def relu(x):
-    return jnp.maximum(0, x)
+def _relu(x):
+    return jnp.maximum(0.0, x)
 
-def update_vertex_state(state: MeshState, params: MeshParams):
-    return ca_update(state, params)
 
-def gaussian(x, mu, sigma):
-    return jnp.exp(-0.5 * ((x - mu) / sigma) ** 2)
+@jax.jit
+def nca_update(state, params):
+    """MeshNCA update on full multi-channel vertex_state."""
+    he_valid = state.half_edge_idx != -1
+    safe_twin = jnp.clip(state.half_edge_twin, 0)
+    safe_dest = jnp.clip(state.half_edge_dest, 0)
+    he_src = safe_dest[safe_twin]
+    he_dst = safe_dest
 
-def ca_update(state: MeshState, params: MeshParams):
-    edges = jnp.stack([state.half_edge_dest, state.half_edge_dest[state.half_edge_twin]], axis=-1)
-    edge_states = state.vertex_state[edges]
-    u = jnp.zeros((state.vertex_state.shape[0], edge_states.shape[-1]))
-    u = u.at[edges[:, 0]].add(edge_states[:, 1])
-    u /= get_edge_count(state)[:, jnp.newaxis] + EPSILON
+    edge_pos_src = state.vertex_pos[he_src]
+    edge_pos_dst = state.vertex_pos[he_dst]
+    edge_vec = edge_pos_dst - edge_pos_src
+    edge_dist = jnp.linalg.norm(edge_vec, axis=-1, keepdims=True)
+    edge_dir = edge_vec / (edge_dist + EPSILON)
+    edge_dist_norm = edge_dist / params.spring_len
 
-    state.vertex_state += params.dt * gaussian(u, params.mu, params.sigma)
-    return state
+    sh = _rsh_cart_1(edge_dir)  # (E, 4)
+    feature_diff = state.vertex_state[he_dst] - state.vertex_state[he_src]  # (E, C)
+    edge_msg = (edge_dist_norm[..., None] * sh[..., None]
+                * feature_diff[..., None, :])  # (E, 4, C)
+    edge_msg = edge_msg.reshape(edge_msg.shape[0], -1)
+    edge_msg = jnp.where(he_valid[:, None], edge_msg, 0.0)
 
-def nca_update(state: MeshState, params: MeshParams):
-    edges = jnp.stack([state.half_edge_dest, state.half_edge_dest[state.half_edge_twin]], axis=-1)
-    edge_positions = state.vertex_pos[edges]
-    edge_vectors = edge_positions[:, 1] - edge_positions[:, 0]
-    edge_distances = jnp.linalg.norm(edge_vectors, axis=-1, keepdims=True)
-    edge_unit_dir = edge_vectors / (edge_distances + EPSILON)
-    edge_dist_norm = edge_distances / params.spring_len
+    z = jnp.zeros((MAX_VERTICES, edge_msg.shape[-1]))
+    z = z.at[he_src].add(edge_msg)
 
-    # get edge theta and phi in polar coordinates
-    sh_coefs = rsh_cart_1(edge_unit_dir)
-
-    edge_states = state.vertex_state[edges]
-    feature_diff = edge_states[:, 1] - edge_states[:, 0]
-    edge_message = edge_dist_norm[..., jnp.newaxis] * sh_coefs[..., jnp.newaxis] * feature_diff[..., jnp.newaxis, :]
-    edge_message = edge_message.reshape(edge_message.shape[0], -1)
-    z = jnp.zeros((state.vertex_state.shape[0], edge_message.shape[-1]))
-    z = z.at[edges[:, 0]].add(edge_message)
     s = state.vertex_state
-    s = jnp.concatenate([s, z], axis=-1)
+    inp = jnp.concatenate([s, z], axis=-1)
 
-    num_mlp_layers = len(params.vertex_state_mlp_params)
-    for i in range(num_mlp_layers):
-        w, b = params.vertex_state_mlp_params[f'layer{i+1}']
-        s = relu(jnp.einsum('ij,jk->ik', s, w) + b)
+    mlp = params.vertex_state_mlp_params
+    num_layers = len(mlp)
+    h = inp
+    for i in range(num_layers):
+        w, b = mlp[f'layer{i+1}']
+        h = jnp.einsum('ij,jk->ik', h, w) + b
+        if i < num_layers - 1:
+            h = _relu(h)
 
-    vertex_state = state.vertex_state + s
+    v_active = (state.vertex_idx != -1).astype(jnp.float32)[:, None]
+    delta = h * params.state_dt * v_active
+    new_state = s + delta
+    return state._replace(vertex_state=new_state)
 
-    return state._replace(vertex_state=vertex_state)
 
-
-def generalized_eigh(A, B):
-    L = jnp.linalg.cholesky(B)
-    L_inv = jnp.linalg.inv(L)
-    C = L_inv @ A @ L_inv.T
-    eigenvalues, eigenvectors_transformed = jnp.linalg.eigh(C)
-    eigenvectors_original = L_inv.T @ eigenvectors_transformed
-    return eigenvalues, eigenvectors_original
-
-def get_natural_frequencies(state: MeshState, params: MeshParams):
-
-    vertices = state.vertex_pos[state.vertex_idx != -1]
-    edges = jnp.stack([
-        state.half_edge_dest[state.half_edge_dest != -1], 
-        state.half_edge_dest[state.half_edge_twin[state.half_edge_dest != -1]]
-    ], axis=-1)
-
-    return _get_natural_frequencies(vertices, edges, state, params)
-
-@functools.partial(jax.jit, static_argnames=('params',))
-def _get_natural_frequencies(vertices, edges, state: MeshState, params: MeshParams):
-    M = jnp.diag(vertices.repeat(params.num_dims))
-    K = jnp.zeros((state.vertex_idx.shape[0] * params.num_dims, state.vertex_idx.shape[0] * params.num_dims))
-    
-    edge_positions = state.vertex_pos[edges]
-    edge_directions = edge_positions[:, 1] - edge_positions[:, 0]
-    edge_lengths = jnp.linalg.norm(edge_directions, axis=-1, keepdims=True)
-    edge_directions = edge_directions / (edge_lengths + EPSILON)
-
-    K_spring = params.elastic_constant * jnp.einsum('ij,ik->ijk', edge_directions, edge_directions)
-    K = K.at[edges[:, 0]*params.num_dims:(edges[:, 0]+1)*params.num_dims, edges[:, 0]*params.num_dims:(edges[:, 0]+1)*params.num_dims].add(K_spring)
-    K = K.at[edges[:, 1]*params.num_dims:(edges[:, 1]+1)*params.num_dims, edges[:, 1]*params.num_dims:(edges[:, 1]+1)*params.num_dims].add(K_spring)
-    K = K.at[edges[:, 0]*params.num_dims:(edges[:, 0]+1)*params.num_dims, edges[:, 1]*params.num_dims:(edges[:, 1]+1)*params.num_dims].add(-K_spring)
-    K = K.at[edges[:, 1]*params.num_dims:(edges[:, 1]+1)*params.num_dims, edges[:, 0]*params.num_dims:(edges[:, 0]+1)*params.num_dims].add(-K_spring)
-
-    # Solve generalized eigenvalue problem
-    eigenvals, eigenvecs = generalized_eigh(K, M)
-    natural_freqs = jnp.sqrt(eigenvals)
-    return natural_freqs, eigenvecs
+# ── Intrinsic Length Growth ──────────────────────────────────────────────────
 
 @jax.jit
-def calculate_vertex_normals(state):
-    # Filter to only active faces
-    active_faces = state.face_idx != -1
-    active_face_half_edges = jnp.where(active_faces, state.face_half_edge, 0)
-    
-    # Get triangle vertices - only for active faces
-    triangle_half_edges = jnp.stack([
-        active_face_half_edges,
-        state.half_edge_next[active_face_half_edges],
-        state.half_edge_next[state.half_edge_next[active_face_half_edges]],
-    ], -1)
-    triangle_vertices = state.half_edge_dest[triangle_half_edges]
+def grow_intrinsic_lengths(state, params, key):
+    """Grow intrinsic edge lengths based on source vertex state channel 0.
 
-    # Get vertex positions for all triangles
-    triangle_positions = state.vertex_pos[triangle_vertices]
-
-    # Calculate face normals using cross product
-    edge1 = triangle_positions[:, 1] - triangle_positions[:, 0]
-    edge2 = triangle_positions[:, 2] - triangle_positions[:, 0]
-    face_normals = jnp.cross(edge1, edge2)
-
-    # Mask out inactive faces
-    face_normals = jnp.where(active_faces[:, None], face_normals, 0)
-
-    vertex_normals = jnp.zeros_like(state.vertex_pos)
-    vertex_normals = vertex_normals.at[triangle_vertices[:, 0]].add(face_normals)
-    vertex_normals = vertex_normals.at[triangle_vertices[:, 1]].add(face_normals)
-    vertex_normals = vertex_normals.at[triangle_vertices[:, 2]].add(face_normals)
-    
-    # Normalize
-    vertex_normals = vertex_normals / (jnp.linalg.norm(vertex_normals, axis=1, keepdims=True) + EPSILON)
-    return vertex_normals
-
-def camera_matrix(width, height):
-    # Camera position - looking at the mesh from above and in front
-    eye = glm.vec3(width/2, height/2, 800)
-    target = glm.vec3(width/2, height/2, 0)
-    up = glm.vec3(0, 1, 0)
-    
-    view = glm.lookAt(eye, target, up)
-    projection = glm.perspective(glm.radians(45.0), width/height, 0.1, 2000.0)
-    
-    return projection * view
-
-@jax.jit
-def get_indices(state, all_half_edges_with_faces):
-    
-
-    # Build triangles for all half-edges with faces
-    triangle_half_edges = jnp.stack([
-        all_half_edges_with_faces,
-        state.half_edge_next[all_half_edges_with_faces],
-        state.half_edge_next[state.half_edge_next[all_half_edges_with_faces]],
-    ], -1)
-    triangle_vertices = state.half_edge_dest[triangle_half_edges]
-
-    # Front face indices (original order)
-    indices_front = triangle_vertices.reshape(-1)
-
-    # Back face indices (swap v1 and v2 to reverse winding)
-    triangle_vertices_back = triangle_vertices[:, [0, 2, 1]]
-    indices_back = triangle_vertices_back.reshape(-1)
-
-    # Flatten to get index array
-    indices = jnp.concatenate([indices_front, indices_back])
-    return indices
-
-def test(state):
-    assert jnp.all(state.half_edge_dest[state.vertex_half_edge] == state.half_edge_dest[state.half_edge_next[state.half_edge_prev[state.vertex_half_edge]]])
-    assert jnp.all(state.half_edge_face[state.half_edge_idx] == state.half_edge_face[state.half_edge_next[state.half_edge_idx]]), f"Half edge {jnp.where(state.half_edge_face[state.half_edge_idx] != state.half_edge_face[state.half_edge_next[state.half_edge_idx]])[0].tolist()} have different faces than their next half edges"
-    assert jnp.all(state.half_edge_idx == state.half_edge_idx[state.half_edge_next[state.half_edge_prev[state.half_edge_idx]]]), f"Half edge {jnp.where(state.half_edge_idx != state.half_edge_idx[state.half_edge_next[state.half_edge_prev[state.half_edge_idx]]])[0].tolist()} do not loop back to themselves when going next then prev"
-
-    # assert jnp.all(jnp.bitwise_xor(state.half_edge_dest[state.half_edge_next[state.vertex_half_edge]] == -1, state.half_edge_dest[state.half_edge_next[state.vertex_half_edge]] != state.half_edge_dest[state.half_edge_next[state.half_edge_twin[state.vertex_half_edge]]]))
-
-    max_iter = 100
-    complete = jnp.zeros((state.vertex_idx.shape[0],), dtype=bool)
-    iter = 0
-    start_vertex = state.half_edge_dest[state.vertex_half_edge]
-    this_half_edge = state.vertex_half_edge
-    def cond_func(carry):
-        complete, iter, this_half_edge, start_vertex, max_iter = carry
-        return ~jnp.all(complete) & (iter < max_iter)
-
-    def body_func(carry):
-        complete, iter, this_half_edge, start_vertex, max_iter = carry
-        next_half_edge = state.half_edge_next[state.half_edge_twin[this_half_edge]]
-        next_vertex = state.half_edge_dest[next_half_edge]
-        complete = complete | (next_vertex == start_vertex)
-        this_half_edge = next_half_edge
-        iter += 1
-        return (complete, iter, this_half_edge, start_vertex, max_iter)
-
-    (complete, iter, this_half_edge, start_vertex, max_iter) = jax.lax.while_loop(
-        cond_func,
-        body_func,
-        (complete, iter, this_half_edge, start_vertex, max_iter)
-    )
-    assert iter < max_iter, "Looping over half edges did not complete in max iterations"
-
-def get_on_boundary(state: MeshState):
-    # get vertices on external edges
-    vertex_half_edge = state.vertex_half_edge
-    finish_vertex_half_edge = vertex_half_edge.copy()
-    start_vertex_half_edge = state.half_edge_next[state.half_edge_twin[vertex_half_edge]]
-    on_boundary = jnp.logical_and(state.half_edge_face[finish_vertex_half_edge] == -1, finish_vertex_half_edge != -1)
-
-    def cond_fun(carry):
-        vertex_half_edge, _ = carry
-        return jnp.any(vertex_half_edge != finish_vertex_half_edge)
-
-    def body_fun(carry):
-        vertex_half_edge, on_boundary = carry
-        on_boundary = jnp.logical_or(on_boundary, jnp.logical_and(state.half_edge_face[vertex_half_edge] == -1, vertex_half_edge != -1))
-        current_half_edge = state.half_edge_next[state.half_edge_twin[vertex_half_edge]]
-        return (current_half_edge, on_boundary)
-
-    (_, on_boundary) = jax.lax.while_loop(
-        cond_fun,
-        body_fun,
-        (start_vertex_half_edge, on_boundary)
-    )
-    return on_boundary
-
-@jax.jit
-def set_vertex_state_edge(state: MeshState):
-    on_boundary = get_on_boundary(state)
-    vertex_state = state.vertex_state.at[:, 0].set(jnp.where(on_boundary, 1.0, 0.0))
-    return state._replace(vertex_state=vertex_state)
-
-def create_initial_state_and_params(
-        subkeys, 
-        spring_len=40.0,
-        elastic_constant=0.1,
-        repulsion_distance=200.0,
-        repulsion_strength=2.0,
-        bulge_strength=10.0,
-        planar_strength=0.1,
-        num_dims=3, 
-        state_dims=8, 
-        hidden_state_dims=32, 
-        num_mlp_layers=2,
-        num_colour_channels=1,
-        scale=0.1
-    ):
-    state = create_initial_state(subkeys[0], num_dims=num_dims, state_dims=state_dims)
-
-    num_sph = 4 # 4 spherical harmonics up to degree 1
-    mlp_params = {}
-    for i in range(num_mlp_layers):
-        if i == 0:
-            in_dim = state_dims + num_sph * state_dims  
-        else:
-            in_dim = hidden_state_dims
-        if i == num_mlp_layers - 1:
-            out_dim = state_dims
-        else:
-            out_dim = hidden_state_dims
-        w = scale * jax.random.normal(subkeys[i + 1], (in_dim, out_dim))
-        b = jnp.zeros((out_dim,))
-        mlp_params[f'layer{i+1}'] = (w, b)
-
-    params = MeshParams(
-        spring_len=spring_len,
-        elastic_constant=elastic_constant,
-        repulsion_distance=repulsion_distance,
-        repulsion_strength=repulsion_strength,
-        bulge_strength=bulge_strength,
-        planar_strength=planar_strength,
-        num_dims=num_dims,
-        vertex_state_mlp_params=mlp_params,
-        num_colour_channels=num_colour_channels
-    )
-    return state, params
-
-def get_vertex_colour(state: MeshState, params: MeshParams):
-    return  0.5 * jnp.tanh(state.vertex_state[:, :3]) + 0.5
-
-def get_vertex_colour_grayscale(state: MeshState, params: MeshParams):
-    grayscale = 0.5 * jnp.tanh(state.vertex_state[:, 0:1]) + 0.5
-    return jnp.concatenate([grayscale, grayscale, grayscale], axis=-1)
-
-
-def jax_to_torch_gpu(jax_array):
-    """Zero-copy JAX to PyTorch conversion via DLPack (GPU only)."""
-    return torch.from_dlpack(jax.dlpack.to_dlpack(jax_array))
-
-
-@jax.jit
-def extract_mesh_for_nvdiffrast(state: MeshState):
+    Channel 0 is interpreted as a growth signal in [0, 1] (Lenia) or via
+    sigmoid (NCA). Caller is responsible for any pre-clamping/saturation.
     """
-    Extract mesh data from JAX half-edge structure for nvdiffrast.
+    he_valid = state.half_edge_idx != -1
+    safe_twin = jnp.clip(state.half_edge_twin, 0)
+    safe_dest = jnp.clip(state.half_edge_dest, 0)
+    he_src = safe_dest[safe_twin]
 
-    Returns:
-        verts: JAX array (MAX_VERTICES, 3) vertex positions
-        faces: JAX array (MAX_FACES, 3) triangle vertex indices
-        n_active_faces: number of active faces
+    s = state.vertex_state[he_src, 0]
+    grow = jnp.maximum(2.0 * s - 1.0, 0.0) ** 2
+
+    noise_per_vertex = 0.5 + jax.random.uniform(key, (MAX_VERTICES,))
+    noise = noise_per_vertex[he_src]
+
+    delta = grow * noise * params.state_dt * params.growth_rate
+    delta = jnp.where(he_valid, delta, 0.0)
+
+    new_intrinsic = state.half_edge_intrinsic_len + delta
+    new_intrinsic = jnp.minimum(new_intrinsic, params.spring_len * 3.0)
+    return state._replace(half_edge_intrinsic_len=new_intrinsic)
+
+
+# ── Combined XPBD Physics Step ──────────────────────────────────────────────
+
+XPBD_ITERATIONS = 10  # static for JIT compatibility
+
+
+@functools.partial(jax.jit, static_argnums=(4, 5))
+def batched_physics_step(state, params, cheb_coeffs, key, n_substeps, growth_mode):
+    """Run n_substeps of XPBD + CA in a single JIT call.
+
+    growth_mode: "lenia" or "nca" (static argument, controls trace).
     """
+
+    def substep(carry, _):
+        pos, vertex_state, he_intrinsic, key = carry
+
+        st = state._replace(
+            vertex_pos=pos,
+            vertex_state=vertex_state,
+            half_edge_intrinsic_len=he_intrinsic,
+        )
+
+        f_ext = compute_external_forces(st, params)
+        pos = predict_positions(st, f_ext, params)
+
+        active_v = state.vertex_idx != -1
+        sort_order, bstart, bend, cell_coords = \
+            _build_spatial_hash(pos, active_v, params.repulsion_dist)
+        neighbor_list = build_neighbor_list(st)
+
+        def xpbd_iter(p, _):
+            p = project_springs(p, st._replace(vertex_pos=p), params)
+            p = project_bending(p, st._replace(vertex_pos=p), params)
+            p = project_collision(p, st, params,
+                                  sort_order, bstart, bend, cell_coords,
+                                  neighbor_list)
+            return p, None
+
+        pos, _ = jax.lax.scan(xpbd_iter, pos, None, length=XPBD_ITERATIONS)
+
+        st = st._replace(vertex_pos=pos)
+
+        if growth_mode == 'lenia':
+            st = chebyshev_ca_step(st, cheb_coeffs, params)
+        elif growth_mode == 'nca':
+            st = nca_update(st, params)
+            ch0 = jax.nn.sigmoid(st.vertex_state[:, 0])
+            ch0 = ch0 * (state.vertex_idx != -1).astype(jnp.float32)
+            st = st._replace(vertex_state=st.vertex_state.at[:, 0].set(ch0))
+        else:
+            raise ValueError(f"Unknown growth_mode: {growth_mode}")
+
+        key, subkey = jax.random.split(key)
+        st = grow_intrinsic_lengths(st, params, subkey)
+
+        return (st.vertex_pos, st.vertex_state,
+                st.half_edge_intrinsic_len, key), None
+
+    init = (state.vertex_pos, state.vertex_state,
+            state.half_edge_intrinsic_len, key)
+    (pos, vs, hil, key), _ = jax.lax.scan(
+        substep, init, None, length=n_substeps
+    )
+
+    return state._replace(
+        vertex_pos=pos, vertex_state=vs,
+        half_edge_intrinsic_len=hil,
+    ), key
+
+
+# ── Diagnostics ──────────────────────────────────────────────────────────────
+
+@jax.jit
+def measure_dihedral_angles(state):
+    """Absolute dihedral angles (degrees) for all interior edges + summary."""
+    he_valid = state.half_edge_idx != -1
+    safe_twin = jnp.clip(state.half_edge_twin, 0)
+    safe_dest = jnp.clip(state.half_edge_dest, 0)
+    safe_next = jnp.clip(state.half_edge_next, 0)
+    he_src = safe_dest[safe_twin]
+
+    pos = state.vertex_pos
+    src_pos = pos[he_src]
+    dst_pos = pos[safe_dest]
+    diff = dst_pos - src_pos
+    dist = jnp.sqrt(jnp.sum(diff * diff, axis=-1) + EPSILON)
+    e_hat = diff / jnp.maximum(dist[:, None], EPSILON)
+
+    he_face = state.half_edge_face
+    twin_face = he_face[safe_twin]
+    he_idx = jnp.arange(MAX_HALF_EDGES)
+    interior = he_valid & (he_face >= 0) & (twin_face >= 0) \
+        & (state.half_edge_twin >= 0) & (he_idx < state.half_edge_twin)
+
+    opp_c = safe_dest[safe_next]
+    safe_twin_next = jnp.clip(state.half_edge_next[safe_twin], 0)
+    opp_d = safe_dest[safe_twin_next]
+
+    pc = pos[opp_c]
+    pd = pos[opp_d]
+
+    fn1 = jnp.cross(diff, pc - src_pos)
+    fn2 = jnp.cross(src_pos - dst_pos, pd - dst_pos)
+    a1 = jnp.sqrt(jnp.sum(fn1 * fn1, axis=-1) + EPSILON)
+    a2 = jnp.sqrt(jnp.sum(fn2 * fn2, axis=-1) + EPSILON)
+    n1 = fn1 / a1[:, None]
+    n2 = fn2 / a2[:, None]
+
+    cos_theta = jnp.sum(n1 * n2, axis=-1)
+    sin_theta = jnp.sum(jnp.cross(n1, n2) * e_hat, axis=-1)
+    theta = jnp.arctan2(
+        jnp.where(interior, sin_theta, 0.0),
+        jnp.where(interior, cos_theta, 1.0),
+    )
+
+    abs_theta_deg = jnp.abs(theta) * (180.0 / jnp.pi)
+    abs_theta_deg = jnp.where(interior, abs_theta_deg, 0.0)
+
+    n_interior = jnp.sum(interior.astype(jnp.int32))
+    max_angle = jnp.max(abs_theta_deg)
+    mean_angle = jnp.sum(abs_theta_deg) / jnp.maximum(n_interior.astype(jnp.float32), 1.0)
+    return abs_theta_deg, max_angle, mean_angle, n_interior
+
+
+def detect_boundary(state):
+    """Boolean (MAX_VERTICES,) marking vertices touching a boundary half-edge."""
+    boundary = np.zeros(MAX_VERTICES, dtype=bool)
+    he_face = np.array(state.half_edge_face)
+    he_dest = np.array(state.half_edge_dest)
+    he_twin = np.array(state.half_edge_twin)
+    he_valid = np.array(state.half_edge_idx != -1)
+
+    for i in range(MAX_HALF_EDGES):
+        if he_valid[i] and he_face[i] == -1:
+            src = he_dest[max(he_twin[i], 0)]
+            dst = he_dest[i]
+            if 0 <= src < MAX_VERTICES:
+                boundary[src] = True
+            if 0 <= dst < MAX_VERTICES:
+                boundary[dst] = True
+    return jnp.array(boundary)
+
+
+@jax.jit
+def get_on_boundary(state):
+    """Mark every active vertex that touches at least one boundary half-edge."""
+    he_valid = state.half_edge_idx != -1
+    on_boundary_he = (state.half_edge_face == -1) & he_valid
+    safe_twin = jnp.clip(state.half_edge_twin, 0)
+    safe_dest = jnp.clip(state.half_edge_dest, 0)
+    he_src = safe_dest[safe_twin]
+
+    on_b = jnp.zeros(MAX_VERTICES, dtype=bool)
+    on_b = on_b.at[safe_dest].max(on_boundary_he)
+    on_b = on_b.at[he_src].max(on_boundary_he)
+    return on_b & (state.vertex_idx != -1)
+
+
+# ── Rendering (nvdiffrast) ───────────────────────────────────────────────────
+
+@jax.jit
+def extract_mesh_for_nvdiffrast(state):
+    """Extract verts, faces, n_active_faces for rendering."""
     verts = state.vertex_pos
-
-    # Get face half-edges for ALL face slots (use 0 as placeholder for inactive)
     active_mask = state.face_idx != -1
     face_half_edges = jnp.where(active_mask, state.face_half_edge, 0)
 
-    # Build triangles from the representative half-edge
-    triangle_half_edges = jnp.stack([
+    tri_he = jnp.stack([
         face_half_edges,
         state.half_edge_next[face_half_edges],
         state.half_edge_next[state.half_edge_next[face_half_edges]],
     ], -1)
-
-    # Get face vertex indices
-    faces = state.half_edge_dest[triangle_half_edges]
-
-    # For inactive faces, set to degenerate triangle (0, 0, 0)
+    faces = state.half_edge_dest[tri_he]
     faces = jnp.where(active_mask[:, None], faces, 0)
-
-    n_active_faces = jnp.sum(active_mask)
-
-    return verts, faces, n_active_faces
+    n_active = jnp.sum(active_mask)
+    return verts, faces, n_active
 
 
 @jax.jit
-def compute_vertex_colors_jax(state: MeshState):
-    """Compute vertex colors from vertex state.
-
-    Maps vertex_state to RGB using tanh activation, taking first 3 channels.
-    """
-    # Use first 3 channels of vertex_state (or fewer if not available)
-    state_rgb = state.vertex_state[:, :3]
-    # Map to [0, 1] range using tanh
-    colors = 0.5 * (jnp.tanh(state_rgb) + 1.0)
-    # pad to 3 channels if fewer
-    colors = jnp.pad(colors, ((0, 0), (0, 3 - colors.shape[1])), mode='edge')
-    return colors
-
-
-@jax.jit
-def compute_vertex_normals_jax(verts, faces, n_active):
-    """Compute vertex normals in JAX."""
-    # Get triangle vertices
+def compute_vertex_normals_jax(verts, faces):
     v0 = verts[faces[:, 0]]
     v1 = verts[faces[:, 1]]
     v2 = verts[faces[:, 2]]
+    face_normals = jnp.cross(v1 - v0, v2 - v0)
+    vn = jnp.zeros_like(verts)
+    vn = vn.at[faces[:, 0]].add(face_normals)
+    vn = vn.at[faces[:, 1]].add(face_normals)
+    vn = vn.at[faces[:, 2]].add(face_normals)
+    norm = jnp.linalg.norm(vn, axis=-1, keepdims=True)
+    return vn / jnp.maximum(norm, 1e-8)
 
-    # Compute face normals
-    e1 = v1 - v0
-    e2 = v2 - v0
-    face_normals = jnp.cross(e1, e2)
 
-    # Accumulate normals at vertices
-    vertex_normals = jnp.zeros_like(verts)
-    vertex_normals = vertex_normals.at[faces[:, 0]].add(face_normals)
-    vertex_normals = vertex_normals.at[faces[:, 1]].add(face_normals)
-    vertex_normals = vertex_normals.at[faces[:, 2]].add(face_normals)
+@jax.jit
+def compute_vertex_colors_jax(state):
+    """Vertex colors from channel 0 (Lenia-style blue→yellow) or first 3 channels (NCA)."""
+    state_rgb = state.vertex_state[:, :3]
+    colors = 0.5 * (jnp.tanh(state_rgb) + 1.0)
+    pad = 3 - colors.shape[1]
+    if pad > 0:
+        colors = jnp.pad(colors, ((0, 0), (0, pad)), mode='edge')
+    return colors
 
-    # Normalize
-    norm = jnp.linalg.norm(vertex_normals, axis=-1, keepdims=True)
-    vertex_normals = vertex_normals / jnp.maximum(norm, 1e-8)
 
-    return vertex_normals
+def jax_to_torch_gpu(arr):
+    return torch.from_dlpack(jax.dlpack.to_dlpack(arr))
 
 
 class JAXNvdiffrastRenderer:
@@ -1584,198 +1499,147 @@ class JAXNvdiffrastRenderer:
         self.width = width
         self.height = height
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-
-        print(f"nvdiffrast Renderer using device: {self.device}")
-
-        # Create nvdiffrast context
         self.glctx = dr.RasterizeCudaContext()
-
-        # Pre-compute transformation matrices
         self.center_x = width / 2
         self.center_y = height / 2
-
-        # Camera setup (orthographic projection)
-        # Map screen coordinates to clip space [-1, 1]
-        # Vertices at (0, 0) -> (-1, -1), vertices at (width, height) -> (1, 1)
         self.proj_scale = 2.0 / max(width, height)
-
-        # Lighting parameters
         self.light_dir = torch.tensor([0.3, 0.3, 1.0], device=self.device, dtype=torch.float32)
         self.light_dir = self.light_dir / torch.norm(self.light_dir)
         self.ambient = 0.25
         self.diffuse = 0.75
 
-        print(f"Renderer initialized: {width}x{height}")
+    def render(self, state):
+        verts_j, faces_j, n_active = extract_mesh_for_nvdiffrast(state)
+        normals_j = compute_vertex_normals_jax(verts_j, faces_j)
+        colors_j = compute_vertex_colors_jax(state)
+        jax.block_until_ready(verts_j)
 
-    def render(self, state: MeshState):
-        """
-        Render mesh using nvdiffrast.
+        verts = jax_to_torch_gpu(verts_j).to(self.device)
+        faces = jax_to_torch_gpu(faces_j).to(torch.int32).to(self.device)
+        normals = jax_to_torch_gpu(normals_j).to(self.device)
+        vertex_colors = jax_to_torch_gpu(colors_j).to(self.device)
+        n = int(n_active)
+        faces = faces[:n].contiguous()
 
-        Args:
-            state: JAX MeshState
-
-        Returns:
-            numpy array (H, W, 3) RGB image as uint8
-        """
-        # Extract mesh data (in JAX) - JIT compiled
-        verts_jax, faces_jax, n_active = extract_mesh_for_nvdiffrast(state)
-
-        # Compute vertex normals and colors in JAX
-        normals_jax = compute_vertex_normals_jax(verts_jax, faces_jax, n_active)
-        colors_jax = compute_vertex_colors_jax(state)
-
-        # Block until JAX computation is done
-        jax.block_until_ready(verts_jax)
-        jax.block_until_ready(faces_jax)
-        jax.block_until_ready(normals_jax)
-        jax.block_until_ready(colors_jax)
-
-        # Zero-copy conversion to PyTorch
-        verts = jax_to_torch_gpu(verts_jax)
-        faces = jax_to_torch_gpu(faces_jax).to(torch.int32)
-        normals = jax_to_torch_gpu(normals_jax)
-        vertex_colors = jax_to_torch_gpu(colors_jax)
-
-        # Only use active faces
-        n_active_int = int(n_active)
-        faces = faces[:n_active_int].contiguous()
-
-        # Transform vertices to clip space [-1, 1]
-        # Screen coords (0,0) to (width,height) -> clip coords (-1,-1) to (1,1)
         verts_clip = verts.clone()
         verts_clip[:, 0] = (verts[:, 0] - self.center_x) * self.proj_scale
         verts_clip[:, 1] = (verts[:, 1] - self.center_y) * self.proj_scale
-        verts_clip[:, 2] = verts[:, 2] * self.proj_scale  # Keep Z in same scale
-
-        # Convert to homogeneous coordinates [x, y, z, w]
+        verts_clip[:, 2] = verts[:, 2] * self.proj_scale
         verts_homo = torch.cat([verts_clip, torch.ones_like(verts_clip[:, :1])], dim=-1)
-
-        # Add batch dimension for nvdiffrast
         verts_homo = verts_homo.unsqueeze(0).contiguous()
 
         with torch.no_grad():
-            # Create double-sided geometry with explicit normals for each side
-            # Back faces: flipped winding, negated normals (pointing inward)
-            # Front faces: original winding, original normals (pointing outward)
             faces_back = faces[:, [0, 2, 1]]
             faces_double = torch.cat([faces_back, faces], dim=0)
-
-            # Duplicate normals: negated for back faces, original for front faces
-            normals_back = -normals
-            normals_double = torch.cat([normals_back, normals], dim=0)
-
-            # Duplicate colors for both sides
+            normals_double = torch.cat([-normals, normals], dim=0)
             colors_double = torch.cat([vertex_colors, vertex_colors], dim=0)
 
-            # Rasterize with double-sided faces
             rast_out, _ = dr.rasterize(self.glctx, verts_homo, faces_double, (self.height, self.width))
+            normals_interp, _ = dr.interpolate(normals_double.unsqueeze(0).contiguous(),
+                                               rast_out, faces_double)
+            colors_interp, _ = dr.interpolate(colors_double.unsqueeze(0).contiguous(),
+                                              rast_out, faces_double)
 
-            # Interpolate normals (using duplicated normals with correct orientation per side)
-            normals_batch = normals_double.unsqueeze(0).contiguous()
-            normals_interp, _ = dr.interpolate(normals_batch, rast_out, faces_double)
-
-            # Interpolate vertex colors
-            colors_batch = colors_double.unsqueeze(0).contiguous()
-            colors_interp, _ = dr.interpolate(colors_batch, rast_out, faces_double)
-
-            # Normalize interpolated normals
-            normals_shading = normals_interp / (torch.norm(normals_interp, dim=-1, keepdim=True) + 1e-8)
-
-            # Compute lighting (simple Lambertian)
+            ni = normals_interp / (torch.norm(normals_interp, dim=-1, keepdim=True) + 1e-8)
             light_dir = self.light_dir.view(1, 1, 1, 3)
-            ndotl = torch.clamp(torch.sum(normals_shading * light_dir, dim=-1, keepdim=True), 0, 1)
-
-            # Apply lighting to get mesh color
+            ndotl = torch.clamp(torch.sum(ni * light_dir, dim=-1, keepdim=True), 0, 1)
             mesh_color = colors_interp * (self.ambient + self.diffuse * ndotl)
-
-            # Apply antialiasing for smooth silhouette edges
             mesh_color = dr.antialias(mesh_color, rast_out, verts_homo, faces_double)
 
-            # Composite over background (triangle_id > 0 means a triangle was rasterized)
             tri_id = rast_out[..., 3:4]
             mask = (tri_id > 0).float()
-            bg_color = torch.full_like(mesh_color, 0.1)
-            color = mesh_color * mask + bg_color * (1 - mask)
-
-            # Convert to uint8
+            bg = torch.full_like(mesh_color, 0.1)
+            color = mesh_color * mask + bg * (1 - mask)
             color = (color[0] * 255).clamp(0, 255).to(torch.uint8)
 
         return color.cpu().numpy()
 
 
 def enforce_boundary(state):
-    z_min, z_max = 0.0, 50
-    vertex_pos = jnp.clip(
+    pos = jnp.clip(
         state.vertex_pos,
-        a_min=jnp.array([0.0, 0.0, z_min]),
-        a_max=jnp.array([800.0, 800.0, z_max])
+        a_min=jnp.array(WORLD_MIN, dtype=jnp.float32),
+        a_max=jnp.array(WORLD_MAX, dtype=jnp.float32),
     )
-    return state._replace(vertex_pos=vertex_pos)
+    return state._replace(vertex_pos=pos)
 
+
+# ── Main Loop ────────────────────────────────────────────────────────────────
+
+def seed_boundary_state(state, channel=0, value=1.0):
+    """Set channel `channel` of vertex_state to `value` on boundary vertices."""
+    on_b = get_on_boundary(state)
+    new_ch = jnp.where(on_b, value, state.vertex_state[:, channel])
+    return state._replace(vertex_state=state.vertex_state.at[:, channel].set(new_ch))
 
 
 def main():
-    width, height = 500, 500
-    
-    # Initialize JAX
+    width, height = 800, 800
     key = jax.random.PRNGKey(42)
-    key, *subkeys = jax.random.split(key, 5)
-    
-    # Create initial state and parameters
-    num_dims = 3
-    state, params = create_initial_state_and_params(
-        subkeys, num_dims=num_dims, state_dims=1, num_mlp_layers=1, bulge_strength=0
+
+    # Pick a growth mode here:
+    #   "lenia": scalar Chebyshev graph CA
+    #   "nca":   MeshNCA with MLP
+    growth_mode = 'lenia'
+
+    if growth_mode == 'lenia':
+        state_dims = 1
+        mlp_params = {}
+    else:
+        state_dims = 8
+        key, mlp_key = jax.random.split(key)
+        mlp_params = make_mlp_params(mlp_key, state_dims,
+                                     hidden_state_dims=32, num_mlp_layers=2)
+
+    params = default_params(vertex_state_mlp_params=mlp_params)
+    state = make_circle(width, height, params, n_rings=5, state_dims=state_dims)
+    state = seed_boundary_state(state, channel=0, value=1.0)
+
+    cheb_coeffs, cheb_order = chebyshev_ring_coeffs(
+        params.kernel_mu, params.kernel_sigma
     )
-    
-    # Initialize first triangle
-    state = make_circle(state, width, height, params)
+    print(f"Chebyshev order: {cheb_order}")
 
-    # get first triangle vertices
-    v0, v1, v2 = state.vertex_pos[:3]
-
-    
-    # Initialize pygame
     pygame.init()
-    screen = pygame.display.set_mode((width, height), pygame.DOUBLEBUF, vsync=True)
+    screen = pygame.display.set_mode((width, height), pygame.DOUBLEBUF)
     clock = pygame.time.Clock()
-
-    # Initialize renderer
     renderer = JAXNvdiffrastRenderer(width, height)
-    
+
+    frame = 0
     running = True
-    frame_count = 0
     while running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
                 running = False
-        
-        # Update physics
-        state, repulsion_mag = update_positions(state, params)
-        # state = update_vertex_state(state, params)
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                running = False
 
-        # ensure first triangle vertices stay fixed
-        vertex_pos = state.vertex_pos.at[jnp.array([0, 1, 2])].set(jnp.array([v0, v1, v2]))
-        state = state._replace(vertex_pos=vertex_pos)
-        
-        # Generate new triangles
-        # state, key = maybe_generate_new_triangles(state, params, key, repulsion_mag)
-        
-        # Refine mesh every 10 frames
-        if frame_count % 10 == 0:
-            state = refine_mesh(state)
-        
-        # Render with nvdiffrast
-        image_np = renderer.render(state)
-        # Convert to pygame surface
-        surface = pygame.surfarray.make_surface(image_np.swapaxes(0, 1))
+        key, subkey = jax.random.split(key)
+        state, key = batched_physics_step(
+            state, params, cheb_coeffs, subkey, 1, growth_mode
+        )
 
+        if frame % 10 == 0:
+            state, key = split_long_edges(state, params, key)
+            if frame % 20 == 0:
+                state = refine_mesh(state)
+            n_verts = int(jnp.sum(state.vertex_idx != -1))
+            n_faces = int(jnp.sum(state.face_idx != -1))
+            if frame % 50 == 0:
+                _, max_angle, mean_angle, _ = measure_dihedral_angles(state)
+                print(f"Frame {frame}: {n_verts} verts, {n_faces} faces, "
+                      f"max_angle={float(max_angle):.1f}°, "
+                      f"mean_angle={float(mean_angle):.1f}°")
+
+        image = renderer.render(state)
+        surface = pygame.surfarray.make_surface(image.swapaxes(0, 1))
         screen.blit(surface, (0, 0))
         pygame.display.flip()
+        clock.tick(30)
+        frame += 1
 
-        clock.tick(60)
-        frame_count += 1
-    
     pygame.quit()
+
 
 if __name__ == '__main__':
     main()

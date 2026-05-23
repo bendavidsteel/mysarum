@@ -10,8 +10,15 @@ Usage:
 
 import argparse
 import logging
+import os
 import sys
 import time
+
+# Disable JAX's 75% VRAM preallocation: the top-k refine_mesh pipeline needs
+# more XLA scratch than fits if JAX has already claimed most of the GPU on a
+# 4GB card (GTX 1650 Max-Q). On-demand allocation costs a bit on first use
+# but avoids CUDA_ERROR_OUT_OF_MEMORY for the rest of the render.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
 import jax.numpy as jnp

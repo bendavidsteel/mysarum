@@ -1,10 +1,11 @@
 """
-nca_sweep.py — unified NCA growth sweep + diversity scoring + curation.
+nca_sweep.py — unified growth sweep + diversity scoring + curation.
 
-Single hydra-driven entry point. Subcommands selected by sweep config:
-    sweep=stratified   stratified diverse sweep (default)
-    sweep=original     re-run the original 12 hand-picked configs
-    sweep=...          add a new YAML under conf/sweep/ to define new runs
+Single hydra-driven entry point. Sweep config under `conf/sweep/<name>.yaml`
+selects which set of configs to run. Each config picks `growth_mode`:
+    nca / nca_bipolar    untrained MLP rules
+    phototropic          deterministic light + resources + gravity, no MLP
+    lenia                Chebyshev graph CA (single-channel)
 
 Each sweep produces:
     out_dir/imgs/*.png    rendered tiles
@@ -17,8 +18,8 @@ comparison against that previous sweep.
 
 Example:
     conda run -n base python nca_sweep.py
-    conda run -n base python nca_sweep.py sweep=original
-    conda run -n base python nca_sweep.py sweep=stratified compare_to=outputs/.../features.npz
+    conda run -n base python nca_sweep.py sweep=phototropic
+    conda run -n base python nca_sweep.py sweep=bipolar compare_to=outputs/.../features.npz
 """
 
 import json
@@ -92,7 +93,29 @@ def _seed_antipodal(state, channel=0, value=1.0):
     )
 
 
-def apply_seed(state, key, pattern, state_dims):
+def _seed_apex(state, channel=0, value=1.0):
+    """Set channel to value on the single highest-z vertex (the dome apex)."""
+    active = _active(state)
+    z = jnp.where(active, state.vertex_pos[:, 2], -jnp.inf)
+    apex = jnp.argmax(z)
+    return state._replace(
+        vertex_state=state.vertex_state.at[apex, channel].set(value),
+    )
+
+
+def _seed_top_ring(state, channel=0, value=0.5, top_frac=0.2):
+    """Set channel to value on the top `top_frac` of vertices by z."""
+    active = _active(state)
+    z = jnp.where(active, state.vertex_pos[:, 2], -jnp.inf)
+    zmax = jnp.max(z)
+    zmin = jnp.min(jnp.where(active, state.vertex_pos[:, 2], jnp.inf))
+    cutoff = zmax - top_frac * (zmax - zmin)
+    on_top = active & (state.vertex_pos[:, 2] >= cutoff)
+    new_ch = jnp.where(on_top, value, state.vertex_state[:, channel])
+    return state._replace(vertex_state=state.vertex_state.at[:, channel].set(new_ch))
+
+
+def apply_seed(state, key, pattern, state_dims, mode="nca"):
     if pattern == "boundary":
         state = g.seed_boundary_state(state, channel=0, value=1.0)
     elif pattern == "random":
@@ -110,11 +133,30 @@ def apply_seed(state, key, pattern, state_dims):
         state = _seed_gradient(state)
     elif pattern == "ring":
         state = _seed_ring(state)
+    elif pattern == "apex":
+        state = _seed_apex(state, channel=0, value=0.5)
+    elif pattern == "top_ring":
+        state = _seed_top_ring(state, channel=0, value=0.3)
+    elif pattern == "uniform_low":
+        active = _active(state)
+        vs = jnp.where(active, 0.1, state.vertex_state[:, 0])
+        state = state._replace(
+            vertex_state=state.vertex_state.at[:, 0].set(vs),
+        )
     else:
         raise ValueError(f"Unknown seed_pattern: {pattern}")
-    for c in range(1, state_dims):
-        key, sk = jax.random.split(key)
-        state = g.seed_random_state(state, sk, channel=c, low=-0.3, high=0.3)
+
+    if mode == "phototropic":
+        if state_dims >= 3:
+            active = _active(state)
+            ch2 = jnp.where(active, 1.0, state.vertex_state[:, 2])
+            state = state._replace(
+                vertex_state=state.vertex_state.at[:, 2].set(ch2),
+            )
+    else:
+        for c in range(1, state_dims):
+            key, sk = jax.random.split(key)
+            state = g.seed_random_state(state, sk, channel=c, low=-0.3, high=0.3)
     return state
 
 
@@ -126,6 +168,18 @@ CONFIG_DEFAULTS = dict(
     mlp_scale=0.5, state_dt=0.07, growth_rate=5.0,
     growth_mode="nca",
     rings=4, sphere_lat=6, sphere_lon=10, sphere_radius_mult=2.0,
+    hemi_lat=4, hemi_lon=10, hemi_radius_mult=1.5,
+    light_dir=[0.0, 0.0, 1.0],
+    light_pos=[400.0, 400.0, 1500.0],
+    light_decay_dist=1e6,
+    light_ambient=0.05,
+    gravity_strength=0.0,
+    tissue_decay=0.05,
+    tissue_saturation=2.0,
+    resource_diffusion=0.5,
+    resource_decay=0.02,
+    ground_source_value=1.0,
+    ground_z=0.0,
 )
 
 
@@ -137,12 +191,29 @@ def _build_initial(cfg, params, resolution):
             center=(resolution / 2, resolution / 2, 0.0),
             state_dims=cfg["state_dims"],
         )
+    if cfg["shape"] == "hemisphere":
+        return g.make_hemisphere(
+            width=resolution, height=resolution, params=params,
+            n_lat=cfg["hemi_lat"], n_lon=cfg["hemi_lon"],
+            radius_multiplier=cfg["hemi_radius_mult"],
+            state_dims=cfg["state_dims"],
+            ground_z=cfg["ground_z"],
+        )
     return g.make_sphere(
         width=resolution, height=resolution, params=params,
         n_lat=cfg["sphere_lat"], n_lon=cfg["sphere_lon"],
         radius_multiplier=cfg["sphere_radius_mult"],
         state_dims=cfg["state_dims"],
     )
+
+
+def _resolve_light_pos(light_pos_cfg, resolution):
+    lp = list(light_pos_cfg)
+    if lp[0] is None or (isinstance(lp[0], float) and lp[0] < 0):
+        lp[0] = resolution / 2
+    if lp[1] is None or (isinstance(lp[1], float) and lp[1] < 0):
+        lp[1] = resolution / 2
+    return jnp.array(lp, dtype=jnp.float32)
 
 
 def run_one(cfg, frames, substeps, resolution, max_edge_len, max_splits, renderer):
@@ -154,15 +225,31 @@ def run_one(cfg, frames, substeps, resolution, max_edge_len, max_splits, rendere
         num_mlp_layers=cfg["mlp_layers"],
         scale=cfg["mlp_scale"],
     )
+    light_dir = jnp.array(list(cfg["light_dir"]), dtype=jnp.float32)
+    light_pos = _resolve_light_pos(cfg["light_pos"], resolution)
     params = g.default_params(
         max_edge_len=max_edge_len,
         growth_rate=cfg["growth_rate"],
         state_dt=cfg["state_dt"],
         vertex_state_mlp_params=mlp_params,
+        light_dir=light_dir,
+        light_pos=light_pos,
+        light_decay_dist=float(cfg["light_decay_dist"]),
+        light_ambient=float(cfg["light_ambient"]),
+        gravity_strength=float(cfg["gravity_strength"]),
+        tissue_decay=float(cfg["tissue_decay"]),
+        tissue_saturation=float(cfg["tissue_saturation"]),
+        resource_diffusion=float(cfg["resource_diffusion"]),
+        resource_decay=float(cfg["resource_decay"]),
+        ground_z=float(cfg["ground_z"]),
+        ground_source_value=float(cfg["ground_source_value"]),
     )
     state = _build_initial(cfg, params, resolution)
     key, sk = jax.random.split(key)
-    state = apply_seed(state, sk, cfg["seed_pattern"], cfg["state_dims"])
+    state = apply_seed(
+        state, sk, cfg["seed_pattern"], cfg["state_dims"],
+        mode=cfg["growth_mode"],
+    )
     cheb_coeffs, _ = g.chebyshev_ring_coeffs(params.kernel_mu, params.kernel_sigma)
 
     n_iters = frames // substeps

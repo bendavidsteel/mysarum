@@ -84,6 +84,21 @@ MeshParams = collections.namedtuple('MeshParams', [
     'vertex_state_mlp_params',
     # General
     'num_colour_channels',
+    # Phototropic / nature-inspired growth (growth_mode == "phototropic")
+    #   ch0 = tissue (drives growth), ch1 = light (recomputed each step),
+    #   ch2 = nutrient (diffuses from ground), optional ch3+ extra resources
+    'light_dir',
+    'light_pos',
+    'light_decay_dist',
+    'light_ambient',
+    'gravity_strength',
+    'tissue_decay',
+    'tissue_saturation',
+    'resource_diffusion',
+    'resource_decay',
+    'ground_z',
+    'ground_source_value',
+    'ground_pin_strength',
 ])
 
 
@@ -107,6 +122,18 @@ def default_params(**overrides):
         state_dt=0.02,
         vertex_state_mlp_params={},
         num_colour_channels=1,
+        light_dir=jnp.array([0.0, 0.0, 1.0], dtype=jnp.float32),
+        light_pos=jnp.array([400.0, 400.0, 800.0], dtype=jnp.float32),
+        light_decay_dist=1e6,
+        light_ambient=0.05,
+        gravity_strength=0.0,
+        tissue_decay=0.05,
+        tissue_saturation=2.0,
+        resource_diffusion=0.5,
+        resource_decay=0.02,
+        ground_z=0.0,
+        ground_source_value=1.0,
+        ground_pin_strength=0.15,
     )
     defaults.update(overrides)
     return MeshParams(**defaults)
@@ -341,6 +368,51 @@ def make_circle(width, height, params, n_rings=3, segments_inner=6,
         center=(width / 2, height / 2, 0.0),
         state_dims=state_dims,
         key=key,
+    )
+
+
+def make_hemisphere(width, height, params, n_lat=4, n_lon=10,
+                    radius_multiplier=2.0, state_dims=1, key=None,
+                    ground_z=0.0):
+    """UV hemisphere dome with open equatorial boundary on z=ground_z.
+
+    Top pole + (n_lat - 1) intermediate latitude rings + equator ring (last,
+    on the ground). No bottom cap — the equator forms an open boundary loop.
+    """
+    cx, cy = width / 2, height / 2
+    radius = float(params.spring_len) * radius_multiplier
+
+    positions = [[cx, cy, ground_z + radius]]
+    for lat_idx in range(n_lat):
+        theta = (np.pi / 2) * (lat_idx + 1) / n_lat
+        z = ground_z + radius * np.cos(theta)
+        ring_radius = radius * np.sin(theta)
+        for lon_idx in range(n_lon):
+            phi = 2 * np.pi * lon_idx / n_lon
+            x = cx + ring_radius * np.cos(phi)
+            y = cy + ring_radius * np.sin(phi)
+            positions.append([x, y, z])
+
+    def vidx(lat, lon):
+        if lat == -1:
+            return 0
+        return 1 + lat * n_lon + (lon % n_lon)
+
+    faces = []
+    for lon_idx in range(n_lon):
+        faces.append([vidx(-1, 0), vidx(0, lon_idx), vidx(0, lon_idx + 1)])
+    for lat_idx in range(n_lat - 1):
+        for lon_idx in range(n_lon):
+            v_tl = vidx(lat_idx, lon_idx)
+            v_tr = vidx(lat_idx, lon_idx + 1)
+            v_bl = vidx(lat_idx + 1, lon_idx)
+            v_br = vidx(lat_idx + 1, lon_idx + 1)
+            faces.append([v_tl, v_bl, v_tr])
+            faces.append([v_tr, v_bl, v_br])
+
+    return build_mesh_from_faces(
+        np.array(positions), np.array(faces),
+        state_dims=state_dims, key=key,
     )
 
 
@@ -953,8 +1025,13 @@ def compute_external_forces(state, params):
     centroid = neighbor_sum / jnp.maximum(degree[:, None], 1.0)
     laplacian = centroid - pos
 
+    gravity = jnp.zeros_like(pos)
+    gravity = gravity.at[:, 2].set(-params.gravity_strength)
+    gravity = gravity * active
+
     forces = params.bulge_strength * bulge \
-        + params.stiffness * 0.5 * laplacian * active
+        + params.stiffness * 0.5 * laplacian * active \
+        + gravity
     return forces
 
 
@@ -1358,6 +1435,108 @@ def nca_update(state, params):
     return state._replace(vertex_state=new_state)
 
 
+# ── Phototropic (light + resources + gravity) ───────────────────────────────
+#
+# Convention:
+#   ch0 = tissue (drives growth via grow_intrinsic_lengths_bipolar)
+#   ch1 = light  (recomputed every step from per-vertex normals)
+#   ch2 = nutrient (diffuses on the graph + decays + boundary inflow at ground)
+#   ch3+ = extra resource channels with the same diffuse/decay rule
+#
+# All dynamics are deterministic given params. No MLP. Diversity comes from
+# the configurable params (light direction/position, gravity, decay rates,
+# diffusion rate, etc.).
+
+
+@jax.jit
+def _vertex_normals_from_state(state):
+    """Per-vertex normals from active-face triangle normals (unit, masked)."""
+    pos = state.vertex_pos
+    active_mask = state.face_idx != -1
+    face_hes = jnp.where(active_mask, state.face_half_edge, 0)
+    safe_next = state.half_edge_next
+    safe_dest = state.half_edge_dest
+    tri_he = jnp.stack([
+        face_hes,
+        safe_next[face_hes],
+        safe_next[safe_next[face_hes]],
+    ], -1)
+    fv = safe_dest[tri_he]
+    fv = jnp.where(active_mask[:, None], fv, 0)
+    v0, v1, v2 = pos[fv[:, 0]], pos[fv[:, 1]], pos[fv[:, 2]]
+    fn = jnp.cross(v1 - v0, v2 - v0)
+    fn = jnp.where(active_mask[:, None], fn, 0.0)
+    vn = jnp.zeros_like(pos)
+    vn = vn.at[fv[:, 0]].add(fn)
+    vn = vn.at[fv[:, 1]].add(fn)
+    vn = vn.at[fv[:, 2]].add(fn)
+    norm = jnp.linalg.norm(vn, axis=-1, keepdims=True)
+    return vn / jnp.maximum(norm, EPSILON)
+
+
+@jax.jit
+def compute_light_channel(state, params):
+    """Light intensity at each vertex from normal·light_dir + 1/r falloff.
+
+    The light direction in params points *toward* the source. Returns a
+    scalar in roughly [0, 1] per vertex, zero on the unlit side. Inactive
+    vertices get 0.
+    """
+    active = (state.vertex_idx != -1).astype(jnp.float32)
+    normals = _vertex_normals_from_state(state)
+    light_dir = params.light_dir / (jnp.linalg.norm(params.light_dir) + EPSILON)
+    dot = jnp.sum(normals * light_dir[None, :], axis=-1)
+    diffuse = jnp.maximum(dot, 0.0)
+
+    diff = state.vertex_pos - params.light_pos[None, :]
+    d = jnp.linalg.norm(diff, axis=-1)
+    falloff = params.light_decay_dist / (params.light_decay_dist + d)
+
+    illum = params.light_ambient + (1.0 - params.light_ambient) * diffuse * falloff
+    return illum * active
+
+
+@jax.jit
+def diffuse_channel(state, channel, rate):
+    """One explicit graph-Laplacian smoothing step on `channel`.
+
+    new[v] = (1 - rate) * old[v] + rate * mean(old[neighbours]).
+    """
+    he_valid = state.half_edge_idx != -1
+    safe_twin = jnp.clip(state.half_edge_twin, 0)
+    safe_dest = jnp.clip(state.half_edge_dest, 0)
+    he_src = safe_dest[safe_twin]
+    he_dst = safe_dest
+    s = state.vertex_state[:, channel]
+    nbr_sum = jnp.zeros(MAX_VERTICES).at[he_src].add(
+        jnp.where(he_valid, s[he_dst], 0.0)
+    )
+    degree = jnp.zeros(MAX_VERTICES).at[he_src].add(he_valid.astype(jnp.float32))
+    avg = nbr_sum / jnp.maximum(degree, 1.0)
+    new = (1.0 - rate) * s + rate * avg
+    return state._replace(vertex_state=state.vertex_state.at[:, channel].set(new))
+
+
+def boundary_source(state, channel, value, ground_z, band):
+    """Set channel = value on vertices whose z lies within `band` of ground_z."""
+    active = state.vertex_idx != -1
+    on_ground = active & (state.vertex_pos[:, 2] < ground_z + band)
+    new = jnp.where(on_ground, value, state.vertex_state[:, channel])
+    return state._replace(vertex_state=state.vertex_state.at[:, channel].set(new))
+
+
+def project_ground(pos, state, params):
+    """Snap boundary vertices to z=ground_z and prevent any vertex from going
+    below it. Boundary half-edges are detected from topology, so the equator
+    of a hemisphere stays anchored even as new vertices appear from splits.
+    """
+    on_b = get_on_boundary(state)
+    z = pos[:, 2]
+    z = jnp.where(on_b, params.ground_z, z)
+    z = jnp.maximum(z, params.ground_z)
+    return pos.at[:, 2].set(z)
+
+
 # ── Intrinsic Length Growth ──────────────────────────────────────────────────
 
 @jax.jit
@@ -1374,6 +1553,32 @@ def grow_intrinsic_lengths(state, params, key):
 
     s = state.vertex_state[he_src, 0]
     grow = jnp.maximum(2.0 * s - 1.0, 0.0) ** 2
+
+    noise_per_vertex = 0.5 + jax.random.uniform(key, (MAX_VERTICES,))
+    noise = noise_per_vertex[he_src]
+
+    delta = grow * noise * params.state_dt * params.growth_rate
+    delta = jnp.where(he_valid, delta, 0.0)
+
+    new_intrinsic = state.half_edge_intrinsic_len + delta
+    new_intrinsic = jnp.minimum(new_intrinsic, params.spring_len * 3.0)
+    return state._replace(half_edge_intrinsic_len=new_intrinsic)
+
+
+@jax.jit
+def grow_intrinsic_lengths_phototropic(state, params, key):
+    """Growth driven by ch0 (tissue) in [0, 1], no threshold.
+
+    grow = tissue^1.5 (concave-down in [0,1], slow start, fast finish).
+    Always positive: light-driven growth never shrinks, mirroring biology.
+    """
+    he_valid = state.half_edge_idx != -1
+    safe_twin = jnp.clip(state.half_edge_twin, 0)
+    safe_dest = jnp.clip(state.half_edge_dest, 0)
+    he_src = safe_dest[safe_twin]
+
+    s = jnp.clip(state.vertex_state[he_src, 0], 0.0, 1.0)
+    grow = s ** 1.5
 
     noise_per_vertex = 0.5 + jax.random.uniform(key, (MAX_VERTICES,))
     noise = noise_per_vertex[he_src]
@@ -1453,6 +1658,7 @@ def batched_physics_step(state, params, cheb_coeffs, key, n_substeps, growth_mod
 
         pos, _ = jax.lax.scan(xpbd_iter, pos, None, length=XPBD_ITERATIONS)
 
+        pos = project_ground(pos, st, params)
         st = st._replace(vertex_pos=pos)
 
         key, subkey = jax.random.split(key)
@@ -1478,6 +1684,48 @@ def batched_physics_step(state, params, cheb_coeffs, key, n_substeps, growth_mod
             vs = jnp.concatenate([ch0[:, None], ch_rest], axis=1)
             st = st._replace(vertex_state=vs)
             st = grow_intrinsic_lengths_bipolar(st, params, subkey)
+        elif growth_mode == 'phototropic':
+            active_f = (state.vertex_idx != -1).astype(jnp.float32)
+
+            light = compute_light_channel(st, params)
+            vs = st.vertex_state.at[:, 1].set(light)
+            st = st._replace(vertex_state=vs)
+
+            n_res = st.vertex_state.shape[1] - 2
+            on_ground = (state.vertex_idx != -1) & (
+                st.vertex_pos[:, 2] < params.ground_z + params.spring_len * 0.5
+            )
+            for ci in range(n_res):
+                ch = 2 + ci
+                s = st.vertex_state[:, ch]
+                s = (1.0 - params.resource_decay * params.state_dt) * s
+                st = st._replace(
+                    vertex_state=st.vertex_state.at[:, ch].set(s),
+                )
+                st = diffuse_channel(st, ch, params.resource_diffusion)
+                cur = st.vertex_state[:, ch]
+                refreshed = jnp.where(
+                    on_ground,
+                    jnp.maximum(cur, params.ground_source_value),
+                    cur,
+                )
+                st = st._replace(
+                    vertex_state=st.vertex_state.at[:, ch].set(refreshed),
+                )
+
+            tissue = st.vertex_state[:, 0]
+            nutrient = st.vertex_state[:, 2]
+            production = light * nutrient
+            head = 1.0 - tissue / params.tissue_saturation
+            tissue_next = tissue + params.state_dt * (
+                production * head - params.tissue_decay * tissue
+            )
+            tissue_next = jnp.clip(tissue_next, 0.0, 1.0) * active_f
+            st = st._replace(
+                vertex_state=st.vertex_state.at[:, 0].set(tissue_next),
+            )
+
+            st = grow_intrinsic_lengths_phototropic(st, params, subkey)
         else:
             raise ValueError(f"Unknown growth_mode: {growth_mode}")
 

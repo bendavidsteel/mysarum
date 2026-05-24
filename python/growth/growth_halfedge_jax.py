@@ -752,7 +752,60 @@ def _edge_flip_criterion(state, he):
     return should_flip, sin_sum
 
 
-REFINE_TOP_K = 256
+REFINE_TOP_K = 128
+
+
+def _refine_score_all(state):
+    """Vectorized violation score for every half-edge.
+
+    Mirrors _edge_flip_criterion but in batched form, written with explicit
+    array ops (rather than vmap) so XLA can fuse the elementwise chain into
+    fewer live intermediates.
+    """
+    he_twin = state.half_edge_twin
+    safe_twin = jnp.maximum(he_twin, 0)
+
+    he_next = state.half_edge_next
+    he_bc = he_next
+    he_ad = he_next[safe_twin]
+    safe_bc = jnp.maximum(he_bc, 0)
+    safe_ad = jnp.maximum(he_ad, 0)
+    he_ca = he_next[safe_bc]
+    he_db = he_next[safe_ad]
+    safe_ca = jnp.maximum(he_ca, 0)
+    safe_db = jnp.maximum(he_db, 0)
+
+    he_ilen = state.half_edge_intrinsic_len
+    lab = he_ilen
+    lbc = he_ilen[safe_bc]
+    lca = he_ilen[safe_ca]
+    lad = he_ilen[safe_ad]
+    ldb = he_ilen[safe_db]
+
+    lab2 = lab * lab
+    cos_c = (lca * lca + lbc * lbc - lab2) \
+        / jnp.maximum(2.0 * lca * lbc, EPSILON)
+    sin_c = jnp.sqrt(jnp.maximum(1.0 - cos_c * cos_c, 0.0))
+    cos_d = (lad * lad + ldb * ldb - lab2) \
+        / jnp.maximum(2.0 * lad * ldb, EPSILON)
+    sin_d = jnp.sqrt(jnp.maximum(1.0 - cos_d * cos_d, 0.0))
+    sin_sum = sin_c * cos_d + cos_c * sin_d
+
+    he_face = state.half_edge_face
+    he_dest = state.half_edge_dest
+    twin_dest = he_dest[safe_twin]
+
+    should_flip = (
+        (state.half_edge_idx >= 0)
+        & (he_face != -1)
+        & (he_twin >= 0)
+        & (he_face[safe_twin] != -1)
+        & (he_bc >= 0) & (he_ad >= 0)
+        & (he_ca >= 0) & (he_db >= 0)
+        & (he_dest < twin_dest)
+        & (sin_sum < -EPSILON)
+    )
+    return jnp.where(should_flip, -sin_sum, -jnp.inf)
 
 
 @jax.jit
@@ -764,11 +817,7 @@ def refine_mesh(state):
     against carry state (since earlier flips can invalidate neighbours).
     Edges that newly violate mid-pass get caught next call to refine_mesh.
     """
-    all_he = jnp.arange(MAX_HALF_EDGES, dtype=jnp.int32)
-    should_flip_all, sin_sum_all = jax.vmap(
-        _edge_flip_criterion, in_axes=(None, 0),
-    )(state, all_he)
-    score = jnp.where(should_flip_all, -sin_sum_all, -jnp.inf)
+    score = _refine_score_all(state)
     _, candidate_he = jax.lax.top_k(score, REFINE_TOP_K)
 
     def body(state, he):
@@ -1382,9 +1431,15 @@ def batched_physics_step(state, params, cheb_coeffs, key, n_substeps, growth_mod
             st = chebyshev_ca_step(st, cheb_coeffs, params)
         elif growth_mode == 'nca':
             st = nca_update(st, params)
-            ch0 = jax.nn.sigmoid(st.vertex_state[:, 0])
+            # ch0 → sigmoid (needed in [0,1] by grow_intrinsic_lengths).
+            # ch1..N: hard-clip wide enough not to interfere with normal dynamics
+            # but tight enough to stop untrained random-MLP runaway.
+            vs = st.vertex_state
+            ch0 = jax.nn.sigmoid(vs[:, 0])
             ch0 = ch0 * (state.vertex_idx != -1).astype(jnp.float32)
-            st = st._replace(vertex_state=st.vertex_state.at[:, 0].set(ch0))
+            ch_rest = jnp.clip(vs[:, 1:], -5.0, 5.0)
+            vs = jnp.concatenate([ch0[:, None], ch_rest], axis=1)
+            st = st._replace(vertex_state=vs)
         else:
             raise ValueError(f"Unknown growth_mode: {growth_mode}")
 

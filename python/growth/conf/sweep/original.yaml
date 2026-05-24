@@ -1,0 +1,20 @@
+# The original 12 hand-picked configs from the prior session — used to
+# directly compare Vendi scores against the stratified sweep.
+
+name: original
+
+configs:
+  # 6 disc/boundary + 4 sphere/random with default arch (2, 32, 8)
+  - {mlp_seed: 101, shape: disc, seed_pattern: boundary}
+  - {mlp_seed: 211, shape: disc, seed_pattern: boundary}
+  - {mlp_seed: 317, shape: disc, seed_pattern: boundary}
+  - {mlp_seed: 433, shape: disc, seed_pattern: boundary}
+  - {mlp_seed: 557, shape: disc, seed_pattern: boundary}
+  - {mlp_seed: 673, shape: disc, seed_pattern: boundary}
+  - {mlp_seed: 109, shape: sphere, seed_pattern: random}
+  - {mlp_seed: 331, shape: sphere, seed_pattern: random}
+  - {mlp_seed: 449, shape: sphere, seed_pattern: random}
+  - {mlp_seed: 691, shape: sphere, seed_pattern: random}
+  # Two odd-arch picks from the extension run
+  - {mlp_seed: 823, shape: disc, seed_pattern: boundary, mlp_layers: 3, hidden_dims: 12, state_dims: 6, mlp_scale: 0.6}
+  - {mlp_seed: 149, shape: sphere, seed_pattern: antipodal}

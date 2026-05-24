@@ -1,0 +1,8 @@
+# NCA sweep outputs — keep features.npz + index.json + gallery.png per run,
+# drop the per-config rendered tiles (regenerable via nca_sweep.py).
+outputs/*/imgs/
+outputs/*.log
+
+# Stale local galleries from older script iterations
+nca_gallery/
+nca_gallery_ext/

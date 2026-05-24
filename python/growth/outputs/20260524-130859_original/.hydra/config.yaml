@@ -1,0 +1,51 @@
+sweep:
+  name: original
+  configs:
+  - mlp_seed: 101
+    shape: disc
+    seed_pattern: boundary
+  - mlp_seed: 211
+    shape: disc
+    seed_pattern: boundary
+  - mlp_seed: 317
+    shape: disc
+    seed_pattern: boundary
+  - mlp_seed: 433
+    shape: disc
+    seed_pattern: boundary
+  - mlp_seed: 557
+    shape: disc
+    seed_pattern: boundary
+  - mlp_seed: 673
+    shape: disc
+    seed_pattern: boundary
+  - mlp_seed: 109
+    shape: sphere
+    seed_pattern: random
+  - mlp_seed: 331
+    shape: sphere
+    seed_pattern: random
+  - mlp_seed: 449
+    shape: sphere
+    seed_pattern: random
+  - mlp_seed: 691
+    shape: sphere
+    seed_pattern: random
+  - mlp_seed: 823
+    shape: disc
+    seed_pattern: boundary
+    mlp_layers: 3
+    hidden_dims: 12
+    state_dims: 6
+    mlp_scale: 0.6
+  - mlp_seed: 149
+    shape: sphere
+    seed_pattern: antipodal
+out_dir: outputs/${now:%Y%m%d-%H%M%S}_${sweep.name}
+frames: 100
+substeps: 10
+resolution: 384
+max_edge_len: 50.0
+max_splits: 15
+n_pick: 12
+compare_to: /home/ben/Projects/personal/repos/mysarum/python/growth/outputs/stratified-baseline/features.npz

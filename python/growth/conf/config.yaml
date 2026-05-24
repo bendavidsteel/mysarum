@@ -1,0 +1,25 @@
+defaults:
+  - sweep: stratified
+  - _self_
+
+# Where outputs land. Hydra also adds its own ${hydra.run.dir}.
+out_dir: outputs/${now:%Y%m%d-%H%M%S}_${sweep.name}
+
+# Simulation parameters
+frames: 100
+substeps: 10
+resolution: 384
+max_edge_len: 50.0
+max_splits: 15
+
+# Selection / curation
+n_pick: 12
+
+# Optional: features.npz from a previous sweep, used by compare mode
+compare_to: null
+
+hydra:
+  run:
+    dir: ${out_dir}
+  job:
+    chdir: false

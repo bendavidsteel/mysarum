@@ -1,0 +1,35 @@
+[2026-05-24 13:08:59,870][nca-sweep][INFO] - Sweep 'original': 12 configs, frames=100 res=384
+[2026-05-24 13:08:59,870][nca-sweep][INFO] - [1/12] 000_s0101_disc_boundary_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:09:50,909][nca-sweep][INFO] -   ok nv=62 49.0s
+[2026-05-24 13:09:50,909][nca-sweep][INFO] - [2/12] 001_s0211_disc_boundary_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:10:39,404][nca-sweep][INFO] -   ok nv=69 48.4s
+[2026-05-24 13:10:39,404][nca-sweep][INFO] - [3/12] 002_s0317_disc_boundary_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:11:23,828][nca-sweep][INFO] -   ok nv=61 44.4s
+[2026-05-24 13:11:23,828][nca-sweep][INFO] - [4/12] 003_s0433_disc_boundary_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:12:41,132][nca-sweep][INFO] -   ok nv=125 77.2s
+[2026-05-24 13:12:41,132][nca-sweep][INFO] - [5/12] 004_s0557_disc_boundary_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:13:59,995][nca-sweep][INFO] -   ok nv=140 78.8s
+[2026-05-24 13:13:59,995][nca-sweep][INFO] - [6/12] 005_s0673_disc_boundary_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:14:54,954][nca-sweep][INFO] -   ok nv=83 54.9s
+[2026-05-24 13:14:54,955][nca-sweep][INFO] - [7/12] 006_s0109_sphere_random_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:15:56,156][nca-sweep][INFO] -   ok nv=94 61.0s
+[2026-05-24 13:15:56,156][nca-sweep][INFO] - [8/12] 007_s0331_sphere_random_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:16:52,817][nca-sweep][INFO] -   ok nv=87 56.6s
+[2026-05-24 13:16:52,817][nca-sweep][INFO] - [9/12] 008_s0449_sphere_random_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:17:53,667][nca-sweep][INFO] -   ok nv=96 60.8s
+[2026-05-24 13:17:53,668][nca-sweep][INFO] - [10/12] 009_s0691_sphere_random_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:18:53,715][nca-sweep][INFO] -   ok nv=94 60.0s
+[2026-05-24 13:18:53,715][nca-sweep][INFO] - [11/12] 010_s0823_disc_boundary_L3H12S6_dt0.07_gr5.0
+[2026-05-24 13:19:46,493][nca-sweep][INFO] -   ok nv=66 51.6s
+[2026-05-24 13:19:46,493][nca-sweep][INFO] - [12/12] 011_s0149_sphere_antipodal_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:20:53,646][nca-sweep][INFO] -   ok nv=107 66.5s
+[2026-05-24 13:20:53,647][nca-sweep][INFO] - ============================================================
+[2026-05-24 13:20:53,647][nca-sweep][INFO] - Sweep 'original' Vendi score (12 items): 3.103
+[2026-05-24 13:20:53,648][nca-sweep][INFO] - Top-12 diversity picks Vendi: 3.103
+[2026-05-24 13:20:53,891][nca-sweep][INFO] - Saved gallery to outputs/20260524-130859_original/gallery.png
+[2026-05-24 13:20:53,893][nca-sweep][INFO] - ============================================================
+[2026-05-24 13:20:53,893][nca-sweep][INFO] - Comparison:
+[2026-05-24 13:20:53,893][nca-sweep][INFO] -   this sweep ('original', n=12): Vendi=3.103
+[2026-05-24 13:20:53,893][nca-sweep][INFO] -   this top-12 picks:           Vendi=3.103
+[2026-05-24 13:20:53,893][nca-sweep][INFO] -   previous (/home/ben/Projects/personal/repos/mysarum/python/growth/outputs/stratified-baseline/features.npz, n=34):         Vendi=3.378
+[2026-05-24 13:20:53,893][nca-sweep][INFO] - Done: 12 ok, 0 skipped

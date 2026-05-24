@@ -1386,6 +1386,34 @@ def grow_intrinsic_lengths(state, params, key):
     return state._replace(half_edge_intrinsic_len=new_intrinsic)
 
 
+def grow_intrinsic_lengths_bipolar(state, params, key):
+    """Bipolar growth: ch0 in [-1, 1] drives signed length change. Negative
+    regions shrink; positive regions grow. Allows folds / buckling that the
+    one-sided variant cannot reach.
+
+    Lengths clamped to [0.3, 3.0] * spring_len to prevent degenerate edges.
+    """
+    he_valid = state.half_edge_idx != -1
+    safe_twin = jnp.clip(state.half_edge_twin, 0)
+    safe_dest = jnp.clip(state.half_edge_dest, 0)
+    he_src = safe_dest[safe_twin]
+
+    s = state.vertex_state[he_src, 0]
+    grow = jnp.sign(s) * jnp.abs(s) ** 1.5
+
+    noise_per_vertex = 0.5 + jax.random.uniform(key, (MAX_VERTICES,))
+    noise = noise_per_vertex[he_src]
+
+    delta = grow * noise * params.state_dt * params.growth_rate
+    delta = jnp.where(he_valid, delta, 0.0)
+
+    new_intrinsic = state.half_edge_intrinsic_len + delta
+    new_intrinsic = jnp.clip(
+        new_intrinsic, params.spring_len * 0.3, params.spring_len * 3.0,
+    )
+    return state._replace(half_edge_intrinsic_len=new_intrinsic)
+
+
 # ── Combined XPBD Physics Step ──────────────────────────────────────────────
 
 XPBD_ITERATIONS = 10  # static for JIT compatibility
@@ -1427,24 +1455,31 @@ def batched_physics_step(state, params, cheb_coeffs, key, n_substeps, growth_mod
 
         st = st._replace(vertex_pos=pos)
 
+        key, subkey = jax.random.split(key)
+
         if growth_mode == 'lenia':
             st = chebyshev_ca_step(st, cheb_coeffs, params)
+            st = grow_intrinsic_lengths(st, params, subkey)
         elif growth_mode == 'nca':
             st = nca_update(st, params)
-            # ch0 → sigmoid (needed in [0,1] by grow_intrinsic_lengths).
-            # ch1..N: hard-clip wide enough not to interfere with normal dynamics
-            # but tight enough to stop untrained random-MLP runaway.
             vs = st.vertex_state
             ch0 = jax.nn.sigmoid(vs[:, 0])
             ch0 = ch0 * (state.vertex_idx != -1).astype(jnp.float32)
             ch_rest = jnp.clip(vs[:, 1:], -5.0, 5.0)
             vs = jnp.concatenate([ch0[:, None], ch_rest], axis=1)
             st = st._replace(vertex_state=vs)
+            st = grow_intrinsic_lengths(st, params, subkey)
+        elif growth_mode == 'nca_bipolar':
+            st = nca_update(st, params)
+            vs = st.vertex_state
+            ch0 = jnp.tanh(vs[:, 0])
+            ch0 = ch0 * (state.vertex_idx != -1).astype(jnp.float32)
+            ch_rest = jnp.clip(vs[:, 1:], -5.0, 5.0)
+            vs = jnp.concatenate([ch0[:, None], ch_rest], axis=1)
+            st = st._replace(vertex_state=vs)
+            st = grow_intrinsic_lengths_bipolar(st, params, subkey)
         else:
             raise ValueError(f"Unknown growth_mode: {growth_mode}")
-
-        key, subkey = jax.random.split(key)
-        st = grow_intrinsic_lengths(st, params, subkey)
 
         return (st.vertex_pos, st.vertex_state,
                 st.half_edge_intrinsic_len, key), None

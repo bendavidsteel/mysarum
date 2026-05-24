@@ -1,0 +1,61 @@
+[2026-05-24 13:26:44,418][nca-sweep][INFO] - Sweep 'bipolar': 25 configs, frames=100 res=384
+[2026-05-24 13:26:44,419][nca-sweep][INFO] - [1/25] 000_s0101_disc_boundary_L1H16S4_dt0.07_gr5.0
+[2026-05-24 13:27:48,344][nca-sweep][INFO] -   ok nv=89 62.1s
+[2026-05-24 13:27:48,344][nca-sweep][INFO] - [2/25] 001_s0101_disc_boundary_L1H32S8_dt0.07_gr5.0
+[2026-05-24 13:28:49,347][nca-sweep][INFO] -   ok nv=89 60.5s
+[2026-05-24 13:28:49,347][nca-sweep][INFO] - [3/25] 002_s0101_disc_boundary_L2H64S12_dt0.07_gr5.0
+[2026-05-24 13:29:41,438][nca-sweep][INFO] -   ok nv=67 51.3s
+[2026-05-24 13:29:41,438][nca-sweep][INFO] - [4/25] 003_s0101_disc_boundary_L3H32S8_dt0.07_gr5.0
+[2026-05-24 13:31:13,125][nca-sweep][INFO] -   ok nv=158 90.8s
+[2026-05-24 13:31:13,125][nca-sweep][INFO] - [5/25] 004_s0101_disc_boundary_L4H32S8_dt0.07_gr5.0
+[2026-05-24 13:32:44,577][nca-sweep][INFO] -   ok nv=166 91.3s
+[2026-05-24 13:32:44,577][nca-sweep][INFO] - [6/25] 005_s0101_disc_boundary_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:33:31,809][nca-sweep][INFO] -   ok nv=61 47.2s
+[2026-05-24 13:33:31,809][nca-sweep][INFO] - [7/25] 006_s0557_disc_boundary_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:34:55,171][nca-sweep][INFO] -   ok nv=159 83.3s
+[2026-05-24 13:34:55,171][nca-sweep][INFO] - [8/25] 007_s0101_disc_multi3_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:35:40,767][nca-sweep][INFO] -   ok nv=61 44.4s
+[2026-05-24 13:35:40,767][nca-sweep][INFO] - [9/25] 008_s0557_disc_multi3_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:37:07,220][nca-sweep][INFO] -   ok nv=161 86.4s
+[2026-05-24 13:37:07,220][nca-sweep][INFO] - [10/25] 009_s0101_disc_gradient_z_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:37:51,858][nca-sweep][INFO] -   ok nv=61 44.3s
+[2026-05-24 13:37:51,858][nca-sweep][INFO] - [11/25] 010_s0557_disc_gradient_z_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:39:16,161][nca-sweep][INFO] -   ok nv=158 84.2s
+[2026-05-24 13:39:16,161][nca-sweep][INFO] - [12/25] 011_s0109_sphere_random_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:40:06,042][nca-sweep][INFO] -   ok nv=73 49.7s
+[2026-05-24 13:40:06,042][nca-sweep][INFO] - [13/25] 012_s0449_sphere_random_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:41:12,123][nca-sweep][INFO] -   ok nv=103 66.0s
+[2026-05-24 13:41:12,123][nca-sweep][INFO] - [14/25] 013_s0109_sphere_antipodal_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:42:00,087][nca-sweep][INFO] -   ok nv=69 47.9s
+[2026-05-24 13:42:00,087][nca-sweep][INFO] - [15/25] 014_s0449_sphere_antipodal_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:42:58,944][nca-sweep][INFO] -   ok nv=91 58.8s
+[2026-05-24 13:42:58,944][nca-sweep][INFO] - [16/25] 015_s0109_sphere_multi3_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:43:53,875][nca-sweep][INFO] -   ok nv=82 54.5s
+[2026-05-24 13:43:53,875][nca-sweep][INFO] - [17/25] 016_s0449_sphere_multi3_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:45:00,352][nca-sweep][INFO] -   ok nv=106 66.4s
+[2026-05-24 13:45:00,352][nca-sweep][INFO] - [18/25] 017_s0109_sphere_gradient_z_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:45:48,613][nca-sweep][INFO] -   ok nv=70 48.2s
+[2026-05-24 13:45:48,613][nca-sweep][INFO] - [19/25] 018_s0449_sphere_gradient_z_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:46:50,467][nca-sweep][INFO] -   ok nv=98 61.8s
+[2026-05-24 13:46:50,468][nca-sweep][INFO] - [20/25] 019_s0109_sphere_ring_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:47:39,688][nca-sweep][INFO] -   ok nv=72 49.1s
+[2026-05-24 13:47:39,689][nca-sweep][INFO] - [21/25] 020_s0449_sphere_ring_L2H32S8_dt0.07_gr5.0
+[2026-05-24 13:48:39,581][nca-sweep][INFO] -   ok nv=94 59.8s
+[2026-05-24 13:48:39,581][nca-sweep][INFO] - [22/25] 021_s0211_disc_boundary_L2H32S8_dt0.04_gr5.0
+[2026-05-24 13:49:25,100][nca-sweep][INFO] -   ok nv=63 45.5s
+[2026-05-24 13:49:25,100][nca-sweep][INFO] - [23/25] 022_s0211_disc_boundary_L2H32S8_dt0.10_gr5.0
+[2026-05-24 13:50:37,803][nca-sweep][INFO] -   ok nv=119 72.6s
+[2026-05-24 13:50:37,803][nca-sweep][INFO] - [24/25] 023_s0109_sphere_random_L2H32S8_dt0.07_gr3.0
+[2026-05-24 13:51:24,214][nca-sweep][INFO] -   ok nv=66 46.4s
+[2026-05-24 13:51:24,214][nca-sweep][INFO] - [25/25] 024_s0109_sphere_random_L2H32S8_dt0.07_gr8.0
+[2026-05-24 13:52:29,759][nca-sweep][INFO] -   ok nv=105 65.5s
+[2026-05-24 13:52:29,762][nca-sweep][INFO] - ============================================================
+[2026-05-24 13:52:29,762][nca-sweep][INFO] - Sweep 'bipolar' Vendi score (25 items): 4.119
+[2026-05-24 13:52:29,763][nca-sweep][INFO] - Top-12 diversity picks Vendi: 3.811
+[2026-05-24 13:52:30,067][nca-sweep][INFO] - Saved gallery to outputs/20260524-132644_bipolar/gallery.png
+[2026-05-24 13:52:30,068][nca-sweep][INFO] - ============================================================
+[2026-05-24 13:52:30,068][nca-sweep][INFO] - Comparison:
+[2026-05-24 13:52:30,069][nca-sweep][INFO] -   this sweep ('bipolar', n=25): Vendi=4.119
+[2026-05-24 13:52:30,069][nca-sweep][INFO] -   this top-12 picks:           Vendi=3.811
+[2026-05-24 13:52:30,069][nca-sweep][INFO] -   previous (/home/ben/Projects/personal/repos/mysarum/python/growth/outputs/stratified-baseline/features.npz, n=34):         Vendi=3.378
+[2026-05-24 13:52:30,069][nca-sweep][INFO] - Done: 25 ok, 0 skipped

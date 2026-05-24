@@ -1,0 +1,130 @@
+sweep:
+  name: bipolar
+  configs:
+  - mlp_seed: 101
+    shape: disc
+    seed_pattern: boundary
+    mlp_layers: 1
+    hidden_dims: 16
+    state_dims: 4
+    growth_mode: nca_bipolar
+  - mlp_seed: 101
+    shape: disc
+    seed_pattern: boundary
+    mlp_layers: 1
+    hidden_dims: 32
+    state_dims: 8
+    growth_mode: nca_bipolar
+  - mlp_seed: 101
+    shape: disc
+    seed_pattern: boundary
+    mlp_layers: 2
+    hidden_dims: 64
+    state_dims: 12
+    growth_mode: nca_bipolar
+  - mlp_seed: 101
+    shape: disc
+    seed_pattern: boundary
+    mlp_layers: 3
+    hidden_dims: 32
+    state_dims: 8
+    growth_mode: nca_bipolar
+  - mlp_seed: 101
+    shape: disc
+    seed_pattern: boundary
+    mlp_layers: 4
+    hidden_dims: 32
+    state_dims: 8
+    growth_mode: nca_bipolar
+  - mlp_seed: 101
+    shape: disc
+    seed_pattern: boundary
+    growth_mode: nca_bipolar
+  - mlp_seed: 557
+    shape: disc
+    seed_pattern: boundary
+    growth_mode: nca_bipolar
+  - mlp_seed: 101
+    shape: disc
+    seed_pattern: multi3
+    growth_mode: nca_bipolar
+  - mlp_seed: 557
+    shape: disc
+    seed_pattern: multi3
+    growth_mode: nca_bipolar
+  - mlp_seed: 101
+    shape: disc
+    seed_pattern: gradient_z
+    growth_mode: nca_bipolar
+  - mlp_seed: 557
+    shape: disc
+    seed_pattern: gradient_z
+    growth_mode: nca_bipolar
+  - mlp_seed: 109
+    shape: sphere
+    seed_pattern: random
+    growth_mode: nca_bipolar
+  - mlp_seed: 449
+    shape: sphere
+    seed_pattern: random
+    growth_mode: nca_bipolar
+  - mlp_seed: 109
+    shape: sphere
+    seed_pattern: antipodal
+    growth_mode: nca_bipolar
+  - mlp_seed: 449
+    shape: sphere
+    seed_pattern: antipodal
+    growth_mode: nca_bipolar
+  - mlp_seed: 109
+    shape: sphere
+    seed_pattern: multi3
+    growth_mode: nca_bipolar
+  - mlp_seed: 449
+    shape: sphere
+    seed_pattern: multi3
+    growth_mode: nca_bipolar
+  - mlp_seed: 109
+    shape: sphere
+    seed_pattern: gradient_z
+    growth_mode: nca_bipolar
+  - mlp_seed: 449
+    shape: sphere
+    seed_pattern: gradient_z
+    growth_mode: nca_bipolar
+  - mlp_seed: 109
+    shape: sphere
+    seed_pattern: ring
+    growth_mode: nca_bipolar
+  - mlp_seed: 449
+    shape: sphere
+    seed_pattern: ring
+    growth_mode: nca_bipolar
+  - mlp_seed: 211
+    shape: disc
+    seed_pattern: boundary
+    state_dt: 0.04
+    growth_mode: nca_bipolar
+  - mlp_seed: 211
+    shape: disc
+    seed_pattern: boundary
+    state_dt: 0.1
+    growth_mode: nca_bipolar
+  - mlp_seed: 109
+    shape: sphere
+    seed_pattern: random
+    growth_rate: 3.0
+    growth_mode: nca_bipolar
+  - mlp_seed: 109
+    shape: sphere
+    seed_pattern: random
+    growth_rate: 8.0
+    growth_mode: nca_bipolar
+out_dir: outputs/${now:%Y%m%d-%H%M%S}_${sweep.name}
+frames: 100
+substeps: 10
+resolution: 384
+max_edge_len: 50.0
+max_splits: 15
+n_pick: 12
+compare_to: /home/ben/Projects/personal/repos/mysarum/python/growth/outputs/stratified-baseline/features.npz

@@ -1,0 +1,37 @@
+# Bipolar growth coupling: ch0 → tanh maps to [-1, 1] and drives signed
+# edge-length change. Allows folds and indentations the one-sided coupling
+# cannot reach. Run the same stratified spread as `stratified.yaml`.
+
+name: bipolar
+
+configs:
+  # ── A: vary architecture, fix disc/boundary ──
+  - {mlp_seed: 101, shape: disc, seed_pattern: boundary, mlp_layers: 1, hidden_dims: 16, state_dims: 4, growth_mode: nca_bipolar}
+  - {mlp_seed: 101, shape: disc, seed_pattern: boundary, mlp_layers: 1, hidden_dims: 32, state_dims: 8, growth_mode: nca_bipolar}
+  - {mlp_seed: 101, shape: disc, seed_pattern: boundary, mlp_layers: 2, hidden_dims: 64, state_dims: 12, growth_mode: nca_bipolar}
+  - {mlp_seed: 101, shape: disc, seed_pattern: boundary, mlp_layers: 3, hidden_dims: 32, state_dims: 8, growth_mode: nca_bipolar}
+  - {mlp_seed: 101, shape: disc, seed_pattern: boundary, mlp_layers: 4, hidden_dims: 32, state_dims: 8, growth_mode: nca_bipolar}
+  # ── B: vary seed pattern on disc ──
+  - {mlp_seed: 101, shape: disc, seed_pattern: boundary, growth_mode: nca_bipolar}
+  - {mlp_seed: 557, shape: disc, seed_pattern: boundary, growth_mode: nca_bipolar}
+  - {mlp_seed: 101, shape: disc, seed_pattern: multi3, growth_mode: nca_bipolar}
+  - {mlp_seed: 557, shape: disc, seed_pattern: multi3, growth_mode: nca_bipolar}
+  - {mlp_seed: 101, shape: disc, seed_pattern: gradient_z, growth_mode: nca_bipolar}
+  - {mlp_seed: 557, shape: disc, seed_pattern: gradient_z, growth_mode: nca_bipolar}
+  # ── C: sphere variants ──
+  - {mlp_seed: 109, shape: sphere, seed_pattern: random, growth_mode: nca_bipolar}
+  - {mlp_seed: 449, shape: sphere, seed_pattern: random, growth_mode: nca_bipolar}
+  - {mlp_seed: 109, shape: sphere, seed_pattern: antipodal, growth_mode: nca_bipolar}
+  - {mlp_seed: 449, shape: sphere, seed_pattern: antipodal, growth_mode: nca_bipolar}
+  - {mlp_seed: 109, shape: sphere, seed_pattern: multi3, growth_mode: nca_bipolar}
+  - {mlp_seed: 449, shape: sphere, seed_pattern: multi3, growth_mode: nca_bipolar}
+  - {mlp_seed: 109, shape: sphere, seed_pattern: gradient_z, growth_mode: nca_bipolar}
+  - {mlp_seed: 449, shape: sphere, seed_pattern: gradient_z, growth_mode: nca_bipolar}
+  - {mlp_seed: 109, shape: sphere, seed_pattern: ring, growth_mode: nca_bipolar}
+  - {mlp_seed: 449, shape: sphere, seed_pattern: ring, growth_mode: nca_bipolar}
+  # ── D: vary state_dt with bipolar ──
+  - {mlp_seed: 211, shape: disc, seed_pattern: boundary, state_dt: 0.04, growth_mode: nca_bipolar}
+  - {mlp_seed: 211, shape: disc, seed_pattern: boundary, state_dt: 0.10, growth_mode: nca_bipolar}
+  # ── E: vary growth_rate ──
+  - {mlp_seed: 109, shape: sphere, seed_pattern: random, growth_rate: 3.0, growth_mode: nca_bipolar}
+  - {mlp_seed: 109, shape: sphere, seed_pattern: random, growth_rate: 8.0, growth_mode: nca_bipolar}

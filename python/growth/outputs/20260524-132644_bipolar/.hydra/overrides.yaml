@@ -1,0 +1,2 @@
+- sweep=bipolar
+- compare_to=/home/ben/Projects/personal/repos/mysarum/python/growth/outputs/stratified-baseline/features.npz

@@ -124,6 +124,7 @@ CONFIG_DEFAULTS = dict(
     mlp_seed=101, shape="disc", seed_pattern="boundary",
     mlp_layers=2, hidden_dims=32, state_dims=8,
     mlp_scale=0.5, state_dt=0.07, growth_rate=5.0,
+    growth_mode="nca",
     rings=4, sphere_lat=6, sphere_lon=10, sphere_radius_mult=2.0,
 )
 
@@ -169,7 +170,9 @@ def run_one(cfg, frames, substeps, resolution, max_edge_len, max_splits, rendere
     growth = [nv]
     t0 = time.time()
     for _ in range(n_iters):
-        state, key = _jit_physics_step(state, params, cheb_coeffs, key, substeps, "nca")
+        state, key = _jit_physics_step(
+            state, params, cheb_coeffs, key, substeps, cfg["growth_mode"],
+        )
         state, key, nv = g.split_long_edges(state, params, key, max_splits=max_splits)
         state = g.refine_mesh(state)
         growth.append(int(nv))

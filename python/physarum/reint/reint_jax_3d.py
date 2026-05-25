@@ -8,10 +8,21 @@ State: per-voxel particle (X, V, M) on a (D, H, W) grid.
   Arrays indexed [z, y, x].
 
 One step = reintegrate (mass-conservative advection over 5x5x5 stencil)
-         then simulate (SPH pressure + 4-tap 3D sense + border + integrate).
+         + simulate  (SPH pressure + sense + border + integrate, parameterized)
+         + update_trail (decay + deposit).
+
+Agent behaviour is parameterized in the style of Sage Jenson's "36 Points"
+(https://sagejenson.com/36points): each per-cell quantity Q is computed as
+
+    Q = Q_base + Q_scale * trail ^ Q_power
+
+where `trail` is the local trail-chemical value. With Q_scale=0 the parameter
+reduces to a constant Q_base. With Q_scale>0 the agents become more sensitive
+in dense regions — Sage's "primary special sauce". Pass a PhysarumParams to
+`step` / `main(preset=...)`.
 
 Rendering: MIP along an axis (fast preview), or orthographic ray-march with
-trilinear sampling and emission-absorption compositing along the ray.
+trilinear sampling, MIP or emission-absorption compositing along the ray.
 
 Run from the Python loop with async dispatch — fori_loop is slower on this
 hardware (see memory note `feedback_jax_fori_loop_slow`).
@@ -29,17 +40,101 @@ import jax.numpy as jnp
 import numpy as np
 
 
-# --- constants (mirror common.glsl; gravity now along -z) -------------------
+# --- physics constants (advection / SPH / border; not per-agent) ------------
 DT = 1.5
 MASS = 2.0
 FLUID_RHO = 0.2
 DIF = 1.3
-SENSE_ANG = 0.4
-SENSE_DIS = 2.5
-SENSE_FORCE = 0.1
 ACCELERATION = 0.01
 BORDER_H = 5.0
 GRAVITY = 0.001
+
+
+# --- agent-behaviour parameters (Sage Jenson "36 Points" style) -------------
+
+class PhysarumParams(NamedTuple):
+    """Per-cell agent behaviour, modulated by local trail concentration.
+
+    For each Q in (sd, sa, ra, md), the effective value at a cell is
+        Q = Q_base + Q_scale * trail ^ Q_power
+    so Q_scale=0 (or Q_power=0) gives a constant Q_base. trail is clamped
+    to a tiny positive minimum so the `pow` is well-defined.
+
+    sd : sensor distance (voxels)        — how far ahead each cone tap reads
+    sa : sensor cone half-angle (rad)    — wider = bigger 4-tap spread
+    ra : rotation/turn strength          — gain on the (right,up) sense force
+    md : move distance / max speed       — per-cell velocity cap (voxels/step)
+
+    sensor_offset_(right|up) : voxels    — bulk displacement of the 4 taps in
+        the local (right, up) frame (Sage's "secondary special sauce").
+
+    deposit : amount of mass added to trail each step.
+    decay   : multiplicative trail decay each step (1.0 = no decay).
+
+    NOTE: the reintegration stencil is 5×5×5 (±2 voxels), so md * DT must
+    stay below ~2.5 to preserve mass conservation. With DT=1.5, keep
+    md ≤ ~1.6 in steady state; otherwise mass leaks out of the stencil.
+    """
+    # Sensor distance (voxels)
+    sd_base: float = 3.0
+    sd_power: float = 0.0
+    sd_scale: float = 0.0
+    # Sensor cone half-angle (radians)
+    sa_base: float = 0.45
+    sa_power: float = 0.0
+    sa_scale: float = 0.0
+    # Rotation/turn strength
+    ra_base: float = 0.2
+    ra_power: float = 0.0
+    ra_scale: float = 0.0
+    # Move distance / max speed (voxels/step)
+    md_base: float = 1.0
+    md_power: float = 0.0
+    md_scale: float = 0.0
+    # Sensor offsets in the local (right, up) frame, voxels
+    sensor_offset_right: float = 0.0
+    sensor_offset_up: float = 0.0
+    # Trail deposit (added each step from mass)
+    deposit: float = 0.15
+    # Trail decay (multiplied each step; 1.0 = no decay)
+    decay: float = 0.94
+
+
+def param_value(base, power, scale, trail):
+    """Sage-style trail-modulated parameter: base + scale * trail^power.
+    `trail` is an array; output broadcasts to the same shape."""
+    return base + scale * jnp.power(jnp.maximum(trail, 1e-9), power)
+
+
+PRESETS = {
+    # constant behaviour everywhere — close to the pre-parameterized defaults
+    "default": PhysarumParams(),
+    # agents reach further and turn harder where trail is dense → branching webs
+    "weblike": PhysarumParams(
+        sd_base=2.0, sd_scale=3.0, sd_power=1.0,
+        sa_base=0.35, sa_scale=0.4, sa_power=1.5,
+        ra_base=0.15, ra_scale=0.6, ra_power=1.5,
+        md_base=1.0,
+        deposit=0.2, decay=0.93,
+    ),
+    # tight angles + strong rotation → thin filamentary tendrils
+    "tendrils": PhysarumParams(
+        sd_base=2.5, sd_scale=2.0, sd_power=2.0,
+        sa_base=0.25,
+        ra_base=0.4,
+        md_base=0.9,
+        deposit=0.25, decay=0.92,
+    ),
+    # offset sensors break symmetry → spiral / chiral patterns
+    "spiral": PhysarumParams(
+        sd_base=3.0, sd_scale=1.5, sd_power=1.0,
+        sa_base=0.5,
+        ra_base=0.3,
+        md_base=1.0,
+        sensor_offset_right=0.8, sensor_offset_up=0.0,
+        deposit=0.18, decay=0.95,
+    ),
+}
 
 
 class State3D(NamedTuple):
@@ -210,16 +305,26 @@ def reintegrate(state: State3D) -> State3D:
     X_rel = X_acc * inv_m
     V_new = V_acc * inv_m
     X_new = pos + jnp.clip(X_rel, -0.5, 0.5)
-    M_new = jnp.stack([M_acc, M_acc], axis=-1)
+    # Trail is NOT advected — it's a static chemical field that decays in
+    # place and is replenished by mass deposit in update_trail().
+    M_new = jnp.stack([M_acc, M[..., 1]], axis=-1)
     return State3D(X_new, V_new, M_new)
 
 
 # --- simulation: SPH forces + 4-tap 3D sense + border + integrate -----------
 
-def simulate(state: State3D) -> State3D:
+def simulate(state: State3D, params: PhysarumParams) -> State3D:
     X, V, M = state
     D, H, W = X.shape[:3]
     R = jnp.array([W, H, D], dtype=jnp.float32)
+
+    # Per-cell trail modulates per-cell sensor / rotation / move parameters
+    # (Sage's "primary special sauce" applied at the agent's own location).
+    sv = M[..., 1]
+    sd = param_value(params.sd_base, params.sd_power, params.sd_scale, sv)
+    sa = param_value(params.sa_base, params.sa_power, params.sa_scale, sv)
+    ra = param_value(params.ra_base, params.ra_power, params.ra_scale, sv)
+    md = param_value(params.md_base, params.md_power, params.md_scale, sv)
 
     Xp = _wrap_pad_3d(X)
     Mp = _wrap_pad_3d(M)
@@ -242,21 +347,27 @@ def simulate(state: State3D) -> State3D:
     F = jax.lax.fori_loop(0, 5, dz_body,
                           jnp.zeros((D, H, W, 3), dtype=jnp.float32))
 
-    # 3D sense: 4 cone samples (±right, ±up) around forward.
+    # 3D sense: 4 cone samples (±right, ±up) around forward. Sensor angle
+    # and reach are now per-cell arrays driven by params + local trail.
     forward, right_b, up_b = basis_from_velocity(V)
-    ca, sa = jnp.cos(SENSE_ANG), jnp.sin(SENSE_ANG)
+    ca = jnp.cos(sa)[..., None]
+    sa_s = jnp.sin(sa)[..., None]
     fwd_part = forward * ca
-    dir_R = (fwd_part + right_b * sa) * SENSE_DIS
-    dir_L = (fwd_part - right_b * sa) * SENSE_DIS
-    dir_U = (fwd_part + up_b * sa) * SENSE_DIS
-    dir_D = (fwd_part - up_b * sa) * SENSE_DIS
+    sd_e = sd[..., None]
+    # Secondary "sauce": pre-displace all 4 sample positions in (right, up).
+    sense_origin = X + (right_b * params.sensor_offset_right
+                        + up_b * params.sensor_offset_up)
+    dir_R = (fwd_part + right_b * sa_s) * sd_e
+    dir_L = (fwd_part - right_b * sa_s) * sd_e
+    dir_U = (fwd_part + up_b * sa_s) * sd_e
+    dir_D = (fwd_part - up_b * sa_s) * sd_e
     trail = M[..., 1:2]
-    sd_R = trilinear_sample(trail, X + dir_R)[..., 0]
-    sd_L = trilinear_sample(trail, X + dir_L)[..., 0]
-    sd_U = trilinear_sample(trail, X + dir_U)[..., 0]
-    sd_D = trilinear_sample(trail, X + dir_D)[..., 0]
-    F = F + SENSE_FORCE * (right_b * (sd_R - sd_L)[..., None]
-                           + up_b * (sd_U - sd_D)[..., None])
+    sR = trilinear_sample(trail, sense_origin + dir_R)[..., 0]
+    sL = trilinear_sample(trail, sense_origin + dir_L)[..., 0]
+    sU = trilinear_sample(trail, sense_origin + dir_U)[..., 0]
+    sDn = trilinear_sample(trail, sense_origin + dir_D)[..., 0]
+    F = F + ra[..., None] * (right_b * (sR - sL)[..., None]
+                             + up_b * (sU - sDn)[..., None])
 
     F = F - GRAVITY * M[..., 0:1] * jnp.array([0.0, 0.0, 1.0])
 
@@ -270,9 +381,11 @@ def simulate(state: State3D) -> State3D:
     V_new = V_new + bounce
     V_new = jnp.where((N_d < 0)[..., None], 0.0, V_new)
 
+    # Cap speed at per-cell move distance (replaces the old fixed 1.0 cap).
     V_new = V_new * (1.0 + ACCELERATION)
     speed = jnp.linalg.norm(V_new, axis=-1, keepdims=True)
-    V_new = V_new / jnp.maximum(speed, 1.0)
+    md_e = jnp.maximum(md[..., None], 1e-6)
+    V_new = V_new / jnp.maximum(speed / md_e, 1.0)
 
     live = (M[..., 0:1] > 1e-9).astype(jnp.float32)
     V_new = live * V_new + (1.0 - live) * V
@@ -280,8 +393,16 @@ def simulate(state: State3D) -> State3D:
     return State3D(X, V_new, M)
 
 
-def step(state: State3D) -> State3D:
-    return simulate(reintegrate(state))
+def update_trail(state: State3D, params: PhysarumParams) -> State3D:
+    """Decay then deposit. Replaces the old trail = mass coupling."""
+    X, V, M = state
+    mass = M[..., 0]
+    trail = M[..., 1] * params.decay + mass * params.deposit
+    return State3D(X, V, jnp.stack([mass, trail], axis=-1))
+
+
+def step(state: State3D, params: PhysarumParams) -> State3D:
+    return update_trail(simulate(reintegrate(state), params), params)
 
 
 # --- init -------------------------------------------------------------------
@@ -297,8 +418,9 @@ def init_state(key, D, H, W, radius_frac=0.18) -> State3D:
     rand = jax.random.uniform(key, (D, H, W, 3)) - 0.5
     X = pos
     V = jnp.where(in_sphere, 0.5 * rand, 0.0)
+    # Seed trail inside the sphere too — gives sensing signal on step 1.
     M = jnp.where(in_sphere,
-                  jnp.array([MASS, 0.0]),
+                  jnp.array([MASS, MASS * 0.1]),
                   jnp.array([1e-6, 0.0]))
     return State3D(X, V, M)
 
@@ -400,28 +522,29 @@ render_mip_jit = jax.jit(render_mip, static_argnames=("screen", "n_steps"))
 render_rm_jit = jax.jit(render_raymarch, static_argnames=("screen", "n_steps", "mode"))
 
 
-def benchmark(state, n=20):
-    state = step_jit(state); jax.block_until_ready(state.X)
+def benchmark(state, params, n=20):
+    state = step_jit(state, params); jax.block_until_ready(state.X)
     t0 = time.perf_counter()
     for _ in range(n):
-        state = step_jit(state)
+        state = step_jit(state, params)
     jax.block_until_ready(state.X)
     t1 = time.perf_counter()
     print(f"step: {(t1 - t0) * 1000 / n:.1f} ms/step  ({n} iters)")
     return state
 
 
-def main(D=128, H=128, W=128, frames=120, steps_per_frame=1, seed=0,
-         render_size=192, n_steps=128,
+def main(D=128, H=128, W=128, frames=80, steps_per_frame=4, seed=0,
+         render_size=192, n_steps=128, preset="weblike",
          out_mip="reint_3d_mip.gif", out_rm="reint_3d_raymarch.gif"):
+    params = PRESETS[preset] if isinstance(preset, str) else preset
     key = jax.random.PRNGKey(seed)
     state = init_state(key, D, H, W)
 
-    print(f"grid {D}x{H}x{W}, jit compiling...")
+    print(f"grid {D}x{H}x{W}, preset='{preset}', jit compiling...")
     t0 = time.perf_counter()
-    state = step_jit(state); jax.block_until_ready(state.X)
+    state = step_jit(state, params); jax.block_until_ready(state.X)
     print(f"  first step: {time.perf_counter() - t0:.1f} s (compile+exec)")
-    state = benchmark(state, n=10)
+    state = benchmark(state, params, n=10)
 
     # Two complementary orbits so the two GIFs reveal different facets:
     #   mip  — equatorial spin (phi=0), full 2π over the GIF.
@@ -429,7 +552,7 @@ def main(D=128, H=128, W=128, frames=120, steps_per_frame=1, seed=0,
     mips, rms = [], []
     for f in range(frames):
         for _ in range(steps_per_frame):
-            state = step_jit(state)
+            state = step_jit(state, params)
         theta_mip = 2 * jnp.pi * f / frames
         theta_rm = 0.6 + 0.02 * f
         mip = np.asarray(render_mip_jit(state,
@@ -444,6 +567,7 @@ def main(D=128, H=128, W=128, frames=120, steps_per_frame=1, seed=0,
         if (f + 1) % 20 == 0:
             print(f"  frame {f+1}/{frames}  "
                   f"mass={float(state.M[..., 0].sum()):.1f}  "
+                  f"trail={float(state.M[..., 1].sum()):.1f}  "
                   f"max|v|={float(jnp.abs(state.V).max()):.3f}")
 
     iio.imwrite(out_mip, mips, duration=60, loop=0)

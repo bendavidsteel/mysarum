@@ -1,0 +1,16 @@
+sd_base: 3.0
+sd_power: 0.0
+sd_scale: 0.0
+sa_base: 0.45
+sa_power: 0.0
+sa_scale: 0.0
+ra_base: 0.2
+ra_power: 0.0
+ra_scale: 0.0
+md_base: 1.0
+md_power: 0.0
+md_scale: 0.0
+sensor_offset_right: 0.0
+sensor_offset_up: 0.0
+deposit: 0.15
+decay: 0.94

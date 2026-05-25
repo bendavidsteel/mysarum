@@ -1,0 +1,47 @@
+defaults:
+  - preset: weblike
+  - _self_
+
+dim: 3
+# 2D: [H, W]   3D: [D, H, W]
+grid: [128, 128, 128]
+frames: 80
+steps_per_frame: 4
+seed: 0
+
+# 3D rendering
+render_size: 192
+n_steps: 128
+
+# Output filenames (resolved relative to hydra run dir)
+out_2d_gif: reint_2d.gif
+out_mip: reint_3d_mip.gif
+out_rm: reint_3d_raymarch.gif
+out_mask: reint_3d_volume.npy
+out_report: reint_3d_printability.csv
+out_stl: reint_3d_volume.stl
+
+# 3D printability sweep (run after the sim)
+printability:
+  enabled: true
+  r_min_voxels: 1.5
+  n_thresholds: 12
+  kept_fraction_min: 0.8
+  opening_ratio_min: 0.9
+  export_stl: true
+  voxel_size_mm: 0.4   # 128 voxels × 0.4 mm = 51.2 mm cube
+
+# MAP-Elites quality-diversity search (3D only)
+mapelites:
+  enabled: false
+  n_evals: 200
+  init_evals: 20         # uniform-random seeds before mutation kicks in
+  archive_shape: [10, 10]
+  bd_ranges:
+    opening_ratio: [0.0, 1.0]
+    edt_median: [0.0, 8.0]
+  mutation_sigma: 0.1    # fraction of each PARAM_BOUND span
+  grid: [64, 64, 64]     # smaller eval grid to keep wall time tractable
+  frames: 40
+  steps_per_frame: 2
+  r_min_voxels: 1.5

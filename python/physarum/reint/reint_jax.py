@@ -76,6 +76,10 @@ DIF = 1.3
 ACCELERATION = 0.01
 BORDER_H = 5.0
 GRAVITY = 0.001
+# Inward-pointing repulsive force per (mass × penetration-depth) near walls.
+# In addition to the hard-stop bounce — without it, mass slides along walls
+# and accumulates in corners because tangential motion is unopposed there.
+BORDER_REPULSION = 0.04
 
 
 # === agent-behaviour parameters (Sage Jenson "36 Points" style) =============
@@ -398,10 +402,14 @@ def simulate_2d(state: State2D, params: PhysarumParams) -> State2D:
 
     F = F - GRAVITY * M[..., 0:1] * jnp.array([0.0, 1.0])
 
+    # Inward-pointing repulsion + reflective bounce share the SDF query.
+    N_xy, N_z = border_normal_2d(X, R)
+    penetration = jnp.maximum(BORDER_H - N_z, 0.0)[..., None]
+    F = F + BORDER_REPULSION * M[..., 0:1] * penetration * N_xy
+
     inv_m = 1.0 / jnp.maximum(M[..., 0:1], 1e-12)
     V_new = V + F * DT * inv_m
 
-    N_xy, N_z = border_normal_2d(X, R)
     close = (N_z <= BORDER_H).astype(jnp.float32)[..., None]
     vdotN = close[..., 0] * jnp.sum(-N_xy * V_new, axis=-1)
     bounce = 0.5 * (N_xy * vdotN[..., None] + N_xy * jnp.abs(vdotN)[..., None])
@@ -581,10 +589,14 @@ def simulate_3d(state: State3D, params: PhysarumParams) -> State3D:
 
     F = F - GRAVITY * M[..., 0:1] * jnp.array([0.0, 0.0, 1.0])
 
+    # Inward-pointing repulsion + reflective bounce share the SDF query.
+    N_xyz, N_d = border_normal_3d(X, R)
+    penetration = jnp.maximum(BORDER_H - N_d, 0.0)[..., None]
+    F = F + BORDER_REPULSION * M[..., 0:1] * penetration * N_xyz
+
     inv_m = 1.0 / jnp.maximum(M[..., 0:1], 1e-12)
     V_new = V + F * DT * inv_m
 
-    N_xyz, N_d = border_normal_3d(X, R)
     close = (N_d <= BORDER_H).astype(jnp.float32)
     vdotN = close * jnp.sum(-N_xyz * V_new, axis=-1)
     bounce = 0.5 * (N_xyz * vdotN[..., None] + N_xyz * jnp.abs(vdotN)[..., None])
@@ -613,19 +625,41 @@ def step_3d(state: State3D, params: PhysarumParams) -> State3D:
     return update_trail_3d(simulate_3d(reintegrate_3d(state), params), params)
 
 
-def init_state_3d(key, D, H, W, radius_frac=0.18) -> State3D:
+def init_state_3d(key, D, H, W, radius_frac=0.22) -> State3D:
+    """Seed mass as a flat-bottom hemisphere centered on the bottom face.
+
+    Centre at (W/2, H/2, 0); the cube only contains z ≥ 0 so the full ball
+    is automatically clipped to its upper half — a dome sitting on the
+    z=0 plane. Gravity (−z) keeps it there, giving the agents a printable
+    base to grow from. radius_frac defaults higher than the old centered
+    sphere so the hemisphere holds comparable total mass.
+    """
     pos = position_grid_3d(D, H, W)
-    centre = jnp.array([W * 0.5, H * 0.5, D * 0.5])
-    r = jnp.linalg.norm(pos - centre, axis=-1) / max(D, H, W)
-    in_sphere = (r < radius_frac)[..., None]
+    radius = radius_frac * max(D, H, W)
+    centre = jnp.array([W * 0.5, H * 0.5, 0.0])
+    r = jnp.linalg.norm(pos - centre, axis=-1)
+    in_hemi = (r < radius)[..., None]
 
     rand = jax.random.uniform(key, (D, H, W, 3)) - 0.5
     X = pos
-    V = jnp.where(in_sphere, 0.5 * rand, 0.0)
-    M = jnp.where(in_sphere,
+    V = jnp.where(in_hemi, 0.5 * rand, 0.0)
+    M = jnp.where(in_hemi,
                   jnp.array([MASS, MASS * 0.1]),
                   jnp.array([1e-6, 0.0]))
     return State3D(X, V, M)
+
+
+def orbit_view(frame, n_frames, phi_amp=1.0):
+    """Camera (theta, phi) for an orbiting MIP gif.
+
+    theta sweeps one full revolution. phi oscillates as `phi_amp * sin(theta)`
+    so the camera tilts up/down once per revolution — the object's top is
+    visible near theta=π/2 and bottom near 3π/2. With phi_amp=1.0 rad (~57°)
+    we stay well below the gimbal at ±π/2.
+    """
+    theta = 2 * jnp.pi * frame / n_frames
+    phi = phi_amp * jnp.sin(theta)
+    return theta, phi
 
 
 def _colorize(mass_2d, trail_2d):
@@ -912,14 +946,18 @@ def _bd_cell(bd, archive_shape, bd_ranges):
 
 def _evaluate_params(params: PhysarumParams, grid, frames, steps_per_frame,
                      r_min_voxels, seed):
-    """Run a short 3D sim with `params`, return (fitness, (bd1, bd2), best_mask).
+    """Run a short 3D sim with `params`. Returns (fitness, (bd1, bd2),
+    best_mask, M_final).
 
     fitness = sa_to_vol at the best printable threshold, or -inf if no
     threshold was printable.
-    bd1 = opening_ratio,  bd2 = edt_median  at that threshold.
+    bd1 = opening_ratio, bd2 = edt_median at that threshold.
     Falls back to the threshold with the highest opening_ratio when nothing
-    is printable, so unprintable individuals still get a BD coordinate and
-    can occupy the archive cells where unprintable shapes live.
+    is printable, so unprintable individuals still get a BD coordinate.
+    M_final is the (D,H,W,2) (mass,trail) field as a host np.float32 array —
+    used downstream to render a rotating-MIP gif for printable archive cells.
+    Returned only when the individual is printable (None otherwise), to keep
+    the per-eval memory footprint bounded.
     """
     D, H, W = grid
     key = jax.random.PRNGKey(int(seed))
@@ -935,14 +973,14 @@ def _evaluate_params(params: PhysarumParams, grid, frames, steps_per_frame,
     if best_row is not None:
         return (best_row["sa_to_vol"],
                 (best_row["opening_ratio"], best_row["edt_median"]),
-                best_mask)
+                best_mask,
+                np.asarray(state.M))
 
-    # No printable threshold — use the row with the highest opening_ratio so
-    # we still get coordinates (BDs in this region indicate "almost printable").
     best_idx = int(df.select(pl.col("opening_ratio").arg_max()).item())
     fallback = df.row(best_idx, named=True)
     return (-float("inf"),
             (fallback["opening_ratio"], fallback["edt_median"]),
+            None,
             None)
 
 
@@ -982,7 +1020,7 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
             params = _mutate_params(rng, parent, float(me.mutation_sigma))
             origin = f"mut[{parent_cell[0]},{parent_cell[1]}]"
 
-        fitness, bd, mask = _evaluate_params(
+        fitness, bd, mask, M_final = _evaluate_params(
             params, grid, int(me.frames), int(me.steps_per_frame),
             float(me.r_min_voxels), int(cfg.seed) + i)
         cell = _bd_cell(bd, archive_shape, bd_ranges)
@@ -991,7 +1029,7 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
         replaced = cur is None or fitness > cur["fitness"]
         if replaced:
             archive[cell] = dict(params=params, fitness=fitness, bd=bd,
-                                 mask=mask, eval_idx=i)
+                                 mask=mask, M_final=M_final, eval_idx=i)
         elapsed = time.perf_counter() - t0
         rate = (i + 1) / max(elapsed, 1e-6)
         print(f"  eval {i+1:3d}/{me.n_evals} {origin:>14s}  "
@@ -999,8 +1037,12 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
               f"fit={fitness:7.3f}  archive={len(archive):3d}  "
               f"{rate:.2f} ev/s  {'*' if replaced else ''}")
 
-    # Persist final archive.
+    # Persist final archive: per-cell .npy + .stl + a rotating-MIP gif for
+    # every printable survivor, plus a single archive.csv with all params.
     rows = []
+    n_gif = 0
+    gif_screen = max(96, int(cfg.render_size) // 2)
+    gif_n_steps = max(64, int(cfg.n_steps) // 2)
     for (i, j), e in archive.items():
         d = dict(cell_i=i, cell_j=j,
                  opening_ratio=e["bd"][0], edt_median=e["bd"][1],
@@ -1013,6 +1055,26 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
             np.save(arch_dir / f"{stem}.npy", e["mask"])
             export_stl(e["mask"], arch_dir / f"{stem}.stl",
                        voxel_size_mm=float(cfg.printability.voxel_size_mm))
+            if e["M_final"] is not None:
+                M_jax = jnp.asarray(e["M_final"])
+                D_, H_, W_ = M_jax.shape[:3]
+                # render_mip walks state.X/V shapes but only samples state.M;
+                # pass dummy X/V of the right shape so the JIT cache reuses.
+                dummy = jnp.zeros((D_, H_, W_, 3), dtype=jnp.float32)
+                state = State3D(dummy, dummy, M_jax)
+                gif_frames = []
+                n_views = 24
+                for v in range(n_views):
+                    theta, phi = orbit_view(v, n_views, phi_amp=1.0)
+                    img = np.asarray(render_mip_jit(state,
+                                                    theta=float(theta),
+                                                    phi=float(phi),
+                                                    screen=gif_screen,
+                                                    n_steps=gif_n_steps))
+                    gif_frames.append((img * 255).astype(np.uint8))
+                iio.imwrite(arch_dir / f"{stem}.gif", gif_frames,
+                            duration=80, loop=0)
+                n_gif += 1
 
     df = pl.DataFrame(rows).sort("fitness", descending=True)
     df.write_csv(out_dir / "mapelites_archive.csv")
@@ -1020,7 +1082,7 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
           f"in {time.perf_counter() - t0:.1f}s — "
           f"wrote {out_dir / 'mapelites_archive.csv'} and "
           f"{arch_dir} ({sum(e['mask'] is not None for e in archive.values())} "
-          f"printable masks)")
+          f"printable masks, {n_gif} gifs)")
 
 
 # === Hydra entry ============================================================
@@ -1081,14 +1143,19 @@ def run_3d(cfg: DictConfig, params: PhysarumParams, out_dir: Path):
     for f in range(int(cfg.frames)):
         for _ in range(int(cfg.steps_per_frame)):
             state = step_3d_jit(state, params)
-        theta_mip = 2 * jnp.pi * f / cfg.frames
+        # MIP: full theta sweep + phi=sin(theta) so we see top & bottom too.
+        theta_mip, phi_mip = orbit_view(f, int(cfg.frames), phi_amp=1.0)
+        # RM: slower orbit, raised baseline phi, same sin variation.
         theta_rm = 0.6 + 0.02 * f
+        phi_rm = 0.5 + 0.8 * jnp.sin(theta_rm)
         mip = np.asarray(render_mip_jit(state,
-                                        theta=float(theta_mip), phi=0.0,
+                                        theta=float(theta_mip),
+                                        phi=float(phi_mip),
                                         screen=int(cfg.render_size),
                                         n_steps=int(cfg.n_steps)))
         rm = np.asarray(render_rm_jit(state,
-                                      theta=float(theta_rm), phi=0.5,
+                                      theta=float(theta_rm),
+                                      phi=float(phi_rm),
                                       screen=int(cfg.render_size),
                                       n_steps=int(cfg.n_steps),
                                       mode="mip"))

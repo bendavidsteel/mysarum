@@ -107,6 +107,10 @@ class PhysarumParams(NamedTuple):
 
     deposit : trail added each step from local mass.
     decay   : multiplicative trail decay each step (1.0 = no decay).
+    center_pull : spring constant for the linear pull back to the spawn
+        point (bottom-middle in 3D, geometric centre in 2D). 0 disables;
+        too strong collapses all mass to a tight blob and forbids the
+        thin / veiny end of the printable-shape spectrum.
 
     NOTE: the reintegration stencil is 5 voxels wide (±2), so md * DT must
     stay below ~2.5 to preserve mass conservation. With DT=1.5, keep
@@ -128,6 +132,7 @@ class PhysarumParams(NamedTuple):
     sensor_offset_up: float = 0.0
     deposit: float = 0.15
     decay: float = 0.94
+    center_pull: float = CENTER_PULL
 
 
 def param_value(base, power, scale, trail):
@@ -406,7 +411,7 @@ def simulate_2d(state: State2D, params: PhysarumParams) -> State2D:
 
     # Spring pull toward the spawn point (domain centre in 2D).
     centre_2d = jnp.array([W * 0.5, H * 0.5], dtype=jnp.float32)
-    F = F + CENTER_PULL * M[..., 0:1] * (centre_2d - X)
+    F = F + params.center_pull * M[..., 0:1] * (centre_2d - X)
 
     N_xy, N_z = border_normal_2d(X, R)
     inv_m = 1.0 / jnp.maximum(M[..., 0:1], 1e-12)
@@ -583,7 +588,7 @@ def simulate_3d(state: State3D, params: PhysarumParams) -> State3D:
 
     # Spring pull toward the spawn point at the bottom-middle of the cube.
     centre_3d = jnp.array([W * 0.5, H * 0.5, 0.0], dtype=jnp.float32)
-    F = F + CENTER_PULL * M[..., 0:1] * (centre_3d - X)
+    F = F + params.center_pull * M[..., 0:1] * (centre_3d - X)
 
     N_xyz, N_d = border_normal_3d(X, R)
     inv_m = 1.0 / jnp.maximum(M[..., 0:1], 1e-12)
@@ -910,6 +915,8 @@ PARAM_BOUNDS = dict(
     sensor_offset_up=(-1.0, 1.0),
     deposit=(0.05, 0.5),
     decay=(0.85, 0.99),
+    # 0 = no pull (allow thin/veiny shapes); ~0.006 = tight compact base.
+    center_pull=(0.0, 0.006),
 )
 PARAM_FIELDS = list(PARAM_BOUNDS.keys())
 

@@ -76,10 +76,12 @@ DIF = 1.3
 ACCELERATION = 0.01
 BORDER_H = 5.0
 GRAVITY = 0.001
-# Inward-pointing repulsive force per (mass × penetration-depth) near walls.
-# In addition to the hard-stop bounce — without it, mass slides along walls
-# and accumulates in corners because tangential motion is unopposed there.
-BORDER_REPULSION = 0.04
+# Linear spring back toward the spawn point — for 3D the bottom-middle of
+# the cube, for 2D the geometric centre. Force grows with displacement so
+# particles drift toward the base instead of pooling in corners. Replaces
+# the older border-only repulsion, which still allowed corner accumulation
+# along edges where two walls meet (the tangential direction was unopposed).
+CENTER_PULL = 0.003
 
 
 # === agent-behaviour parameters (Sage Jenson "36 Points" style) =============
@@ -402,11 +404,11 @@ def simulate_2d(state: State2D, params: PhysarumParams) -> State2D:
 
     F = F - GRAVITY * M[..., 0:1] * jnp.array([0.0, 1.0])
 
-    # Inward-pointing repulsion + reflective bounce share the SDF query.
-    N_xy, N_z = border_normal_2d(X, R)
-    penetration = jnp.maximum(BORDER_H - N_z, 0.0)[..., None]
-    F = F + BORDER_REPULSION * M[..., 0:1] * penetration * N_xy
+    # Spring pull toward the spawn point (domain centre in 2D).
+    centre_2d = jnp.array([W * 0.5, H * 0.5], dtype=jnp.float32)
+    F = F + CENTER_PULL * M[..., 0:1] * (centre_2d - X)
 
+    N_xy, N_z = border_normal_2d(X, R)
     inv_m = 1.0 / jnp.maximum(M[..., 0:1], 1e-12)
     V_new = V + F * DT * inv_m
 
@@ -454,23 +456,13 @@ def init_state_2d(key, H, W, radius_frac=0.1) -> State2D:
 
 
 def render_2d(state: State2D) -> jnp.ndarray:
-    """Gaussian-weighted (mass, trail) → RGB; same colormap as 3D MIPs."""
+    """Gaussian-weighted (mass, trail) → RGB via the shared _colorize."""
     X, V, M = state
     H, W = X.shape[:2]
     pos = position_grid_2d(H, W)
     diff = pos - X
     g = jnp.exp(-jnp.sum((diff / 0.75) ** 2, axis=-1))
-
-    rho_z = M[..., 0] * g
-    rho_w = M[..., 1] * g
-
-    a = jnp.power(jnp.clip(rho_z / (FLUID_RHO * 2.0 + 1e-12), 0.0, 1.0), 0.1)
-    a = a * a * (3 - 2 * a)
-    col = jnp.broadcast_to((0.2 * a)[..., None], (H, W, 3))
-    palette = jnp.array([0.2, 0.8, 0.6])
-    col = col + (0.5 - 0.5 * jnp.cos(8.0 * palette * rho_w[..., None]))
-    col = jnp.tanh(4.0 * jnp.power(jnp.clip(col, 0.0, 10.0), 1.5))
-    return jnp.clip(col, 0.0, 1.0)
+    return _colorize(M[..., 0] * g, M[..., 1] * g)
 
 
 # === 3D =====================================================================
@@ -589,11 +581,11 @@ def simulate_3d(state: State3D, params: PhysarumParams) -> State3D:
 
     F = F - GRAVITY * M[..., 0:1] * jnp.array([0.0, 0.0, 1.0])
 
-    # Inward-pointing repulsion + reflective bounce share the SDF query.
-    N_xyz, N_d = border_normal_3d(X, R)
-    penetration = jnp.maximum(BORDER_H - N_d, 0.0)[..., None]
-    F = F + BORDER_REPULSION * M[..., 0:1] * penetration * N_xyz
+    # Spring pull toward the spawn point at the bottom-middle of the cube.
+    centre_3d = jnp.array([W * 0.5, H * 0.5, 0.0], dtype=jnp.float32)
+    F = F + CENTER_PULL * M[..., 0:1] * (centre_3d - X)
 
+    N_xyz, N_d = border_normal_3d(X, R)
     inv_m = 1.0 / jnp.maximum(M[..., 0:1], 1e-12)
     V_new = V + F * DT * inv_m
 
@@ -663,13 +655,15 @@ def orbit_view(frame, n_frames, phi_amp=1.0):
 
 
 def _colorize(mass_2d, trail_2d):
-    a = jnp.power(jnp.clip(mass_2d / (FLUID_RHO * 2.0), 0.0, 1.0), 0.1)
-    a = a * a * (3 - 2 * a)
-    col = jnp.broadcast_to((0.2 * a)[..., None], a.shape + (3,))
-    palette = jnp.array([0.2, 0.8, 0.6])
-    col = col + (0.5 - 0.5 * jnp.cos(8.0 * palette * trail_2d[..., None]))
-    col = jnp.tanh(4.0 * jnp.power(jnp.clip(col, 0.0, 10.0), 1.5))
-    return jnp.clip(col, 0.0, 1.0)
+    """Black→cyan colormap. R channel is held at 0; G and B move together
+    from a mass-driven floor to a trail-driven peak, so the colour ramp
+    is strictly along the black→cyan axis (no excursions into red/yellow/
+    magenta). tanh keeps the bright end from blowing out."""
+    mass_t = jnp.tanh(2.5 * jnp.clip(mass_2d / FLUID_RHO, 0.0, None))
+    trail_t = jnp.tanh(2.0 * jnp.clip(trail_2d, 0.0, None))
+    gb = jnp.clip(0.35 * mass_t + 0.75 * trail_t, 0.0, 1.0)
+    zero = jnp.zeros_like(gb)
+    return jnp.stack([zero, gb, gb], axis=-1)
 
 
 def render_raymarch(state: State3D, theta: float = 0.6, phi: float = 0.4,
@@ -1063,7 +1057,7 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
                 dummy = jnp.zeros((D_, H_, W_, 3), dtype=jnp.float32)
                 state = State3D(dummy, dummy, M_jax)
                 gif_frames = []
-                n_views = 24
+                n_views = 48
                 for v in range(n_views):
                     theta, phi = orbit_view(v, n_views, phi_amp=1.0)
                     img = np.asarray(render_mip_jit(state,
@@ -1073,7 +1067,7 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
                                                     n_steps=gif_n_steps))
                     gif_frames.append((img * 255).astype(np.uint8))
                 iio.imwrite(arch_dir / f"{stem}.gif", gif_frames,
-                            duration=80, loop=0)
+                            duration=110, loop=0)
                 n_gif += 1
 
     df = pl.DataFrame(rows).sort("fitness", descending=True)
@@ -1167,8 +1161,8 @@ def run_3d(cfg: DictConfig, params: PhysarumParams, out_dir: Path):
                   f"trail={float(state.M[..., 1].sum()):.1f}  "
                   f"max|v|={float(jnp.abs(state.V).max()):.3f}")
 
-    iio.imwrite(out_dir / cfg.out_mip, mips, duration=60, loop=0)
-    iio.imwrite(out_dir / cfg.out_rm, rms, duration=60, loop=0)
+    iio.imwrite(out_dir / cfg.out_mip, mips, duration=110, loop=0)
+    iio.imwrite(out_dir / cfg.out_rm, rms, duration=110, loop=0)
     print(f"wrote {out_dir / cfg.out_mip} and {out_dir / cfg.out_rm}")
 
     if cfg.printability.enabled:

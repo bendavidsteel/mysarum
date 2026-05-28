@@ -10,6 +10,22 @@ You can check out videos of the project [here](https://www.instagram.com/p/Cq3Pr
 
 ![image of biomass](./biomass.jpg)
 
+## [The Grove](openframeworks/thegrove)
+
+3D physarum, 3D boids, and self-organising trees in a procedurally generated grove, shown at the Friends Film Fest 2023.
+
+You can check out a video of the project [here](https://www.youtube.com/watch?v=foZvAobP6Pg).
+
+![image of the grove](./thegrove.png)
+
+## [Pond](rust/pond)
+
+Projecting my imaginary pond into the world, debuted at Friends Film Fest 2026.
+
+You can check out a video of the project [here](https://www.youtube.com/watch?v=qB9Cer8rzaQ).
+
+![image of pond](./pond.png)
+
 ## Inspiration
 
 https://www.reddit.com/r/generative/comments/z6rzhc/physarum/
@@ -29,3 +45,4 @@ https://soniccharge.com/synplant
 https://www.youtube.com/watch?v=cGpYMTWFnUE
 https://github.com/aubio/aubio
 https://eodev.sourceforge.net/
+https://dl.acm.org/doi/pdf/10.1145/3306346.3323039

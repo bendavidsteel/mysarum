@@ -528,10 +528,15 @@ fn view(app: &App, model: &Model) {
     let tr = (vec3(sg_r, sg_t, 0.0), vec2(1.0, 0.0));
     let br = (vec3(sg_r, sg_b, 0.0), vec2(1.0, 1.0));
     let bl = (vec3(sg_l, sg_b, 0.0), vec2(0.0, 1.0));
-    draw.mesh().tris_textured(
-        model.spectro.clone(),
-        [geom::Tri([tl, tr, br]), geom::Tri([tl, br, bl])],
-    );
+    // `tris_textured` supplies the UVs; the texture binding itself lives on the
+    // shader model, so it must be set via `.texture()` (the handle passed to
+    // `tris_textured` is discarded by this fork — see PrimitiveMesh::new).
+    draw.mesh()
+        .tris_textured(
+            model.spectro.clone(),
+            [geom::Tri([tl, tr, br]), geom::Tri([tl, br, bl])],
+        )
+        .texture(&model.spectro);
     // Frame + frequency ticks (0, 2, 4, 6, 8 kHz) along the left edge.
     draw.rect()
         .x_y((sg_l + sg_r) * 0.5, (sg_t + sg_b) * 0.5)

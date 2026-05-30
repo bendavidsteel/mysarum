@@ -1,9 +1,19 @@
 // 3D boids flocking — port of compute_boids.glsl.
-// O(N^2) neighbour loop over all agents.
+// All-pairs neighbour loop, but tiled through workgroup shared memory: each
+// workgroup of 256 cooperatively loads a 256-boid tile into on-chip memory,
+// then every thread reads neighbours from there instead of global VRAM. The
+// physics is identical to the naive O(N^2) loop — only the memory traffic
+// drops (~256x fewer global loads), which is the right win when the attraction
+// radius spans much of the world and a spatial grid wouldn't prune anything.
 
 @group(0) @binding(0) var<storage, read>       p_in:  array<Particle>;
 @group(0) @binding(1) var<storage, read_write> p_out: array<Particle>;
 @group(1) @binding(0) var<uniform> cp: ComputeParams;
+
+const TILE: u32 = 256u;
+// shared tile: pos.xyz packed with phase in .w, and vel.xyz
+var<workgroup> sh_pos: array<vec4<f32>, 256>;
+var<workgroup> sh_vel: array<vec4<f32>, 256>;
 
 fn avoid_walls(pos: vec3<f32>, vel: ptr<function, vec3<f32>>) {
     let res = cp.world_res.xyz;
@@ -17,15 +27,17 @@ fn ang(a: vec3<f32>, b: vec3<f32>) -> f32 {
 }
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(local_invocation_id)  lid: vec3<u32>) {
     let i = gid.x;
     let n = u32(cp.world_res.w);
-    if (i >= n) { return; }
+    let lane_active = i < n;
+    let self_idx = select(0u, i, lane_active);   // keep inactive lanes in-bounds for loads
 
-    let pos   = p_in[i].pos.xyz;
-    let vel   = p_in[i].vel.xyz;
-    let nat_freq = p_in[i].attr.x;
-    var phase    = p_in[i].attr.y;
+    let pos   = p_in[self_idx].pos.xyz;
+    let vel   = p_in[self_idx].vel.xyz;
+    let nat_freq = p_in[self_idx].attr.x;
+    var phase    = p_in[self_idx].attr.y;
 
     let time     = cp.timing.x;
     let dt       = cp.timing.y;
@@ -54,23 +66,43 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var align_sum   = vec3<f32>(0.0); var align_count   = 0;
     var attract_sum = vec3<f32>(0.0); var attract_count = 0;
 
-    for (var j = 0u; j < n; j = j + 1u) {
-        if (j == i) { continue; }
-        let their_pos = p_in[j].pos.xyz;
-        if (ang(vel, their_pos - pos) < fov) { continue; }
-        let their_vel = p_in[j].vel.xyz;
-        let rel = their_pos - pos;
-        let sqd = dot(rel, rel);
-
-        if (sqd < repulsion_max * repulsion_max) { repulse_sum += rel; repulse_count += 1; }
-        if (sqd < alignment_max * alignment_max) { align_sum += their_vel; align_count += 1; }
-        if (sqd < attraction_max * attraction_max) { attract_sum += rel; attract_count += 1; }
-        if (sqd < kuramoto_max * kuramoto_max) {
-            let their_phase = p_in[j].attr.y;
-            phase_sum += sin(their_phase - phase);
-            kuramoto_count += 1;
+    // ── Tiled all-pairs loop ──────────────────────────────────────────────────
+    let num_tiles = (n + TILE - 1u) / TILE;
+    for (var tile = 0u; tile < num_tiles; tile = tile + 1u) {
+        let load_idx = tile * TILE + lid.x;
+        if (load_idx < n) {
+            sh_pos[lid.x] = vec4<f32>(p_in[load_idx].pos.xyz, p_in[load_idx].attr.y);
+            sh_vel[lid.x] = vec4<f32>(p_in[load_idx].vel.xyz, 0.0);
+        } else {
+            sh_pos[lid.x] = vec4<f32>(0.0);
+            sh_vel[lid.x] = vec4<f32>(0.0);
         }
+        workgroupBarrier();
+
+        let tile_n = min(TILE, n - tile * TILE);
+        for (var k = 0u; k < tile_n; k = k + 1u) {
+            let j = tile * TILE + k;
+            if (j == i) { continue; }
+            let their_pos = sh_pos[k].xyz;
+            if (ang(vel, their_pos - pos) < fov) { continue; }
+            let their_vel = sh_vel[k].xyz;
+            let rel = their_pos - pos;
+            let sqd = dot(rel, rel);
+
+            if (sqd < repulsion_max * repulsion_max) { repulse_sum += rel; repulse_count += 1; }
+            if (sqd < alignment_max * alignment_max) { align_sum += their_vel; align_count += 1; }
+            if (sqd < attraction_max * attraction_max) { attract_sum += rel; attract_count += 1; }
+            if (sqd < kuramoto_max * kuramoto_max) {
+                let their_phase = sh_pos[k].w;
+                phase_sum += sin(their_phase - phase);
+                kuramoto_count += 1;
+            }
+        }
+        workgroupBarrier();
     }
+
+    // inactive lanes only existed to keep the tile loads/barriers uniform
+    if (!lane_active) { return; }
 
     if (repulse_count > 0) {
         let d = repulse_sum / f32(repulse_count);

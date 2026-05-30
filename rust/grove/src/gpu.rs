@@ -101,8 +101,10 @@ pub struct GpuCompute {
     agent_pipeline: wgpu::ComputePipeline,
     agent_cur:  usize,
 
-    // trail volume ping-pong (tex0 always holds the "current" field after a step)
+    // trail volume ping-pong. `trail_cur` is the texture holding the current
+    // field after a step (what the renderer samples); it flips each frame.
     pub trail_views: [wgpu::TextureViewHandle; 2],
+    pub trail_cur:   usize,
     diffuse_pipeline: wgpu::ComputePipeline,
     decay_pipeline:   wgpu::ComputePipeline,
     /// trail bind groups keyed by (read_idx): bg[r] reads tex[r], writes tex[1-r]
@@ -234,10 +236,12 @@ impl GpuCompute {
                 storage_tex_entry(3, cs),
             ],
         });
-        // agents always read trail tex0, write tex1 (frame begins with copy tex0→tex1)
+        // agent_bgs[f]: read agent[f] + trail[f], write agent[1-f] + trail[1-f].
+        // The trail ping-pongs in lockstep with `flip`, so the deposit target is
+        // always the freshly-seeded "other" texture (see step()).
         let agent_bgs = [
             make_agent_bg(device, &agent_bgl, &agent_bufs[0], &agent_bufs[1], &trail_views[0], &trail_views[1], "agent_bg0"),
-            make_agent_bg(device, &agent_bgl, &agent_bufs[1], &agent_bufs[0], &trail_views[0], &trail_views[1], "agent_bg1"),
+            make_agent_bg(device, &agent_bgl, &agent_bufs[1], &agent_bufs[0], &trail_views[1], &trail_views[0], "agent_bg1"),
         ];
 
         // diffuse/decay: trail_read(sampled) + trail_write(storage)
@@ -269,7 +273,7 @@ impl GpuCompute {
         Self {
             boid_bufs, boid_bgs, boid_pipeline, boid_cur: 0,
             agent_bufs, agent_bgs, agent_pipeline, agent_cur: 0,
-            trail_views, diffuse_pipeline, decay_pipeline, trail_bgs_diffuse, trail_textures,
+            trail_views, trail_cur: 0, diffuse_pipeline, decay_pipeline, trail_bgs_diffuse, trail_textures,
             params_buf, params_bg,
             segment_buf, segment_count: 0, segment_capacity,
             flip: false,
@@ -305,11 +309,15 @@ impl GpuCompute {
         }
         self.boid_cur = dst;
 
-        // ── Physarum: copy current field tex0 → tex1, then 5 passes ending in tex0 ──
-        copy_tex(&mut enc, &self.trail_textures[0], &self.trail_textures[1]);
+        // ── Physarum (ping-pong, current field starts in trail[src]) ───────────
+        // The agent deposit is a sparse scatter into a write-only storage texture,
+        // so its target must already hold the current field — hence one seed copy
+        // (trail[src] → trail[dst]) is structurally required. The old second copy
+        // (re-canonicalising to a fixed tex0) is gone: we just track trail_cur.
+        copy_tex(&mut enc, &self.trail_textures[src], &self.trail_textures[dst]);
 
         {
-            // agents: read tex0, write tex1 (deposit onto the field copy)
+            // agents: read trail[src], deposit into the seeded trail[dst]
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("agents"), timestamp_writes: None });
             pass.set_pipeline(&self.agent_pipeline);
             pass.set_bind_group(0, &self.agent_bgs[src], &[]);
@@ -318,12 +326,13 @@ impl GpuCompute {
         }
         self.agent_cur = dst;
 
-        // diffuse (read1→write0), decay (read0→write1), copy tex1→tex0.
+        // diffuse (read dst → write src), decay (read src → write dst).
+        // trail_bgs_diffuse[r] reads trail[r] and writes trail[1-r].
         let (gx, gy, gz) = ((VOL_W + 7) / 8, (VOL_H + 7) / 8, (VOL_D + 7) / 8);
-        run_trail(&mut enc, &self.diffuse_pipeline, &self.trail_bgs_diffuse[1], &self.params_bg, gx, gy, gz, "diffuse");
-        run_trail(&mut enc, &self.decay_pipeline,   &self.trail_bgs_diffuse[0], &self.params_bg, gx, gy, gz, "decay");
-        // final field back to tex0
-        copy_tex(&mut enc, &self.trail_textures[1], &self.trail_textures[0]);
+        run_trail(&mut enc, &self.diffuse_pipeline, &self.trail_bgs_diffuse[dst], &self.params_bg, gx, gy, gz, "diffuse");
+        run_trail(&mut enc, &self.decay_pipeline,   &self.trail_bgs_diffuse[src], &self.params_bg, gx, gy, gz, "decay");
+        // field now lives in trail[dst]; it becomes next frame's trail[src].
+        self.trail_cur = dst;
 
         queue.submit(Some(enc.finish()));
         self.flip = !self.flip;

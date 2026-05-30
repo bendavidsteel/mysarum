@@ -43,7 +43,7 @@ pub struct RenderState {
     ubo_bg:     Option<wgpu::BindGroup>,
     boid_bgs:   Option<[wgpu::BindGroup; 2]>,
     trees_bg:   Option<wgpu::BindGroup>,
-    raycast_bg: Option<wgpu::BindGroup>,
+    raycast_bgs: Option<[wgpu::BindGroup; 2]>,
     depth_view: Option<wgpu::TextureViewHandle>,
     depth_size: [u32; 2],
     depth_samples: u32,
@@ -55,7 +55,7 @@ impl Default for RenderState {
             uniform_buf: None,
             ground_pipeline: None, box_pipeline: None, boids_pipeline: None,
             trees_pipeline: None, raycast_pipeline: None,
-            ubo_bg: None, boid_bgs: None, trees_bg: None, raycast_bg: None,
+            ubo_bg: None, boid_bgs: None, trees_bg: None, raycast_bgs: None,
             depth_view: None, depth_size: [0, 0], depth_samples: 1,
         }
     }
@@ -186,14 +186,15 @@ fn init(device: &wgpu::Device, gpu: &GpuCompute, rs: &mut RenderState, fmt: wgpu
         mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear,
         mipmap_filter: wgpu::FilterMode::Nearest, ..Default::default()
     });
-    let raycast_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    // one raycast bind group per trail texture; the renderer picks gpu.trail_cur
+    let raycast_bgs = [0usize, 1usize].map(|i| device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("raycast_bg"), layout: &raycast_bgl,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&gpu.trail_views[0]) },
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&gpu.trail_views[i]) },
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
             wgpu::BindGroupEntry { binding: 2, resource: uniform_buf.as_entire_binding() },
         ],
-    });
+    }));
 
     // pipeline layouts
     let ubo_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("ubo_pl"), bind_group_layouts: &[&ubo_bgl], push_constant_ranges: &[] });
@@ -213,7 +214,7 @@ fn init(device: &wgpu::Device, gpu: &GpuCompute, rs: &mut RenderState, fmt: wgpu
     rs.ubo_bg = Some(ubo_bg);
     rs.boid_bgs = Some(boid_bgs);
     rs.trees_bg = Some(trees_bg);
-    rs.raycast_bg = Some(raycast_bg);
+    rs.raycast_bgs = Some(raycast_bgs);
 }
 
 fn ensure_depth(device: &wgpu::Device, rs: &mut RenderState, size: [u32; 2], samples: u32) {
@@ -298,7 +299,7 @@ pub fn render(_render_app: &RenderApp, model: &crate::Model, mut frame: Frame) {
 
         // 4. physarum volume (screen blend)
         pass.set_pipeline(rs.raycast_pipeline.as_ref().unwrap());
-        pass.set_bind_group(0, rs.raycast_bg.as_ref().unwrap(), &[]);
+        pass.set_bind_group(0, &rs.raycast_bgs.as_ref().unwrap()[gpu.trail_cur], &[]);
         pass.draw(0..3, 0..1);
 
         // 5. wireframe box

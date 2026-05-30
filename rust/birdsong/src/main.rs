@@ -482,8 +482,9 @@ fn view(app: &App, model: &Model) {
     // larger spectrogram waterfall filling the rest.
     let top_bot = win.top() - win.h() * 0.30;
 
-    // ── Phase portrait of the labial oscillator (delay embedding), top-left ──
-    let pp_cx = win.left() + win.w() * 0.10;
+    // ── Phase portrait of the labial oscillator (delay embedding), top-right;
+    //    the top-left is occupied by the egui info panel. ──
+    let pp_cx = win.right() - win.w() * 0.07;
     let pp_cy = (win.top() - margin + top_bot) * 0.5;
     let pp_r = (win.top() - margin - top_bot) * 0.5 * 0.92;
     draw.ellipse()
@@ -502,9 +503,9 @@ fn view(app: &App, model: &Model) {
     });
     draw.polyline().weight(1.0).points_colored(emb);
 
-    // ── Oscilloscope (top strip, right of the vectorscope) ──
-    let scope_left = win.left() + win.w() * 0.22;
-    let scope_right = win.right() - margin;
+    // ── Oscilloscope (top strip, between the info panel and the vectorscope) ──
+    let scope_left = win.left() + win.w() * 0.31;
+    let scope_right = pp_cx - pp_r * 1.25 - 20.0;
     let scope_mid = pp_cy;
     let scope_amp = pp_r;
     draw.line()
@@ -519,23 +520,17 @@ fn view(app: &App, model: &Model) {
     });
     draw.polyline().weight(1.4).points_colored(waveform);
 
-    // ── Spectrogram waterfall (textured quad filling the lower region) ──
+    // ── Spectrogram waterfall (textured rect filling the lower region) ──
+    // A plain `draw.rect().texture()` is the path this fork actually supports
+    // (see examples/draw/draw_texture.rs): the rect supplies its own UVs and
+    // `.texture()` binds the image to the shader model.
     let sg_l = win.left() + margin;
     let sg_r = win.right() - margin;
     let sg_t = top_bot - 10.0;
     let sg_b = win.bottom() + margin;
-    let tl = (vec3(sg_l, sg_t, 0.0), vec2(0.0, 0.0));
-    let tr = (vec3(sg_r, sg_t, 0.0), vec2(1.0, 0.0));
-    let br = (vec3(sg_r, sg_b, 0.0), vec2(1.0, 1.0));
-    let bl = (vec3(sg_l, sg_b, 0.0), vec2(0.0, 1.0));
-    // `tris_textured` supplies the UVs; the texture binding itself lives on the
-    // shader model, so it must be set via `.texture()` (the handle passed to
-    // `tris_textured` is discarded by this fork — see PrimitiveMesh::new).
-    draw.mesh()
-        .tris_textured(
-            model.spectro.clone(),
-            [geom::Tri([tl, tr, br]), geom::Tri([tl, br, bl])],
-        )
+    draw.rect()
+        .x_y((sg_l + sg_r) * 0.5, (sg_t + sg_b) * 0.5)
+        .w_h(sg_r - sg_l, sg_t - sg_b)
         .texture(&model.spectro);
     // Frame + frequency ticks (0, 2, 4, 6, 8 kHz) along the left edge.
     draw.rect()

@@ -24,6 +24,11 @@
 //!
 //!          Pout'' + (1/tau)*Pout' + w_oec^2 * Pout = G * dPi/dt
 //!
+//! The window shows three views of the synthesised voice: a vectorscope
+//! (delay embedding of the labial limit cycle, top-left), an oscilloscope of
+//! the radiated pressure wave (top), and a scrolling spectrogram waterfall
+//! (short-time DFT, 0–8 kHz, ~6 s of history) filling the lower region.
+//!
 //! The bird "sings" by moving along a path (alpha(t), beta(t)) in parameter
 //! space. Here YOU are the bird: the mouse position is that path.
 //!     mouse X  ->  alpha (air-sac pressure)   left = quiet, right = strong
@@ -34,6 +39,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use nannou::prelude::bevy_asset::RenderAssetUsages;
 use nannou::prelude::*;
 use nannou_audio as audio;
 use nannou_audio::Buffer;
@@ -58,6 +64,14 @@ const GAMMA_MIN: f32 = 8_000.0;
 const GAMMA_MAX: f32 = 60_000.0;
 
 const OVERSAMPLE: usize = 24; // ODE substeps per audio frame (Euler stability)
+
+// ── Spectrogram (short-time DFT waterfall) ──────────────────────────────────
+
+const FFT_SIZE: usize = 1024; // samples per analysis window
+const N_FREQ: usize = 192; // frequency bins / texture height
+const TIME_COLS: usize = 360; // history columns / texture width (~6 s at 60 fps)
+const FREQ_MAX: f32 = 8_000.0; // top of the displayed frequency axis (Hz)
+const DB_FLOOR: f32 = -55.0; // magnitudes at/below this map to black
 
 // ── Shared, mouse-driven parameters ─────────────────────────────────────────
 
@@ -179,6 +193,15 @@ struct Model {
     // the consumer itself holds a non-Sync Cell.
     scope_rx: Mutex<ringbuf::HeapCons<f32>>,
     scope: Vec<f32>, // rolling oscilloscope buffer
+
+    // Spectrogram: a GPU texture scrolled one column per frame. The short-time
+    // DFT is evaluated directly at N_FREQ linearly-spaced bins via precomputed
+    // twiddle tables (cheap at this size, and avoids an FFT dependency).
+    spectro: Handle<Image>,
+    hann: Vec<f32>,         // analysis window, len FFT_SIZE
+    dft_cos: Vec<f32>,      // N_FREQ * FFT_SIZE
+    dft_sin: Vec<f32>,      // N_FREQ * FFT_SIZE
+    dft_norm: f32,          // amplitude normalisation (2 / sum(hann))
 }
 
 fn main() {
@@ -239,11 +262,49 @@ fn model(app: &App) -> Model {
         }
     });
 
+    // Spectrogram texture: width = time columns, height = frequency bins.
+    let spectro = app.assets_mut::<Image>().add(Image::new(
+        Extent3d {
+            width: TIME_COLS as u32,
+            height: N_FREQ as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        vec![0u8; TIME_COLS * N_FREQ * 4],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(), // MAIN_WORLD | RENDER_WORLD: editable + uploaded
+    ));
+
+    // Hann window and per-bin DFT twiddle tables (freq linear in [0, FREQ_MAX]).
+    let hann: Vec<f32> = (0..FFT_SIZE)
+        .map(|n| {
+            let w = 2.0 * PI * n as f32 / (FFT_SIZE as f32 - 1.0);
+            0.5 - 0.5 * w.cos()
+        })
+        .collect();
+    let hann_sum: f32 = hann.iter().sum();
+    let analysis_sr = 44_100.0_f32; // the scope buffer runs at the device rate
+    let mut dft_cos = vec![0.0f32; N_FREQ * FFT_SIZE];
+    let mut dft_sin = vec![0.0f32; N_FREQ * FFT_SIZE];
+    for k in 0..N_FREQ {
+        let freq = FREQ_MAX * k as f32 / (N_FREQ as f32 - 1.0);
+        let omega = 2.0 * PI * freq / analysis_sr;
+        for n in 0..FFT_SIZE {
+            dft_cos[k * FFT_SIZE + n] = (omega * n as f32).cos();
+            dft_sin[k * FFT_SIZE + n] = (omega * n as f32).sin();
+        }
+    }
+
     Model {
         window,
         params,
         scope_rx: Mutex::new(scope_rx),
         scope: vec![0.0; SCOPE_LEN],
+        spectro,
+        hann,
+        dft_cos,
+        dft_sin,
+        dft_norm: 2.0 / hann_sum,
     }
 }
 
@@ -265,6 +326,9 @@ fn update(app: &App, model: &mut Model) {
         }
     }
 
+    // ── Spectrogram: STDFT of the latest window → scroll texture one column ──
+    update_spectrogram(app, model);
+
     // ── egui readout (this fork has no draw.text(), so all text lives here) ──
     let freq = estimate_freq(&model.scope, 44_100.0);
     let mut p = model.params.lock().map(|g| *g).unwrap_or_default();
@@ -282,6 +346,7 @@ fn update(app: &App, model: &mut Model) {
         ui.add(egui::Slider::new(&mut p.volume, 0.0..=1.0).text("volume"));
         ui.checkbox(&mut p.paused, "pause airflow (space)");
         ui.separator();
+        ui.label(format!("spectrogram: 0 – {:.0} kHz, ~6 s", FREQ_MAX / 1000.0));
         ui.label("Move the mouse to trace a path through");
         ui.label("parameter space — that is the bird's gesture.");
     });
@@ -292,6 +357,78 @@ fn update(app: &App, model: &mut Model) {
         g.volume = p.volume;
         g.paused = p.paused;
     }
+}
+
+/// Evaluate the short-time DFT of the most recent FFT_SIZE scope samples and
+/// push the resulting magnitude column onto the right edge of the scrolling
+/// spectrogram texture (oldest time at the left, high frequency at the top).
+fn update_spectrogram(app: &App, model: &mut Model) {
+    let n = model.scope.len();
+    if n < FFT_SIZE {
+        return;
+    }
+    let frame = &model.scope[n - FFT_SIZE..];
+
+    // Magnitude per bin → an RGBA column (one texel per frequency bin).
+    let mut column = [[0u8; 4]; N_FREQ];
+    for k in 0..N_FREQ {
+        let (cos, sin) = (
+            &model.dft_cos[k * FFT_SIZE..(k + 1) * FFT_SIZE],
+            &model.dft_sin[k * FFT_SIZE..(k + 1) * FFT_SIZE],
+        );
+        let mut re = 0.0f32;
+        let mut im = 0.0f32;
+        for i in 0..FFT_SIZE {
+            let s = frame[i] * model.hann[i];
+            re += s * cos[i];
+            im -= s * sin[i];
+        }
+        let mag = (re * re + im * im).sqrt() * model.dft_norm;
+        let db = 20.0 * (mag + 1e-9).log10();
+        let t = ((db - DB_FLOOR) / -DB_FLOOR).clamp(0.0, 1.0);
+        let (r, g, b) = inferno(t);
+        // Row 0 is the top of the texture → highest frequency.
+        column[N_FREQ - 1 - k] = [r, g, b, 255];
+    }
+
+    // Scroll every row one texel to the left, then write the new column.
+    let mut img = app.assets_mut::<Image>();
+    let Some(img) = img.get_mut(&model.spectro) else {
+        return;
+    };
+    let Some(buf) = img.data.as_mut() else {
+        return;
+    };
+    let w = TIME_COLS;
+    for row in 0..N_FREQ {
+        let base = row * w * 4;
+        buf.copy_within(base + 4..base + w * 4, base);
+        let last = base + (w - 1) * 4;
+        buf[last..last + 4].copy_from_slice(&column[row]);
+    }
+}
+
+/// Compact "inferno"-style colormap (black → purple → red → orange → pale
+/// yellow) via piecewise-linear interpolation over a handful of control colors.
+fn inferno(t: f32) -> (u8, u8, u8) {
+    const STOPS: [(f32, f32, f32, f32); 6] = [
+        (0.00, 0.00, 0.00, 0.02),
+        (0.20, 0.18, 0.03, 0.30),
+        (0.40, 0.53, 0.06, 0.42),
+        (0.60, 0.84, 0.22, 0.26),
+        (0.80, 0.98, 0.55, 0.04),
+        (1.00, 0.99, 0.96, 0.66),
+    ];
+    let t = t.clamp(0.0, 1.0);
+    let mut i = 0;
+    while i + 1 < STOPS.len() && t > STOPS[i + 1].0 {
+        i += 1;
+    }
+    let (t0, r0, g0, b0) = STOPS[i];
+    let (t1, r1, g1, b1) = STOPS[(i + 1).min(STOPS.len() - 1)];
+    let f = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
+    let lerp = |a: f32, b: f32| ((a + (b - a) * f) * 255.0).round().clamp(0.0, 255.0) as u8;
+    (lerp(r0, r1), lerp(g0, g1), lerp(b0, b1))
 }
 
 // ── Input: the mouse IS the bird's motor gesture ────────────────────────────
@@ -338,31 +475,17 @@ fn view(app: &App, model: &Model) {
     // which isn't registered yet on the first frame and would panic).
     let win = app.window(model.window).rect();
 
-    // ── Oscilloscope (top portion of the window) ──
-    let scope_top = win.top() - 30.0;
-    let scope_bot = win.bottom() + win.h() * 0.40;
-    let scope_mid = (scope_top + scope_bot) * 0.5;
-    let scope_amp = (scope_top - scope_bot) * 0.5 * 0.92;
-
-    // zero line
-    draw.line()
-        .start(pt2(win.left() + 20.0, scope_mid))
-        .end(pt2(win.right() - 20.0, scope_mid))
-        .weight(1.0)
-        .color(Color::srgb(0.15, 0.15, 0.20));
-
     let n = model.scope.len();
-    let waveform = (0..n).map(|i| {
-        let x = map_range(i, 0, n - 1, win.left() + 20.0, win.right() - 20.0);
-        let y = scope_mid + model.scope[i].clamp(-1.0, 1.0) * scope_amp;
-        (pt2(x, y), Color::srgb(0.35, 0.95, 0.65))
-    });
-    draw.polyline().weight(1.6).points_colored(waveform);
+    let margin = 20.0;
 
-    // ── Phase portrait of the labial oscillator (delay embedding) ──
-    let pp_cx = win.left() + win.w() * 0.18;
-    let pp_cy = win.bottom() + win.h() * 0.20;
-    let pp_r = win.h() * 0.16;
+    // The window splits into a top strip (vectorscope + oscilloscope) and a
+    // larger spectrogram waterfall filling the rest.
+    let top_bot = win.top() - win.h() * 0.30;
+
+    // ── Phase portrait of the labial oscillator (delay embedding), top-left ──
+    let pp_cx = win.left() + win.w() * 0.10;
+    let pp_cy = (win.top() - margin + top_bot) * 0.5;
+    let pp_r = (win.top() - margin - top_bot) * 0.5 * 0.92;
     draw.ellipse()
         .x_y(pp_cx, pp_cy)
         .radius(pp_r * 1.05)
@@ -378,8 +501,55 @@ fn view(app: &App, model: &Model) {
         (pt2(pp_cx + xv * pp_r, pp_cy + yv * pp_r), Color::srgb(0.95, 0.55, 0.30))
     });
     draw.polyline().weight(1.0).points_colored(emb);
-    // Text (labels, parameter readout) is drawn via egui in `update`, since
-    // draw.text() is unimplemented in this nannou fork.
+
+    // ── Oscilloscope (top strip, right of the vectorscope) ──
+    let scope_left = win.left() + win.w() * 0.22;
+    let scope_right = win.right() - margin;
+    let scope_mid = pp_cy;
+    let scope_amp = pp_r;
+    draw.line()
+        .start(pt2(scope_left, scope_mid))
+        .end(pt2(scope_right, scope_mid))
+        .weight(1.0)
+        .color(Color::srgb(0.15, 0.15, 0.20));
+    let waveform = (0..n).map(|i| {
+        let x = map_range(i, 0, n - 1, scope_left, scope_right);
+        let y = scope_mid + model.scope[i].clamp(-1.0, 1.0) * scope_amp;
+        (pt2(x, y), Color::srgb(0.35, 0.95, 0.65))
+    });
+    draw.polyline().weight(1.4).points_colored(waveform);
+
+    // ── Spectrogram waterfall (textured quad filling the lower region) ──
+    let sg_l = win.left() + margin;
+    let sg_r = win.right() - margin;
+    let sg_t = top_bot - 10.0;
+    let sg_b = win.bottom() + margin;
+    let tl = (vec3(sg_l, sg_t, 0.0), vec2(0.0, 0.0));
+    let tr = (vec3(sg_r, sg_t, 0.0), vec2(1.0, 0.0));
+    let br = (vec3(sg_r, sg_b, 0.0), vec2(1.0, 1.0));
+    let bl = (vec3(sg_l, sg_b, 0.0), vec2(0.0, 1.0));
+    draw.mesh().tris_textured(
+        model.spectro.clone(),
+        [geom::Tri([tl, tr, br]), geom::Tri([tl, br, bl])],
+    );
+    // Frame + frequency ticks (0, 2, 4, 6, 8 kHz) along the left edge.
+    draw.rect()
+        .x_y((sg_l + sg_r) * 0.5, (sg_t + sg_b) * 0.5)
+        .w_h(sg_r - sg_l, sg_t - sg_b)
+        .no_fill()
+        .stroke_weight(1.0)
+        .stroke(Color::srgb(0.2, 0.2, 0.26));
+    for k in 0..=4 {
+        let frac = k as f32 / 4.0; // 0 kHz at bottom, FREQ_MAX at top
+        let y = sg_b + frac * (sg_t - sg_b);
+        draw.line()
+            .start(pt2(sg_l, y))
+            .end(pt2(sg_l + 8.0, y))
+            .weight(1.0)
+            .color(Color::srgb(0.35, 0.35, 0.42));
+    }
+    // Text (labels, parameter readout, axis units) is drawn via egui in
+    // `update`, since draw.text() is unimplemented in this nannou fork.
 }
 
 /// Rough fundamental-frequency estimate from positive-going zero crossings.

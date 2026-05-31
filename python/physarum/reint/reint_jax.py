@@ -782,7 +782,7 @@ def _largest_cc_gpu(mask, struct26):
 
 def printability_report(trail, r_min_voxels=3.0, thresholds=None,
                         n_thresholds=12,
-                        opening_ratio_min=0.9,
+                        opening_ratio_min=0.8,
                         volume_fill_min=0.1, volume_fill_max=0.5,
                         top_clear_voxels=1,
                         bottom_fill_min=0.1, bottom_fill_max=0.8):
@@ -806,8 +806,8 @@ def printability_report(trail, r_min_voxels=3.0, thresholds=None,
       • the bottom face (z=0) footprint fraction ∈ (bottom_fill_min,
         bottom_fill_max) — a real base to stand on, but not a full slab.
     Array axis 0 is z (spawn base at z=0); axes 1,2 are the walls. Among
-    printable rows the "best" maximizes fitness = opening_ratio × sa_to_vol
-    (robustly thick and veiny).
+    printable rows the "best" maximizes fitness = sa_to_vol (the veiniest, most
+    surface-rich shape that still clears every gate).
 
     Returns (df, best_mask, best_row).
     """
@@ -864,9 +864,9 @@ def printability_report(trail, r_min_voxels=3.0, thresholds=None,
         wall_filled = int(mask[:, 0, :].sum() + mask[:, -1, :].sum()
                           + mask[:, :, 0].sum() + mask[:, :, -1].sum())
         bottom_frac = float(mask[0].sum()) / float(mask.shape[1] * mask.shape[2])
-        # Reward robustly-thick + veiny shapes. volume_fill is a gate (below),
-        # not a fitness term, so the search can't win by filling the cube.
-        fitness = opening_ratio * sa_to_vol
+        # Reward veininess (surface/volume). opening_ratio and volume_fill are
+        # gates (below), not fitness terms.
+        fitness = sa_to_vol
 
         printable = (opening_ratio >= opening_ratio_min
                      and volume_fill_min < volume_fill < volume_fill_max
@@ -1005,8 +1005,8 @@ def _evaluate_params(params: PhysarumParams, grid, frames, steps_per_frame,
     """Run a short 3D sim with `params`. Returns (fitness, (bd,), best_mask,
     M_final, info).
 
-    fitness = opening_ratio × sa_to_vol at the best printable threshold, or
-    -inf if no threshold was printable.
+    fitness = sa_to_vol at the best printable threshold, or -inf if no
+    threshold was printable.
     The single behavior descriptor is edt_median at that threshold.
     Falls back to the highest-fitness threshold when nothing is printable, so
     unprintable individuals still get a BD coordinate.
@@ -1057,11 +1057,11 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
     """Quality-diversity search over PhysarumParams.
 
     Archive is a 1-D grid indexed by edt_median.  Each cell holds the
-    highest-fitness (= opening_ratio × sa_to_vol) individual whose descriptor
-    lands there. We:
+    highest-fitness (= sa_to_vol) individual whose descriptor lands there. We:
       1) seed the archive with `init_evals` uniform-random params
       2) loop `n_evals - init_evals` more times, each iteration mutating a
-         random archive member with Gaussian noise
+         random *printable* archive member with Gaussian noise (unprintable
+         cells are never chosen as parents)
       3) save final archive as a CSV, drop the best mask per occupied cell
          under <out_dir>/archive/, and emit per-cell STLs for printable
          survivors.
@@ -1080,11 +1080,15 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
           f"eval grid {grid}, frames {me.frames}×{me.steps_per_frame} ===")
     t0 = time.perf_counter()
     for i in range(int(me.n_evals)):
-        if i < int(me.init_evals) or len(archive) == 0:
+        # Only mutate from printable elites — unprintable (-inf) cells are dead
+        # ends and would waste the budget orbiting infeasible shapes.
+        printable_cells = [c for c, e in archive.items()
+                           if np.isfinite(e["fitness"])]
+        if i < int(me.init_evals) or not printable_cells:
             params = _sample_params_uniform(rng)
             origin = "init"
         else:
-            parent_cell = list(archive.keys())[rng.integers(len(archive))]
+            parent_cell = printable_cells[rng.integers(len(printable_cells))]
             parent = archive[parent_cell]["params"]
             params = _mutate_params(rng, parent, float(me.mutation_sigma))
             origin = f"mut[{parent_cell[0]}]"

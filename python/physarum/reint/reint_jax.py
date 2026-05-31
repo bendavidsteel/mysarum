@@ -24,7 +24,7 @@ become more sensitive in dense regions ("primary special sauce").
     statistics, morphological-opening survival, and surface/volume.
   export_stl           — marching cubes on the chosen mask + binary STL.
   map_elites_run       — quality-diversity search over PhysarumParams,
-    archive indexed by (opening_ratio, edt_median).
+    archive indexed by (sa_to_vol, edt_median).
 
 Entry point: hydra. Run with
     python reint_jax.py                          # default config (3D, weblike)
@@ -37,6 +37,7 @@ See conf/config.yaml for all knobs.
 import os
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
+import math
 import struct
 import time
 from pathlib import Path
@@ -681,6 +682,9 @@ def render_raymarch(state: State3D, theta: float = 0.6, phi: float = 0.4,
     mode='mip'   : max-density-along-ray (robust; same 2D colormap).
     mode='alpha' : emission-absorption alpha compositing (depth shaded but
                    collapses to a translucent blob unless veins are dense).
+    mode='solid' : every voxel above 0.5 is fully opaque (alpha=1) — renders a
+                   binary mask as the solid object it would print as, shaded by
+                   a screen-space surface normal so form reads in 3D.
     """
     D, H, W = state.M.shape[:3]
     size = float(max(D, H, W))
@@ -711,6 +715,23 @@ def render_raymarch(state: State3D, theta: float = 0.6, phi: float = 0.4,
 
     if mode == "mip":
         return _colorize(mass.max(axis=-1), trail.max(axis=-1))
+
+    if mode == "solid":
+        # Treat any sample above 0.5 as opaque print material. Per ray, take
+        # the first such hit → a depth buffer; shade by a screen-space normal
+        # derived from depth gradients (flat faces bright, silhouettes dark).
+        occ = mass > 0.5
+        hit = occ.any(axis=-1)
+        first = jnp.argmax(occ, axis=-1).astype(jnp.float32)
+        zbuf = jnp.where(hit, first, float(n_steps))      # misses pushed far
+        gx = zbuf - jnp.roll(zbuf, 1, axis=1)
+        gy = zbuf - jnp.roll(zbuf, 1, axis=0)
+        ndotl = 1.0 / jnp.sqrt(gx * gx + gy * gy + 1.0)   # light along view
+        depth = jnp.clip(first / float(n_steps), 0.0, 1.0)
+        shade = (0.30 + 0.70 * ndotl) * (1.0 - 0.30 * depth)
+        gb = jnp.where(hit, shade, 0.0)
+        zero = jnp.zeros_like(gb)
+        return jnp.stack([zero, gb, gb], axis=-1)         # black→cyan, opaque
 
     ds = ts[1] - ts[0]
     density = jnp.maximum(mass - density_floor, 0.0)
@@ -759,27 +780,39 @@ def _largest_cc_gpu(mask, struct26):
     return labels == int(cp.argmax(counts))
 
 
-def printability_report(trail, r_min_voxels=1.5, thresholds=None,
+def printability_report(trail, r_min_voxels=3.0, thresholds=None,
                         n_thresholds=12,
-                        kept_fraction_min=0.8,
-                        opening_ratio_min=0.9):
+                        opening_ratio_min=0.9,
+                        volume_fill_min=0.1, volume_fill_max=0.5,
+                        top_clear_voxels=1,
+                        bottom_fill_min=0.1, bottom_fill_max=0.8):
     """GPU threshold sweep for 3D-printability of a trail volume.
 
     For each candidate threshold t:
       1) mask = trail > t, then keep only the largest 26-connected component.
+         All metrics below are computed on that single component.
       2) EDT on the kept mask — interior voxel value = distance (in voxels)
          to the nearest exterior voxel, i.e. half the local thickness.
       3) Morphological opening with a Euclidean ball of radius r_min_voxels.
       4) Surface area = 6-conn boundary voxel count; volume = mask voxels.
 
-    A row is "printable" iff kept_fraction ≥ kept_fraction_min AND
-    opening_ratio ≥ opening_ratio_min. Among printable rows the "best" is
-    the one with the highest surface_area/volume (most veiny while still
-    admitting a ball of radius r_min_voxels nearly everywhere).
+    A row is "printable" iff all of:
+      • opening_ratio ≥ opening_ratio_min (a min-feature ball fits almost
+        everywhere);
+      • volume_fill ∈ (volume_fill_min, volume_fill_max) — neither specks nor a
+        near-solid block (volume_fill = occupied voxels / total grid voxels);
+      • the top `top_clear_voxels` z-slices and all four side walls are empty,
+        so the object touches no ceiling or wall of the print volume;
+      • the bottom face (z=0) footprint fraction ∈ (bottom_fill_min,
+        bottom_fill_max) — a real base to stand on, but not a full slab.
+    Array axis 0 is z (spawn base at z=0); axes 1,2 are the walls. Among
+    printable rows the "best" maximizes fitness = opening_ratio × sa_to_vol
+    (robustly thick and veiny).
 
     Returns (df, best_mask, best_row).
     """
     trail_gpu = cp.asarray(trail, dtype=cp.float32)
+    total_voxels = int(trail_gpu.size)
     nz = trail_gpu[trail_gpu > 0]
     if nz.size == 0:
         raise ValueError("trail is all zeros")
@@ -799,9 +832,11 @@ def printability_report(trail, r_min_voxels=1.5, thresholds=None,
         vol0 = int(mask0.sum())
         if vol0 == 0:
             rows.append(dict(threshold=float(t), kept_fraction=0.0, volume=0,
+                             volume_fill=0.0, top_filled=0, wall_filled=0,
+                             bottom_frac=0.0,
                              edt_min=0.0, edt_q01=0.0, edt_median=0.0,
                              opening_ratio=0.0, surface_area=0,
-                             sa_to_vol=0.0, printable=False))
+                             sa_to_vol=0.0, fitness=0.0, printable=False))
             continue
 
         mask = _largest_cc_gpu(mask0, struct26)
@@ -821,19 +856,39 @@ def printability_report(trail, r_min_voxels=1.5, thresholds=None,
         surface_area = int((mask & ~eroded).sum())
         sa_to_vol = surface_area / vol
 
-        printable = (kept_fraction >= kept_fraction_min
-                     and opening_ratio >= opening_ratio_min)
+        volume_fill = vol / total_voxels
+        # Boundary checks. Axis 0 = z (spawn base at z=0); axes 1,2 are the
+        # H,W walls. The object may rest on the bottom face but must clear the
+        # ceiling and all four walls entirely.
+        top_filled = int(mask[-top_clear_voxels:].sum())
+        wall_filled = int(mask[:, 0, :].sum() + mask[:, -1, :].sum()
+                          + mask[:, :, 0].sum() + mask[:, :, -1].sum())
+        bottom_frac = float(mask[0].sum()) / float(mask.shape[1] * mask.shape[2])
+        # Reward robustly-thick + veiny shapes. volume_fill is a gate (below),
+        # not a fitness term, so the search can't win by filling the cube.
+        fitness = opening_ratio * sa_to_vol
+
+        printable = (opening_ratio >= opening_ratio_min
+                     and volume_fill_min < volume_fill < volume_fill_max
+                     and top_filled == 0
+                     and wall_filled == 0
+                     and bottom_fill_min < bottom_frac < bottom_fill_max)
         rows.append(dict(threshold=float(t),
                          kept_fraction=kept_fraction,
                          volume=vol,
+                         volume_fill=volume_fill,
+                         top_filled=top_filled,
+                         wall_filled=wall_filled,
+                         bottom_frac=bottom_frac,
                          edt_min=edt_min, edt_q01=edt_q01, edt_median=edt_med,
                          opening_ratio=opening_ratio,
                          surface_area=surface_area,
                          sa_to_vol=sa_to_vol,
+                         fitness=fitness,
                          printable=printable))
         masks[float(t)] = mask
 
-    df = pl.DataFrame(rows).sort("sa_to_vol", descending=True)
+    df = pl.DataFrame(rows).sort("fitness", descending=True)
     printable_df = df.filter(pl.col("printable"))
     best_row = printable_df.row(0, named=True) if printable_df.height > 0 else None
     best_mask = (cp.asnumpy(masks[best_row["threshold"]]).astype(np.uint8)
@@ -947,14 +1002,16 @@ def _bd_cell(bd, archive_shape, bd_ranges):
 
 def _evaluate_params(params: PhysarumParams, grid, frames, steps_per_frame,
                      r_min_voxels, seed):
-    """Run a short 3D sim with `params`. Returns (fitness, (bd1, bd2),
-    best_mask, M_final).
+    """Run a short 3D sim with `params`. Returns (fitness, (bd,), best_mask,
+    M_final, info).
 
-    fitness = sa_to_vol at the best printable threshold, or -inf if no
-    threshold was printable.
-    bd1 = opening_ratio, bd2 = edt_median at that threshold.
-    Falls back to the threshold with the highest opening_ratio when nothing
-    is printable, so unprintable individuals still get a BD coordinate.
+    fitness = opening_ratio × sa_to_vol at the best printable threshold, or
+    -inf if no threshold was printable.
+    The single behavior descriptor is edt_median at that threshold.
+    Falls back to the highest-fitness threshold when nothing is printable, so
+    unprintable individuals still get a BD coordinate.
+    info carries the scalar metrics (sa_to_vol, opening_ratio, volume_fill,
+    edt_median) at the chosen threshold, for the archive CSV.
     M_final is the (D,H,W,2) (mass,trail) field as a host np.float32 array —
     used downstream to render a rotating-MIP gif for printable archive cells.
     Returned only when the individual is printable (None otherwise), to keep
@@ -971,25 +1028,37 @@ def _evaluate_params(params: PhysarumParams, grid, frames, steps_per_frame,
     trail = np.asarray(state.M[..., 1])
     df, best_mask, best_row = printability_report(
         trail, r_min_voxels=r_min_voxels, n_thresholds=10)
-    if best_row is not None:
-        return (best_row["sa_to_vol"],
-                (best_row["opening_ratio"], best_row["edt_median"]),
-                best_mask,
-                np.asarray(state.M))
+    def _info(row):
+        return dict(sa_to_vol=row["sa_to_vol"],
+                    opening_ratio=row["opening_ratio"],
+                    volume_fill=row["volume_fill"],
+                    edt_median=row["edt_median"],
+                    bottom_frac=row["bottom_frac"],
+                    top_filled=row["top_filled"],
+                    wall_filled=row["wall_filled"])
 
-    best_idx = int(df.select(pl.col("opening_ratio").arg_max()).item())
+    if best_row is not None:
+        return (best_row["fitness"],
+                (best_row["edt_median"],),
+                best_mask,
+                np.asarray(state.M),
+                _info(best_row))
+
+    best_idx = int(df.select(pl.col("fitness").arg_max()).item())
     fallback = df.row(best_idx, named=True)
     return (-float("inf"),
-            (fallback["opening_ratio"], fallback["edt_median"]),
+            (fallback["edt_median"],),
             None,
-            None)
+            None,
+            _info(fallback))
 
 
 def map_elites_run(cfg: DictConfig, out_dir: Path):
     """Quality-diversity search over PhysarumParams.
 
-    Archive is a 2D grid indexed by (opening_ratio, edt_median).  Each cell
-    holds the highest-sa_to_vol individual whose BDs land there. We:
+    Archive is a 1-D grid indexed by edt_median.  Each cell holds the
+    highest-fitness (= opening_ratio × sa_to_vol) individual whose descriptor
+    lands there. We:
       1) seed the archive with `init_evals` uniform-random params
       2) loop `n_evals - init_evals` more times, each iteration mutating a
          random archive member with Gaussian noise
@@ -999,12 +1068,11 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
     """
     me = cfg.mapelites
     archive_shape = tuple(me.archive_shape)
-    bd_ranges = (tuple(me.bd_ranges.opening_ratio),
-                 tuple(me.bd_ranges.edt_median))
+    bd_ranges = (tuple(me.bd_ranges.edt_median),)
     grid = tuple(me.grid)
     rng = np.random.default_rng(int(cfg.seed))
 
-    archive = {}  # (i,j) -> dict(params, fitness, bd, mask, eval_idx)
+    archive = {}  # (i,) -> dict(params, fitness, bd, mask, info, eval_idx)
     arch_dir = out_dir / "archive"
     arch_dir.mkdir(exist_ok=True)
 
@@ -1019,9 +1087,9 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
             parent_cell = list(archive.keys())[rng.integers(len(archive))]
             parent = archive[parent_cell]["params"]
             params = _mutate_params(rng, parent, float(me.mutation_sigma))
-            origin = f"mut[{parent_cell[0]},{parent_cell[1]}]"
+            origin = f"mut[{parent_cell[0]}]"
 
-        fitness, bd, mask, M_final = _evaluate_params(
+        fitness, bd, mask, M_final, info = _evaluate_params(
             params, grid, int(me.frames), int(me.steps_per_frame),
             float(me.r_min_voxels), int(cfg.seed) + i)
         cell = _bd_cell(bd, archive_shape, bd_ranges)
@@ -1030,56 +1098,66 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
         replaced = cur is None or fitness > cur["fitness"]
         if replaced:
             archive[cell] = dict(params=params, fitness=fitness, bd=bd,
-                                 mask=mask, M_final=M_final, eval_idx=i)
+                                 mask=mask, M_final=M_final, info=info,
+                                 eval_idx=i)
         elapsed = time.perf_counter() - t0
         rate = (i + 1) / max(elapsed, 1e-6)
-        print(f"  eval {i+1:3d}/{me.n_evals} {origin:>14s}  "
-              f"bd=({bd[0]:.3f},{bd[1]:.2f})  cell={cell}  "
-              f"fit={fitness:7.3f}  archive={len(archive):3d}  "
+        print(f"  eval {i+1:3d}/{me.n_evals} {origin:>11s}  "
+              f"edt={bd[0]:5.2f}  cell={cell[0]:2d}  "
+              f"fit={fitness:7.4f}  archive={len(archive):3d}  "
               f"{rate:.2f} ev/s  {'*' if replaced else ''}")
 
-    # Persist final archive: per-cell .npy + .stl + a rotating-MIP gif for
-    # every printable survivor, plus a single archive.csv with all params.
+    # Persist final archive: per-cell .npy + .stl + a rotating solid-render gif
+    # for every printable survivor, plus a single archive.csv with all params.
     rows = []
     n_gif = 0
     gif_screen = max(96, int(cfg.render_size) // 2)
     gif_n_steps = max(64, int(cfg.n_steps) // 2)
-    for (i, j), e in archive.items():
-        d = dict(cell_i=i, cell_j=j,
-                 opening_ratio=e["bd"][0], edt_median=e["bd"][1],
+    for (i,), e in archive.items():
+        d = dict(cell=i, edt_median=e["bd"][0],
+                 sa_to_vol=e["info"]["sa_to_vol"],
+                 opening_ratio=e["info"]["opening_ratio"],
+                 volume_fill=e["info"]["volume_fill"],
+                 bottom_frac=e["info"]["bottom_frac"],
+                 top_filled=e["info"]["top_filled"],
+                 wall_filled=e["info"]["wall_filled"],
                  fitness=e["fitness"], eval_idx=e["eval_idx"])
         for f in PARAM_FIELDS:
             d[f] = getattr(e["params"], f)
         rows.append(d)
         if e["mask"] is not None:
-            stem = f"cell_{i:02d}_{j:02d}_fit{e['fitness']:.3f}"
+            stem = f"cell_{i:02d}_fit{e['fitness']:.4f}"
             np.save(arch_dir / f"{stem}.npy", e["mask"])
             export_stl(e["mask"], arch_dir / f"{stem}.stl",
                        voxel_size_mm=float(cfg.printability.voxel_size_mm))
-            if e["M_final"] is not None:
-                M_jax = jnp.asarray(e["M_final"])
-                D_, H_, W_ = M_jax.shape[:3]
-                # render_mip walks state.X/V shapes but only samples state.M;
-                # pass dummy X/V of the right shape so the JIT cache reuses.
-                dummy = jnp.zeros((D_, H_, W_, 3), dtype=jnp.float32)
-                state = State3D(dummy, dummy, M_jax)
-                gif_frames = []
-                n_views = 48
-                for v in range(n_views):
-                    theta, phi = orbit_view(v, n_views, phi_amp=1.0)
-                    img = np.asarray(render_mip_jit(state,
-                                                    theta=float(theta),
-                                                    phi=float(phi),
-                                                    screen=gif_screen,
-                                                    n_steps=gif_n_steps))
-                    gif_frames.append((img * 255).astype(np.uint8))
-                iio.imwrite(arch_dir / f"{stem}.gif", gif_frames,
-                            duration=110, loop=0)
-                n_gif += 1
+            # Render exactly what gets printed: the binary mask (optimal
+            # threshold, largest connected component) as a fully opaque solid,
+            # so thin density regions don't read as wispy.
+            mask_jax = jnp.asarray(e["mask"], dtype=jnp.float32)
+            M_jax = jnp.stack([mask_jax, mask_jax], axis=-1)
+            D_, H_, W_ = M_jax.shape[:3]
+            # render walks state.X/V shapes but only samples state.M;
+            # pass dummy X/V of the right shape so the JIT cache reuses.
+            dummy = jnp.zeros((D_, H_, W_, 3), dtype=jnp.float32)
+            state = State3D(dummy, dummy, M_jax)
+            gif_frames = []
+            n_views = 48
+            for v in range(n_views):
+                theta, phi = orbit_view(v, n_views, phi_amp=1.0)
+                img = np.asarray(render_rm_jit(state,
+                                               theta=float(theta),
+                                               phi=float(phi),
+                                               screen=gif_screen,
+                                               n_steps=gif_n_steps,
+                                               mode="solid"))
+                gif_frames.append((img * 255).astype(np.uint8))
+            iio.imwrite(arch_dir / f"{stem}.gif", gif_frames,
+                        duration=110, loop=0)
+            n_gif += 1
 
     df = pl.DataFrame(rows).sort("fitness", descending=True)
     df.write_csv(out_dir / "mapelites_archive.csv")
-    print(f"\nfilled {len(archive)} / {archive_shape[0]*archive_shape[1]} cells "
+    print(f"\nfilled {len(archive)} / {math.prod(archive_shape)} cells "
           f"in {time.perf_counter() - t0:.1f}s — "
           f"wrote {out_dir / 'mapelites_archive.csv'} and "
           f"{arch_dir} ({sum(e['mask'] is not None for e in archive.values())} "
@@ -1182,8 +1260,12 @@ def run_3d(cfg: DictConfig, params: PhysarumParams, out_dir: Path):
             trail,
             r_min_voxels=float(pcfg.r_min_voxels),
             n_thresholds=int(pcfg.n_thresholds),
-            kept_fraction_min=float(pcfg.kept_fraction_min),
-            opening_ratio_min=float(pcfg.opening_ratio_min))
+            opening_ratio_min=float(pcfg.opening_ratio_min),
+            volume_fill_min=float(pcfg.volume_fill_min),
+            volume_fill_max=float(pcfg.volume_fill_max),
+            top_clear_voxels=int(pcfg.top_clear_voxels),
+            bottom_fill_min=float(pcfg.bottom_fill_min),
+            bottom_fill_max=float(pcfg.bottom_fill_max))
         print(f"  sweep took {time.perf_counter() - ts:.2f}s")
         with pl.Config(tbl_rows=int(pcfg.n_thresholds), tbl_cols=-1,
                        float_precision=3):
@@ -1191,11 +1273,13 @@ def run_3d(cfg: DictConfig, params: PhysarumParams, out_dir: Path):
         df.write_csv(out_dir / cfg.out_report)
         print(f"wrote {out_dir / cfg.out_report}")
         if best_row is None:
-            print("no printable threshold found — lower r_min_voxels, loosen "
-                  "the printability thresholds, or tune params toward thicker "
-                  "structure (higher deposit, lower decay, lower sd/ra).")
+            print("no printable threshold found — lower r_min_voxels or "
+                  "opening_ratio_min, or tune params toward thicker structure "
+                  "(higher deposit, lower decay, lower sd/ra).")
         else:
             print(f"best printable threshold: t={best_row['threshold']:.3f}  "
+                  f"fitness={best_row['fitness']:.3f}  "
+                  f"fill={best_row['volume_fill']:.3f}  "
                   f"sa/vol={best_row['sa_to_vol']:.3f}  "
                   f"volume={best_row['volume']}  "
                   f"opening_ratio={best_row['opening_ratio']:.3f}  "

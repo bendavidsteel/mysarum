@@ -27,8 +27,10 @@ printability:
   r_min_voxels: 2
   n_thresholds: 12
   opening_ratio_min: 0.5
-  volume_fill_min: 0.1     # reject specks; shape must fill >10% of the cube
+  volume_fill_min: 0.05    # reject specks; shape must fill >5% of the cube
   volume_fill_max: 0.6     # reject near-solid blocks; must fill <60%
+  edt_median_min: 1.5      # typical wall must exceed 1.5 voxels half-thickness
+  edt_reward_tau: 2.5      # tanh scale for the diminishing thickness reward
   top_clear_voxels: 1      # top N z-slices must be empty (clear of ceiling)
   bottom_fill_min: 0.1     # base footprint must cover >10% of the bottom face
   bottom_fill_max: 0.8     # ...and <80% (a real base, not a full slab)

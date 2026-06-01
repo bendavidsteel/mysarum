@@ -783,7 +783,8 @@ def _largest_cc_gpu(mask, struct26):
 def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                         n_thresholds=12,
                         opening_ratio_min=0.5,
-                        volume_fill_min=0.1, volume_fill_max=0.6,
+                        volume_fill_min=0.05, volume_fill_max=0.6,
+                        edt_median_min=1.5, edt_reward_tau=2.5,
                         top_clear_voxels=1,
                         bottom_fill_min=0.1, bottom_fill_max=0.8,
                         cylinder_penalty_scale=0.006):
@@ -802,13 +803,16 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
         everywhere);
       • volume_fill ∈ (volume_fill_min, volume_fill_max) — neither specks nor a
         near-solid block (volume_fill = occupied voxels / total grid voxels);
+      • edt_median > edt_median_min — typical wall thick enough to print;
       • the top `top_clear_voxels` z-slices and all four side walls are empty,
         so the object touches no ceiling or wall of the print volume;
       • the bottom face (z=0) footprint fraction ∈ (bottom_fill_min,
         bottom_fill_max) — a real base to stand on, but not a full slab.
     Array axis 0 is z (spawn base at z=0); axes 1,2 are the walls. Among
-    printable rows the "best" maximizes fitness = sa_to_vol × cyl_mult, where
-    cyl_mult = exp(-penalty / cylinder_penalty_scale) softly punishes mass
+    printable rows the "best" maximizes fitness = sa_to_vol × cyl_mult ×
+    tanh(edt_median / edt_reward_tau) — veininess, with a diminishing-returns
+    bonus for thickness; cyl_mult = exp(-penalty / cylinder_penalty_scale)
+    softly punishes mass
     outside the largest vertical cylinder that fits the volume (corner / near-
     wall content that looks "grown in a box"); penalty = Σ over filled voxels
     of their radial excess past the cylinder, ÷ total voxels (1.0 = all inside).
@@ -850,6 +854,7 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
             rows.append(dict(threshold=float(t), kept_fraction=0.0, volume=0,
                              volume_fill=0.0, top_filled=0, wall_filled=0,
                              bottom_frac=0.0, outside_frac=0.0, cyl_mult=1.0,
+                             edt_reward=0.0,
                              edt_min=0.0, edt_q01=0.0, edt_median=0.0,
                              opening_ratio=0.0, surface_area=0,
                              sa_to_vol=0.0, fitness=0.0, printable=False))
@@ -886,12 +891,17 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
         outside_frac = float((mask & (excess_xy[None, :, :] > 0)).sum()) / vol
         cyl_mult = float(np.exp(-(outside_sum / total_voxels)
                                 / cylinder_penalty_scale))
-        # Reward veininess (surface/volume), scaled by the cylinder multiplier.
-        # opening_ratio and volume_fill are gates (below), not fitness terms.
-        fitness = sa_to_vol * cyl_mult
+        # Diminishing-returns reward for thicker (more printable) structure;
+        # tanh saturates so 2→3 voxels of half-thickness helps more than 4→5.
+        edt_reward = float(np.tanh(edt_med / edt_reward_tau))
+        # Reward veininess (surface/volume), scaled by the cylinder multiplier
+        # and the thickness reward. opening_ratio, volume_fill, and the
+        # edt_median floor are gates (below), not fitness terms.
+        fitness = sa_to_vol * cyl_mult * edt_reward
 
         printable = (opening_ratio >= opening_ratio_min
                      and volume_fill_min < volume_fill < volume_fill_max
+                     and edt_med > edt_median_min
                      and top_filled == 0
                      and wall_filled == 0
                      and bottom_fill_min < bottom_frac < bottom_fill_max)
@@ -904,6 +914,7 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                          bottom_frac=bottom_frac,
                          outside_frac=outside_frac,
                          cyl_mult=cyl_mult,
+                         edt_reward=edt_reward,
                          edt_min=edt_min, edt_q01=edt_q01, edt_median=edt_med,
                          opening_ratio=opening_ratio,
                          surface_area=surface_area,
@@ -1061,7 +1072,8 @@ def _evaluate_params(params: PhysarumParams, grid, frames, steps_per_frame,
                     top_filled=row["top_filled"],
                     wall_filled=row["wall_filled"],
                     outside_frac=row["outside_frac"],
-                    cyl_mult=row["cyl_mult"])
+                    cyl_mult=row["cyl_mult"],
+                    edt_reward=row["edt_reward"])
 
     if best_row is not None:
         return (best_row["fitness"],
@@ -1157,6 +1169,7 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
                  wall_filled=e["info"]["wall_filled"],
                  outside_frac=e["info"]["outside_frac"],
                  cyl_mult=e["info"]["cyl_mult"],
+                 edt_reward=e["info"]["edt_reward"],
                  fitness=e["fitness"], eval_idx=e["eval_idx"])
         for f in PARAM_FIELDS:
             d[f] = getattr(e["params"], f)
@@ -1300,6 +1313,8 @@ def run_3d(cfg: DictConfig, params: PhysarumParams, out_dir: Path):
             opening_ratio_min=float(pcfg.opening_ratio_min),
             volume_fill_min=float(pcfg.volume_fill_min),
             volume_fill_max=float(pcfg.volume_fill_max),
+            edt_median_min=float(pcfg.edt_median_min),
+            edt_reward_tau=float(pcfg.edt_reward_tau),
             top_clear_voxels=int(pcfg.top_clear_voxels),
             bottom_fill_min=float(pcfg.bottom_fill_min),
             bottom_fill_max=float(pcfg.bottom_fill_max),

@@ -24,11 +24,11 @@ out_stl: reint_3d_volume.stl
 # 3D printability sweep (run after the sim)
 printability:
   enabled: true
-  r_min_voxels: 3
+  r_min_voxels: 2
   n_thresholds: 12
-  opening_ratio_min: 0.8
+  opening_ratio_min: 0.5
   volume_fill_min: 0.1     # reject specks; shape must fill >10% of the cube
-  volume_fill_max: 0.5     # reject near-solid blocks; must fill <50%
+  volume_fill_max: 0.6     # reject near-solid blocks; must fill <60%
   top_clear_voxels: 1      # top N z-slices must be empty (clear of ceiling)
   bottom_fill_min: 0.1     # base footprint must cover >10% of the bottom face
   bottom_fill_max: 0.8     # ...and <80% (a real base, not a full slab)
@@ -40,11 +40,12 @@ mapelites:
   enabled: false
   n_evals: 200
   init_evals: 20         # uniform-random seeds before mutation kicks in
-  archive_shape: [16]       # 1-D archive indexed by edt_median
+  archive_shape: [8, 5]     # 2-D: edt_median (thickness) × volume_fill
   bd_ranges:
-    edt_median: [0.0, 16.0]
+    edt_median: [0.0, 10.0]
+    volume_fill: [0.1, 0.6]
   mutation_sigma: 0.1    # fraction of each PARAM_BOUND span
   grid: [64, 64, 64]     # smaller eval grid to keep wall time tractable
   frames: 40
   steps_per_frame: 2
-  r_min_voxels: 3
+  r_min_voxels: 2

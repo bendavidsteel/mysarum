@@ -24,7 +24,7 @@ become more sensitive in dense regions ("primary special sauce").
     statistics, morphological-opening survival, and surface/volume.
   export_stl           — marching cubes on the chosen mask + binary STL.
   map_elites_run       — quality-diversity search over PhysarumParams,
-    archive indexed by (sa_to_vol, edt_median).
+    archive indexed by (edt_median, volume_fill).
 
 Entry point: hydra. Run with
     python reint_jax.py                          # default config (3D, weblike)
@@ -780,10 +780,10 @@ def _largest_cc_gpu(mask, struct26):
     return labels == int(cp.argmax(counts))
 
 
-def printability_report(trail, r_min_voxels=3.0, thresholds=None,
+def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                         n_thresholds=12,
-                        opening_ratio_min=0.8,
-                        volume_fill_min=0.1, volume_fill_max=0.5,
+                        opening_ratio_min=0.5,
+                        volume_fill_min=0.1, volume_fill_max=0.6,
                         top_clear_voxels=1,
                         bottom_fill_min=0.1, bottom_fill_max=0.8):
     """GPU threshold sweep for 3D-printability of a trail volume.
@@ -1007,7 +1007,7 @@ def _evaluate_params(params: PhysarumParams, grid, frames, steps_per_frame,
 
     fitness = sa_to_vol at the best printable threshold, or -inf if no
     threshold was printable.
-    The single behavior descriptor is edt_median at that threshold.
+    The behavior descriptors are (edt_median, volume_fill) at that threshold.
     Falls back to the highest-fitness threshold when nothing is printable, so
     unprintable individuals still get a BD coordinate.
     info carries the scalar metrics (sa_to_vol, opening_ratio, volume_fill,
@@ -1039,7 +1039,7 @@ def _evaluate_params(params: PhysarumParams, grid, frames, steps_per_frame,
 
     if best_row is not None:
         return (best_row["fitness"],
-                (best_row["edt_median"],),
+                (best_row["edt_median"], best_row["volume_fill"]),
                 best_mask,
                 np.asarray(state.M),
                 _info(best_row))
@@ -1047,7 +1047,7 @@ def _evaluate_params(params: PhysarumParams, grid, frames, steps_per_frame,
     best_idx = int(df.select(pl.col("fitness").arg_max()).item())
     fallback = df.row(best_idx, named=True)
     return (-float("inf"),
-            (fallback["edt_median"],),
+            (fallback["edt_median"], fallback["volume_fill"]),
             None,
             None,
             _info(fallback))
@@ -1056,8 +1056,9 @@ def _evaluate_params(params: PhysarumParams, grid, frames, steps_per_frame,
 def map_elites_run(cfg: DictConfig, out_dir: Path):
     """Quality-diversity search over PhysarumParams.
 
-    Archive is a 1-D grid indexed by edt_median.  Each cell holds the
-    highest-fitness (= sa_to_vol) individual whose descriptor lands there. We:
+    Archive is a 2-D grid indexed by (edt_median, volume_fill).  Each cell
+    holds the highest-fitness (= sa_to_vol) individual whose descriptors land
+    there. We:
       1) seed the archive with `init_evals` uniform-random params
       2) loop `n_evals - init_evals` more times, each iteration mutating a
          random *printable* archive member with Gaussian noise (unprintable
@@ -1068,11 +1069,12 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
     """
     me = cfg.mapelites
     archive_shape = tuple(me.archive_shape)
-    bd_ranges = (tuple(me.bd_ranges.edt_median),)
+    bd_ranges = (tuple(me.bd_ranges.edt_median),
+                 tuple(me.bd_ranges.volume_fill))
     grid = tuple(me.grid)
     rng = np.random.default_rng(int(cfg.seed))
 
-    archive = {}  # (i,) -> dict(params, fitness, bd, mask, info, eval_idx)
+    archive = {}  # (i,j) -> dict(params, fitness, bd, mask, info, eval_idx)
     arch_dir = out_dir / "archive"
     arch_dir.mkdir(exist_ok=True)
 
@@ -1091,7 +1093,7 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
             parent_cell = printable_cells[rng.integers(len(printable_cells))]
             parent = archive[parent_cell]["params"]
             params = _mutate_params(rng, parent, float(me.mutation_sigma))
-            origin = f"mut[{parent_cell[0]}]"
+            origin = "mut[" + ",".join(map(str, parent_cell)) + "]"
 
         fitness, bd, mask, M_final, info = _evaluate_params(
             params, grid, int(me.frames), int(me.steps_per_frame),
@@ -1106,8 +1108,9 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
                                  eval_idx=i)
         elapsed = time.perf_counter() - t0
         rate = (i + 1) / max(elapsed, 1e-6)
-        print(f"  eval {i+1:3d}/{me.n_evals} {origin:>11s}  "
-              f"edt={bd[0]:5.2f}  cell={cell[0]:2d}  "
+        bd_str = "(" + ",".join(f"{v:.2f}" for v in bd) + ")"
+        print(f"  eval {i+1:4d}/{me.n_evals} {origin:>13s}  "
+              f"edt,fill={bd_str}  cell={str(cell):8s}  "
               f"fit={fitness:7.4f}  archive={len(archive):3d}  "
               f"{rate:.2f} ev/s  {'*' if replaced else ''}")
 
@@ -1117,11 +1120,12 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
     n_gif = 0
     gif_screen = max(96, int(cfg.render_size) // 2)
     gif_n_steps = max(64, int(cfg.n_steps) // 2)
-    for (i,), e in archive.items():
-        d = dict(cell=i, edt_median=e["bd"][0],
+    for cell, e in archive.items():
+        d = dict(cell_edt=cell[0], cell_fill=cell[1],
                  sa_to_vol=e["info"]["sa_to_vol"],
                  opening_ratio=e["info"]["opening_ratio"],
                  volume_fill=e["info"]["volume_fill"],
+                 edt_median=e["info"]["edt_median"],
                  bottom_frac=e["info"]["bottom_frac"],
                  top_filled=e["info"]["top_filled"],
                  wall_filled=e["info"]["wall_filled"],
@@ -1130,7 +1134,8 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
             d[f] = getattr(e["params"], f)
         rows.append(d)
         if e["mask"] is not None:
-            stem = f"cell_{i:02d}_fit{e['fitness']:.4f}"
+            stem = "cell_" + "_".join(f"{c:02d}" for c in cell) \
+                   + f"_fit{e['fitness']:.4f}"
             np.save(arch_dir / f"{stem}.npy", e["mask"])
             export_stl(e["mask"], arch_dir / f"{stem}.stl",
                        voxel_size_mm=float(cfg.printability.voxel_size_mm))

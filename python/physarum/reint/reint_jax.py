@@ -785,7 +785,8 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                         opening_ratio_min=0.5,
                         volume_fill_min=0.1, volume_fill_max=0.6,
                         top_clear_voxels=1,
-                        bottom_fill_min=0.1, bottom_fill_max=0.8):
+                        bottom_fill_min=0.1, bottom_fill_max=0.8,
+                        cylinder_penalty_scale=0.006):
     """GPU threshold sweep for 3D-printability of a trail volume.
 
     For each candidate threshold t:
@@ -806,13 +807,28 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
       • the bottom face (z=0) footprint fraction ∈ (bottom_fill_min,
         bottom_fill_max) — a real base to stand on, but not a full slab.
     Array axis 0 is z (spawn base at z=0); axes 1,2 are the walls. Among
-    printable rows the "best" maximizes fitness = sa_to_vol (the veiniest, most
-    surface-rich shape that still clears every gate).
+    printable rows the "best" maximizes fitness = sa_to_vol × cyl_mult, where
+    cyl_mult = exp(-penalty / cylinder_penalty_scale) softly punishes mass
+    outside the largest vertical cylinder that fits the volume (corner / near-
+    wall content that looks "grown in a box"); penalty = Σ over filled voxels
+    of their radial excess past the cylinder, ÷ total voxels (1.0 = all inside).
 
     Returns (df, best_mask, best_row).
     """
     trail_gpu = cp.asarray(trail, dtype=cp.float32)
     total_voxels = int(trail_gpu.size)
+
+    # Per-(y,x) radial excess outside the largest vertical cylinder that fits
+    # the volume (axis through the centre, radius = min(H,W)/2), normalised by
+    # that radius so it is resolution-independent: 0 inside, ~0.41 at corners.
+    D_, H_, W_ = trail_gpu.shape
+    cy, cx = (H_ - 1) / 2.0, (W_ - 1) / 2.0
+    r_cyl = min(H_, W_) / 2.0
+    yy, xx = cp.meshgrid(cp.arange(H_), cp.arange(W_), indexing="ij")
+    excess_xy = cp.maximum(
+        0.0, cp.sqrt((yy - cy) ** 2 + (xx - cx) ** 2) / r_cyl - 1.0
+    ).astype(cp.float32)
+
     nz = trail_gpu[trail_gpu > 0]
     if nz.size == 0:
         raise ValueError("trail is all zeros")
@@ -833,7 +849,7 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
         if vol0 == 0:
             rows.append(dict(threshold=float(t), kept_fraction=0.0, volume=0,
                              volume_fill=0.0, top_filled=0, wall_filled=0,
-                             bottom_frac=0.0,
+                             bottom_frac=0.0, outside_frac=0.0, cyl_mult=1.0,
                              edt_min=0.0, edt_q01=0.0, edt_median=0.0,
                              opening_ratio=0.0, surface_area=0,
                              sa_to_vol=0.0, fitness=0.0, printable=False))
@@ -864,9 +880,15 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
         wall_filled = int(mask[:, 0, :].sum() + mask[:, -1, :].sum()
                           + mask[:, :, 0].sum() + mask[:, :, -1].sum())
         bottom_frac = float(mask[0].sum()) / float(mask.shape[1] * mask.shape[2])
-        # Reward veininess (surface/volume). opening_ratio and volume_fill are
-        # gates (below), not fitness terms.
-        fitness = sa_to_vol
+        # Soft cylinder penalty: punish corner/near-wall mass (looks grown in a
+        # box) by how far + how much sits outside the inscribed cylinder.
+        outside_sum = float((mask * excess_xy[None, :, :]).sum())
+        outside_frac = float((mask & (excess_xy[None, :, :] > 0)).sum()) / vol
+        cyl_mult = float(np.exp(-(outside_sum / total_voxels)
+                                / cylinder_penalty_scale))
+        # Reward veininess (surface/volume), scaled by the cylinder multiplier.
+        # opening_ratio and volume_fill are gates (below), not fitness terms.
+        fitness = sa_to_vol * cyl_mult
 
         printable = (opening_ratio >= opening_ratio_min
                      and volume_fill_min < volume_fill < volume_fill_max
@@ -880,6 +902,8 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                          top_filled=top_filled,
                          wall_filled=wall_filled,
                          bottom_frac=bottom_frac,
+                         outside_frac=outside_frac,
+                         cyl_mult=cyl_mult,
                          edt_min=edt_min, edt_q01=edt_q01, edt_median=edt_med,
                          opening_ratio=opening_ratio,
                          surface_area=surface_area,
@@ -1035,7 +1059,9 @@ def _evaluate_params(params: PhysarumParams, grid, frames, steps_per_frame,
                     edt_median=row["edt_median"],
                     bottom_frac=row["bottom_frac"],
                     top_filled=row["top_filled"],
-                    wall_filled=row["wall_filled"])
+                    wall_filled=row["wall_filled"],
+                    outside_frac=row["outside_frac"],
+                    cyl_mult=row["cyl_mult"])
 
     if best_row is not None:
         return (best_row["fitness"],
@@ -1129,6 +1155,8 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
                  bottom_frac=e["info"]["bottom_frac"],
                  top_filled=e["info"]["top_filled"],
                  wall_filled=e["info"]["wall_filled"],
+                 outside_frac=e["info"]["outside_frac"],
+                 cyl_mult=e["info"]["cyl_mult"],
                  fitness=e["fitness"], eval_idx=e["eval_idx"])
         for f in PARAM_FIELDS:
             d[f] = getattr(e["params"], f)
@@ -1274,7 +1302,8 @@ def run_3d(cfg: DictConfig, params: PhysarumParams, out_dir: Path):
             volume_fill_max=float(pcfg.volume_fill_max),
             top_clear_voxels=int(pcfg.top_clear_voxels),
             bottom_fill_min=float(pcfg.bottom_fill_min),
-            bottom_fill_max=float(pcfg.bottom_fill_max))
+            bottom_fill_max=float(pcfg.bottom_fill_max),
+            cylinder_penalty_scale=float(pcfg.cylinder_penalty_scale))
         print(f"  sweep took {time.perf_counter() - ts:.2f}s")
         with pl.Config(tbl_rows=int(pcfg.n_thresholds), tbl_cols=-1,
                        float_precision=3):

@@ -34,7 +34,7 @@ printability:
   top_clear_voxels: 1      # top N z-slices must be empty (clear of ceiling)
   bottom_fill_min: 0.1     # base footprint must cover >10% of the bottom face
   bottom_fill_max: 0.8     # ...and <80% (a real base, not a full slab)
-  cylinder_penalty_scale: 0.006   # smaller = harsher penalty on corner mass
+  cylinder_penalty_scale: 0.003   # smaller = harsher penalty on corner mass
   export_stl: true
   voxel_size_mm: 0.4   # 128 voxels × 0.4 mm = 51.2 mm cube
 

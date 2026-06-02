@@ -787,7 +787,7 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                         edt_median_min=1.5, edt_reward_tau=2.5,
                         top_clear_voxels=1,
                         bottom_fill_min=0.1, bottom_fill_max=0.8,
-                        cylinder_penalty_scale=0.006):
+                        cylinder_penalty_scale=0.003):
     """GPU threshold sweep for 3D-printability of a trail volume.
 
     For each candidate threshold t:
@@ -1156,8 +1156,8 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
     # for every printable survivor, plus a single archive.csv with all params.
     rows = []
     n_gif = 0
-    gif_screen = max(96, int(cfg.render_size) // 2)
-    gif_n_steps = max(64, int(cfg.n_steps) // 2)
+    gif_screen = max(384, int(cfg.render_size) * 2)   # 4× the previous 96 px
+    gif_n_steps = max(256, int(cfg.n_steps) * 2)       # 4× the previous 64
     for cell, e in archive.items():
         d = dict(cell_edt=cell[0], cell_fill=cell[1],
                  sa_to_vol=e["info"]["sa_to_vol"],

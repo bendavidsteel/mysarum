@@ -783,7 +783,7 @@ def _largest_cc_gpu(mask, struct26):
 def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                         n_thresholds=12,
                         opening_ratio_min=0.5,
-                        volume_fill_min=0.05, volume_fill_max=0.6,
+                        volume_fill_min=0.05, volume_fill_max=0.35,
                         edt_median_min=1.5, edt_reward_tau=2.5,
                         top_clear_voxels=1,
                         bottom_fill_min=0.1, bottom_fill_max=0.8,

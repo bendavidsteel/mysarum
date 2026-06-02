@@ -787,7 +787,8 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                         edt_median_min=1.5, edt_reward_tau=2.5,
                         top_clear_voxels=1,
                         bottom_fill_min=0.1, bottom_fill_max=0.8,
-                        cylinder_penalty_scale=0.003):
+                        cylinder_penalty_scale=0.003,
+                        overhang_free=0.03, overhang_penalty_scale=0.1):
     """GPU threshold sweep for 3D-printability of a trail volume.
 
     For each candidate threshold t:
@@ -810,9 +811,10 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
         bottom_fill_max) — a real base to stand on, but not a full slab.
     Array axis 0 is z (spawn base at z=0); axes 1,2 are the walls. Among
     printable rows the "best" maximizes fitness = sa_to_vol × cyl_mult ×
-    tanh(edt_median / edt_reward_tau) — veininess, with a diminishing-returns
-    bonus for thickness; cyl_mult = exp(-penalty / cylinder_penalty_scale)
-    softly punishes mass
+    overhang_mult × tanh(edt_median / edt_reward_tau) — veininess, with a
+    diminishing-returns bonus for thickness; overhang_mult softly punishes
+    self-support violations beyond overhang_free (45° cone); cyl_mult =
+    exp(-penalty / cylinder_penalty_scale) softly punishes mass
     outside the largest vertical cylinder that fits the volume (corner / near-
     wall content that looks "grown in a box"); penalty = Σ over filled voxels
     of their radial excess past the cylinder, ÷ total voxels (1.0 = all inside).
@@ -844,6 +846,9 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
     struct26 = cp.ones((3, 3, 3), dtype=bool)
     struct6 = cp.asarray(_struct_6conn())
     ball = cp.asarray(_ball_struct(r_min_voxels))
+    # 3×3 in-plane element: a voxel is self-supported if any voxel in the 3×3
+    # x-y neighbourhood one layer below is filled (≈45° FDM support cone).
+    struct_xy = cp.ones((1, 3, 3), dtype=bool)
 
     rows = []
     masks = {}
@@ -854,6 +859,7 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
             rows.append(dict(threshold=float(t), kept_fraction=0.0, volume=0,
                              volume_fill=0.0, top_filled=0, wall_filled=0,
                              bottom_frac=0.0, outside_frac=0.0, cyl_mult=1.0,
+                             overhang_frac=0.0, overhang_mult=1.0,
                              edt_reward=0.0,
                              edt_min=0.0, edt_q01=0.0, edt_median=0.0,
                              opening_ratio=0.0, surface_area=0,
@@ -891,13 +897,24 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
         outside_frac = float((mask & (excess_xy[None, :, :] > 0)).sum()) / vol
         cyl_mult = float(np.exp(-(outside_sum / total_voxels)
                                 / cylinder_penalty_scale))
+        # Overhang / self-support: a filled voxel is supported if any voxel in
+        # the 3×3 x-y patch one layer below is filled (≈45° cone), or it rests
+        # on the base. overhang_frac = unsupported share; a free allowance is
+        # forgiven (small overhangs print fine), the rest softly penalised.
+        below = cp.zeros_like(mask)
+        below[1:] = mask[:-1]
+        support = cndi.binary_dilation(below, structure=struct_xy)
+        support[0] = True
+        overhang_frac = float((mask & ~support).sum()) / vol
+        overhang_mult = float(np.exp(-max(0.0, overhang_frac - overhang_free)
+                                     / overhang_penalty_scale))
         # Diminishing-returns reward for thicker (more printable) structure;
         # tanh saturates so 2→3 voxels of half-thickness helps more than 4→5.
         edt_reward = float(np.tanh(edt_med / edt_reward_tau))
-        # Reward veininess (surface/volume), scaled by the cylinder multiplier
-        # and the thickness reward. opening_ratio, volume_fill, and the
-        # edt_median floor are gates (below), not fitness terms.
-        fitness = sa_to_vol * cyl_mult * edt_reward
+        # Reward veininess (surface/volume), scaled by the cylinder and
+        # overhang multipliers and the thickness reward. opening_ratio,
+        # volume_fill, and the edt_median floor are gates, not fitness terms.
+        fitness = sa_to_vol * cyl_mult * overhang_mult * edt_reward
 
         printable = (opening_ratio >= opening_ratio_min
                      and volume_fill_min < volume_fill < volume_fill_max
@@ -914,6 +931,8 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                          bottom_frac=bottom_frac,
                          outside_frac=outside_frac,
                          cyl_mult=cyl_mult,
+                         overhang_frac=overhang_frac,
+                         overhang_mult=overhang_mult,
                          edt_reward=edt_reward,
                          edt_min=edt_min, edt_q01=edt_q01, edt_median=edt_med,
                          opening_ratio=opening_ratio,
@@ -1035,60 +1054,55 @@ def _bd_cell(bd, archive_shape, bd_ranges):
     return tuple(idx)
 
 
-def _evaluate_params(params: PhysarumParams, grid, frames, steps_per_frame,
-                     r_min_voxels, seed):
-    """Run a short 3D sim with `params`. Returns (fitness, (bd,), best_mask,
-    M_final, info).
+_INFO_KEYS = ("sa_to_vol", "opening_ratio", "volume_fill", "edt_median",
+              "bottom_frac", "top_filled", "wall_filled", "outside_frac",
+              "cyl_mult", "overhang_frac", "overhang_mult", "edt_reward")
 
-    fitness = sa_to_vol at the best printable threshold, or -inf if no
-    threshold was printable.
-    The behavior descriptors are (edt_median, volume_fill) at that threshold.
-    Falls back to the highest-fitness threshold when nothing is printable, so
-    unprintable individuals still get a BD coordinate.
-    info carries the scalar metrics (sa_to_vol, opening_ratio, volume_fill,
-    edt_median) at the chosen threshold, for the archive CSV.
-    M_final is the (D,H,W,2) (mass,trail) field as a host np.float32 array —
-    used downstream to render a rotating-MIP gif for printable archive cells.
-    Returned only when the individual is printable (None otherwise), to keep
-    the per-eval memory footprint bounded.
+
+def _candidate_from_trail(trail, r_min_voxels, step):
+    """Evaluate one trail volume → a candidate dict for the archive.
+
+    candidate = dict(fitness, bd=(edt_median, volume_fill), mask, info, step).
+    fitness = the printability fitness at the best printable threshold, or
+    -inf if none printable (then bd falls back to the highest-fitness row so
+    the shape still gets an archive coordinate, and mask is None).
+    """
+    df, best_mask, best_row = printability_report(
+        trail, r_min_voxels=r_min_voxels, n_thresholds=10)
+    if best_row is not None:
+        row, mask, fitness = best_row, best_mask, best_row["fitness"]
+    else:
+        idx = int(df.select(pl.col("fitness").arg_max()).item())
+        row, mask, fitness = df.row(idx, named=True), None, -float("inf")
+    return dict(fitness=fitness,
+                bd=(row["edt_median"], row["volume_fill"]),
+                mask=mask,
+                info={k: row[k] for k in _INFO_KEYS},
+                step=step)
+
+
+def _evaluate_params(params: PhysarumParams, grid, frames, steps_per_frame,
+                     r_min_voxels, seed, eval_interval):
+    """Run a short 3D sim with `params`, evaluating printability at several
+    growth checkpoints (every `eval_interval` frames, plus the final frame).
+
+    Returns a list of candidate dicts (one per checkpoint) — the sim is the
+    expensive part, so sampling it at multiple stages yields several
+    evaluatable shapes (sparse/thin early → fuller/thicker late) almost for
+    free. See `_candidate_from_trail` for the candidate schema.
     """
     D, H, W = grid
     key = jax.random.PRNGKey(int(seed))
     state = init_state_3d(key, D, H, W)
-    for _ in range(frames):
+    candidates = []
+    for fr in range(frames):
         for _ in range(steps_per_frame):
             state = step_3d_jit(state, params)
-    jax.block_until_ready(state.X)
-
-    trail = np.asarray(state.M[..., 1])
-    df, best_mask, best_row = printability_report(
-        trail, r_min_voxels=r_min_voxels, n_thresholds=10)
-    def _info(row):
-        return dict(sa_to_vol=row["sa_to_vol"],
-                    opening_ratio=row["opening_ratio"],
-                    volume_fill=row["volume_fill"],
-                    edt_median=row["edt_median"],
-                    bottom_frac=row["bottom_frac"],
-                    top_filled=row["top_filled"],
-                    wall_filled=row["wall_filled"],
-                    outside_frac=row["outside_frac"],
-                    cyl_mult=row["cyl_mult"],
-                    edt_reward=row["edt_reward"])
-
-    if best_row is not None:
-        return (best_row["fitness"],
-                (best_row["edt_median"], best_row["volume_fill"]),
-                best_mask,
-                np.asarray(state.M),
-                _info(best_row))
-
-    best_idx = int(df.select(pl.col("fitness").arg_max()).item())
-    fallback = df.row(best_idx, named=True)
-    return (-float("inf"),
-            (fallback["edt_median"], fallback["volume_fill"]),
-            None,
-            None,
-            _info(fallback))
+        if (fr + 1) % eval_interval == 0 or (fr + 1) == frames:
+            jax.block_until_ready(state.X)
+            trail = np.asarray(state.M[..., 1])
+            candidates.append(_candidate_from_trail(trail, r_min_voxels, fr + 1))
+    return candidates
 
 
 def map_elites_run(cfg: DictConfig, out_dir: Path):
@@ -1101,6 +1115,8 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
       2) loop `n_evals - init_evals` more times, each iteration mutating a
          random *printable* archive member with Gaussian noise (unprintable
          cells are never chosen as parents)
+      Each sim is evaluated at several growth checkpoints (every
+      `eval_interval` frames), so one sim yields multiple archive candidates.
       3) save final archive as a CSV, drop the best mask per occupied cell
          under <out_dir>/archive/, and emit per-cell STLs for printable
          survivors.
@@ -1110,14 +1126,17 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
     bd_ranges = (tuple(me.bd_ranges.edt_median),
                  tuple(me.bd_ranges.volume_fill))
     grid = tuple(me.grid)
+    eval_interval = int(me.eval_interval)
     rng = np.random.default_rng(int(cfg.seed))
 
-    archive = {}  # (i,j) -> dict(params, fitness, bd, mask, info, eval_idx)
+    archive = {}  # (i,j) -> dict(params, fitness, bd, mask, info, eval_idx, step)
     arch_dir = out_dir / "archive"
     arch_dir.mkdir(exist_ok=True)
 
-    print(f"\n=== MAP-Elites: {me.n_evals} evals, archive {archive_shape}, "
-          f"eval grid {grid}, frames {me.frames}×{me.steps_per_frame} ===")
+    n_chk = len(range(eval_interval, int(me.frames) + 1, eval_interval)) or 1
+    print(f"\n=== MAP-Elites: {me.n_evals} sims × ~{n_chk} checkpoints, archive "
+          f"{archive_shape}, eval grid {grid}, "
+          f"frames {me.frames}×{me.steps_per_frame} ===")
     t0 = time.perf_counter()
     for i in range(int(me.n_evals)):
         # Only mutate from printable elites — unprintable (-inf) cells are dead
@@ -1133,24 +1152,27 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
             params = _mutate_params(rng, parent, float(me.mutation_sigma))
             origin = "mut[" + ",".join(map(str, parent_cell)) + "]"
 
-        fitness, bd, mask, M_final, info = _evaluate_params(
+        # One sim → several candidates (growth checkpoints). Insert each.
+        candidates = _evaluate_params(
             params, grid, int(me.frames), int(me.steps_per_frame),
-            float(me.r_min_voxels), int(cfg.seed) + i)
-        cell = _bd_cell(bd, archive_shape, bd_ranges)
-
-        cur = archive.get(cell)
-        replaced = cur is None or fitness > cur["fitness"]
-        if replaced:
-            archive[cell] = dict(params=params, fitness=fitness, bd=bd,
-                                 mask=mask, M_final=M_final, info=info,
-                                 eval_idx=i)
+            float(me.r_min_voxels), int(cfg.seed) + i, eval_interval)
+        n_new = 0
+        best = max(candidates, key=lambda c: c["fitness"])
+        for cand in candidates:
+            cell = _bd_cell(cand["bd"], archive_shape, bd_ranges)
+            cur = archive.get(cell)
+            if cur is None or cand["fitness"] > cur["fitness"]:
+                archive[cell] = dict(params=params, fitness=cand["fitness"],
+                                     bd=cand["bd"], mask=cand["mask"],
+                                     info=cand["info"], eval_idx=i,
+                                     step=cand["step"])
+                n_new += 1
         elapsed = time.perf_counter() - t0
         rate = (i + 1) / max(elapsed, 1e-6)
-        bd_str = "(" + ",".join(f"{v:.2f}" for v in bd) + ")"
-        print(f"  eval {i+1:4d}/{me.n_evals} {origin:>13s}  "
-              f"edt,fill={bd_str}  cell={str(cell):8s}  "
-              f"fit={fitness:7.4f}  archive={len(archive):3d}  "
-              f"{rate:.2f} ev/s  {'*' if replaced else ''}")
+        bd_str = "(" + ",".join(f"{v:.2f}" for v in best["bd"]) + ")"
+        print(f"  sim {i+1:4d}/{me.n_evals} {origin:>13s}  "
+              f"best edt,fill={bd_str}  fit={best['fitness']:7.4f}  "
+              f"+{n_new}cells  archive={len(archive):3d}  {rate:.2f} sim/s")
 
     # Persist final archive: per-cell .npy + .stl + a rotating solid-render gif
     # for every printable survivor, plus a single archive.csv with all params.
@@ -1169,8 +1191,10 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
                  wall_filled=e["info"]["wall_filled"],
                  outside_frac=e["info"]["outside_frac"],
                  cyl_mult=e["info"]["cyl_mult"],
+                 overhang_frac=e["info"]["overhang_frac"],
+                 overhang_mult=e["info"]["overhang_mult"],
                  edt_reward=e["info"]["edt_reward"],
-                 fitness=e["fitness"], eval_idx=e["eval_idx"])
+                 fitness=e["fitness"], eval_idx=e["eval_idx"], step=e["step"])
         for f in PARAM_FIELDS:
             d[f] = getattr(e["params"], f)
         rows.append(d)
@@ -1318,7 +1342,9 @@ def run_3d(cfg: DictConfig, params: PhysarumParams, out_dir: Path):
             top_clear_voxels=int(pcfg.top_clear_voxels),
             bottom_fill_min=float(pcfg.bottom_fill_min),
             bottom_fill_max=float(pcfg.bottom_fill_max),
-            cylinder_penalty_scale=float(pcfg.cylinder_penalty_scale))
+            cylinder_penalty_scale=float(pcfg.cylinder_penalty_scale),
+            overhang_free=float(pcfg.overhang_free),
+            overhang_penalty_scale=float(pcfg.overhang_penalty_scale))
         print(f"  sweep took {time.perf_counter() - ts:.2f}s")
         with pl.Config(tbl_rows=int(pcfg.n_thresholds), tbl_cols=-1,
                        float_precision=3):

@@ -35,6 +35,8 @@ printability:
   bottom_fill_min: 0.1     # base footprint must cover >10% of the bottom face
   bottom_fill_max: 0.8     # ...and <80% (a real base, not a full slab)
   cylinder_penalty_scale: 0.003   # smaller = harsher penalty on corner mass
+  overhang_free: 0.03      # overhang fraction forgiven (small overhangs print)
+  overhang_penalty_scale: 0.1     # smaller = harsher penalty on overhangs
   export_stl: true
   voxel_size_mm: 0.4   # 128 voxels × 0.4 mm = 51.2 mm cube
 
@@ -51,4 +53,5 @@ mapelites:
   grid: [64, 64, 64]     # smaller eval grid to keep wall time tractable
   frames: 40
   steps_per_frame: 2
+  eval_interval: 10      # evaluate every N frames → ~frames/N candidates/sim
   r_min_voxels: 2

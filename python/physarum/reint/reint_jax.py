@@ -1016,23 +1016,26 @@ def export_stl(mask, path, voxel_size_mm=0.4, level=0.5):
 # Search bounds for each PhysarumParams field. (Conservative — sensor offsets
 # limited to ±1 voxel since they multiply against the local basis.)
 PARAM_BOUNDS = dict(
-    sd_base=(1.0, 5.0),
-    sd_power=(0.0, 3.0),
-    sd_scale=(0.0, 3.0),
-    sa_base=(0.1, 1.0),
-    sa_power=(0.0, 3.0),
-    sa_scale=(0.0, 1.0),
-    ra_base=(0.0, 0.8),
-    ra_power=(0.0, 3.0),
-    ra_scale=(0.0, 1.0),
-    md_base=(0.6, 1.5),
+    sd_base=(1.0, 8.0),
+    sd_power=(0.0, 4.0),
+    sd_scale=(0.0, 5.0),
+    sa_base=(0.1, 1.5),
+    sa_power=(0.0, 4.0),
+    sa_scale=(0.0, 1.5),
+    ra_base=(0.0, 1.5),
+    ra_power=(0.0, 4.0),
+    ra_scale=(0.0, 1.5),
+    # md is capped by the reintegration stencil (md·DT ≲ 2.5, DT=1.5 → md ≲
+    # 1.6); widen the *floor* only (slower agents), never the ceiling.
+    md_base=(0.3, 1.5),
     md_power=(0.0, 3.0),
     md_scale=(0.0, 0.5),
-    sensor_offset_right=(-1.0, 1.0),
-    sensor_offset_up=(-1.0, 1.0),
-    deposit=(0.05, 0.5),
-    decay=(0.85, 0.99),
+    sensor_offset_right=(-2.0, 2.0),
+    sensor_offset_up=(-2.0, 2.0),
+    deposit=(0.05, 1.0),
+    decay=(0.70, 0.99),
     # 0 = no pull (allow thin/veiny shapes); ~0.006 = tight compact base.
+    # Held: above this collapses to a blob that fails the fill/cylinder gates.
     center_pull=(0.0, 0.006),
 )
 PARAM_FIELDS = list(PARAM_BOUNDS.keys())

@@ -785,6 +785,7 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                         opening_ratio_min=0.5,
                         volume_fill_min=0.05, volume_fill_max=0.35,
                         edt_median_min=1.5, edt_reward_tau=2.5,
+                        sa_reward_tau=0.25,
                         top_clear_voxels=1,
                         bottom_fill_min=0.1, bottom_fill_max=0.8,
                         cylinder_penalty_scale=0.003,
@@ -810,9 +811,11 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
       • the bottom face (z=0) footprint fraction ∈ (bottom_fill_min,
         bottom_fill_max) — a real base to stand on, but not a full slab.
     Array axis 0 is z (spawn base at z=0); axes 1,2 are the walls. Among
-    printable rows the "best" maximizes fitness = sa_to_vol × cyl_mult ×
-    overhang_mult × tanh(edt_median / edt_reward_tau) — veininess, with a
-    diminishing-returns bonus for thickness; overhang_mult softly punishes
+    printable rows the "best" maximizes fitness = tanh(sa_to_vol /
+    sa_reward_tau) × cyl_mult × overhang_mult × tanh(edt_median /
+    edt_reward_tau) — diminishing-returns rewards for veininess and thickness
+    (both saturate, so maxing either out doesn't dominate); overhang_mult
+    softly punishes
     self-support violations beyond overhang_free (45° cone); cyl_mult =
     exp(-penalty / cylinder_penalty_scale) softly punishes mass
     outside the largest vertical cylinder that fits the volume (corner / near-
@@ -860,7 +863,7 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                              volume_fill=0.0, top_filled=0, wall_filled=0,
                              bottom_frac=0.0, outside_frac=0.0, cyl_mult=1.0,
                              overhang_frac=0.0, overhang_mult=1.0,
-                             edt_reward=0.0,
+                             edt_reward=0.0, sa_reward=0.0,
                              edt_min=0.0, edt_q01=0.0, edt_median=0.0,
                              opening_ratio=0.0, surface_area=0,
                              sa_to_vol=0.0, fitness=0.0, printable=False))
@@ -911,10 +914,14 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
         # Diminishing-returns reward for thicker (more printable) structure;
         # tanh saturates so 2→3 voxels of half-thickness helps more than 4→5.
         edt_reward = float(np.tanh(edt_med / edt_reward_tau))
-        # Reward veininess (surface/volume), scaled by the cylinder and
-        # overhang multipliers and the thickness reward. opening_ratio,
-        # volume_fill, and the edt_median floor are gates, not fitness terms.
-        fitness = sa_to_vol * cyl_mult * overhang_mult * edt_reward
+        # Diminishing-returns veininess reward: sa_to_vol is a good signal up
+        # to a point, but maxing it out (thin spiky shapes) isn't more
+        # desirable, so saturate it with tanh.
+        sa_reward = float(np.tanh(sa_to_vol / sa_reward_tau))
+        # Veininess × thickness rewards, scaled by the cylinder and overhang
+        # penalties. opening_ratio, volume_fill, and the edt_median floor are
+        # gates, not fitness terms.
+        fitness = sa_reward * cyl_mult * overhang_mult * edt_reward
 
         printable = (opening_ratio >= opening_ratio_min
                      and volume_fill_min < volume_fill < volume_fill_max
@@ -934,6 +941,7 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                          overhang_frac=overhang_frac,
                          overhang_mult=overhang_mult,
                          edt_reward=edt_reward,
+                         sa_reward=sa_reward,
                          edt_min=edt_min, edt_q01=edt_q01, edt_median=edt_med,
                          opening_ratio=opening_ratio,
                          surface_area=surface_area,
@@ -1056,7 +1064,8 @@ def _bd_cell(bd, archive_shape, bd_ranges):
 
 _INFO_KEYS = ("sa_to_vol", "opening_ratio", "volume_fill", "edt_median",
               "bottom_frac", "top_filled", "wall_filled", "outside_frac",
-              "cyl_mult", "overhang_frac", "overhang_mult", "edt_reward")
+              "cyl_mult", "overhang_frac", "overhang_mult", "edt_reward",
+              "sa_reward")
 
 
 def _candidate_from_trail(trail, r_min_voxels, step):
@@ -1194,6 +1203,7 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
                  overhang_frac=e["info"]["overhang_frac"],
                  overhang_mult=e["info"]["overhang_mult"],
                  edt_reward=e["info"]["edt_reward"],
+                 sa_reward=e["info"]["sa_reward"],
                  fitness=e["fitness"], eval_idx=e["eval_idx"], step=e["step"])
         for f in PARAM_FIELDS:
             d[f] = getattr(e["params"], f)
@@ -1339,6 +1349,7 @@ def run_3d(cfg: DictConfig, params: PhysarumParams, out_dir: Path):
             volume_fill_max=float(pcfg.volume_fill_max),
             edt_median_min=float(pcfg.edt_median_min),
             edt_reward_tau=float(pcfg.edt_reward_tau),
+            sa_reward_tau=float(pcfg.sa_reward_tau),
             top_clear_voxels=int(pcfg.top_clear_voxels),
             bottom_fill_min=float(pcfg.bottom_fill_min),
             bottom_fill_max=float(pcfg.bottom_fill_max),

@@ -11,7 +11,6 @@ pub(crate) const SEGMENTS_INNER: usize = 6;
 
 // ── Half-edge mesh (structure-of-arrays, heap-allocated) ───────────────────────
 
-#[derive(Clone)]
 pub(crate) struct HalfEdgeMesh {
     // Face arrays
     pub(crate) face_idx: [i32; MAX_FACES],
@@ -31,6 +30,7 @@ pub(crate) struct HalfEdgeMesh {
     pub(crate) half_edge_face: [i32; MAX_HALF_EDGES],
     pub(crate) half_edge_next: [i32; MAX_HALF_EDGES],
     pub(crate) half_edge_prev: [i32; MAX_HALF_EDGES],
+    pub(crate) half_edge_intrinsic_len: Vec<f32>,
 
     // Allocation watermarks
     pub(crate) next_vertex: usize,
@@ -69,6 +69,7 @@ impl HalfEdgeMesh {
         mesh.half_edge_next.fill(-1);
         mesh.half_edge_prev.fill(-1);
         // Vec fields are zero-initialized (null ptr, 0 len/cap) — replace with real Vecs
+        mesh.half_edge_intrinsic_len = vec![0.0f32; MAX_HALF_EDGES];
         mesh.scratch_splits = Vec::with_capacity(256);
         mesh.scratch_edge_counts = Vec::with_capacity(MAX_VERTICES);
         mesh.scratch_edges_to_check = Vec::with_capacity(MAX_HALF_EDGES);
@@ -124,6 +125,48 @@ impl HalfEdgeMesh {
 
     pub(crate) fn active_vertex_count(&self) -> usize {
         self.num_active_vertices
+    }
+
+    /// Clone entirely on the heap, avoiding the ~5MB stack allocation
+    /// that `Clone::clone()` would require.
+    pub(crate) fn clone_boxed(&self) -> Box<Self> {
+        unsafe {
+            let layout = std::alloc::Layout::new::<Self>();
+            let ptr = std::alloc::alloc(layout) as *mut Self;
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            // Bitwise copy all fixed-size arrays and scalars
+            std::ptr::copy_nonoverlapping(
+                self as *const Self as *const u8,
+                ptr as *mut u8,
+                layout.size(),
+            );
+            // The Vec fields were bitwise-copied (shared heap pointers).
+            // Overwrite with proper clones using ptr::write (no drop of old value).
+            std::ptr::write(&mut (*ptr).half_edge_intrinsic_len, self.half_edge_intrinsic_len.clone());
+            std::ptr::write(&mut (*ptr).scratch_splits, self.scratch_splits.clone());
+            std::ptr::write(&mut (*ptr).scratch_edge_counts, self.scratch_edge_counts.clone());
+            std::ptr::write(&mut (*ptr).scratch_edges_to_check, self.scratch_edges_to_check.clone());
+            Box::from_raw(ptr)
+        }
+    }
+
+    /// Compute intrinsic edge lengths from current extrinsic (3D) vertex positions.
+    /// Call after building the mesh or after any operation that creates new geometry.
+    pub(crate) fn compute_intrinsic_lengths(&mut self) {
+        for he in 0..self.next_half_edge {
+            if self.half_edge_idx[he] < 0 { continue; }
+            let dst = self.half_edge_dest[he];
+            let twin = self.half_edge_twin[he];
+            if dst < 0 || twin < 0 { continue; }
+            let src = self.half_edge_dest[twin as usize];
+            if src < 0 { continue; }
+            let d = self.vertex_pos[dst as usize] - self.vertex_pos[src as usize];
+            let len = d.length();
+            // Guard against coincident endpoints so we never seed a zero rest length.
+            self.half_edge_intrinsic_len[he] = len.max(EPSILON);
+        }
     }
 
     // ── Get half-edge from vertex a to vertex b ────────────────────────────
@@ -245,6 +288,14 @@ impl HalfEdgeMesh {
         self.half_edge_prev[half_edge_ac] = half_edge_a_prev as i32;
         self.half_edge_prev[half_edge_b_next] = half_edge_cb as i32;
 
+        // Intrinsic lengths: edge AB unchanged, new edges BC/CA use extrinsic distances
+        let l_bc = (self.vertex_pos[vertex_b] - self.vertex_pos[vertex_c]).length();
+        let l_ca = (self.vertex_pos[vertex_c] - self.vertex_pos[vertex_a]).length();
+        self.half_edge_intrinsic_len[half_edge_bc] = l_bc;
+        self.half_edge_intrinsic_len[half_edge_cb] = l_bc;
+        self.half_edge_intrinsic_len[half_edge_ca] = l_ca;
+        self.half_edge_intrinsic_len[half_edge_ac] = l_ca;
+
         true
     }
 
@@ -304,6 +355,11 @@ impl HalfEdgeMesh {
 
         let half_edge_ba_next = self.half_edge_next[half_edge_ba] as usize;
         let half_edge_ba_prev = self.half_edge_prev[half_edge_ba] as usize;
+
+        // Save intrinsic length of AB before repurposing half-edges
+        let l_ab = self.half_edge_intrinsic_len[half_edge_ab];
+        let l_bc = self.half_edge_intrinsic_len[half_edge_bc];
+        let l_ca = self.half_edge_intrinsic_len[half_edge_ca];
 
         // New vertex with z-perturbation to allow 3D buckling
         let mut new_pos = (self.vertex_pos[vertex_a] + self.vertex_pos[vertex_b]) * 0.5;
@@ -365,6 +421,18 @@ impl HalfEdgeMesh {
         self.half_edge_prev[half_edge_bd] = half_edge_ba_prev as i32;
         self.half_edge_prev[half_edge_ba_next] = half_edge_da as i32;
 
+        // Intrinsic lengths: AD and DB are halves of AB; DC via median formula
+        let l_ad = l_ab * 0.5;
+        let l_db = l_ab * 0.5;
+        let l_dc_sq = (2.0 * l_ca * l_ca + 2.0 * l_bc * l_bc - l_ab * l_ab) / 4.0;
+        let l_dc = l_dc_sq.max(0.0).sqrt();
+        self.half_edge_intrinsic_len[half_edge_ad] = l_ad;  // repurposed from ab
+        self.half_edge_intrinsic_len[half_edge_da] = l_ad;
+        self.half_edge_intrinsic_len[half_edge_db] = l_db;
+        self.half_edge_intrinsic_len[half_edge_bd] = l_db;  // repurposed from ba
+        self.half_edge_intrinsic_len[half_edge_dc] = l_dc;
+        self.half_edge_intrinsic_len[half_edge_cd] = l_dc;
+
         true
     }
 
@@ -393,6 +461,13 @@ impl HalfEdgeMesh {
 
         let vertex_c = self.half_edge_dest[half_edge_bc_old] as usize;
         let vertex_d = self.half_edge_dest[half_edge_ad] as usize;
+
+        // Save intrinsic lengths before repurposing half-edges
+        let l_ab = self.half_edge_intrinsic_len[half_edge_ab];
+        let l_bc = self.half_edge_intrinsic_len[half_edge_bc_old];
+        let l_ca = self.half_edge_intrinsic_len[half_edge_ca];
+        let l_ad = self.half_edge_intrinsic_len[half_edge_ad];
+        let l_db = self.half_edge_intrinsic_len[half_edge_db];
 
         let face_abc = self.half_edge_face[half_edge_ab];
         let face_bad = self.half_edge_face[half_edge_ba];
@@ -518,6 +593,23 @@ impl HalfEdgeMesh {
         self.half_edge_prev[half_edge_ed] = half_edge_be as i32;
         self.half_edge_prev[half_edge_db] = half_edge_ed as i32;
 
+        // Intrinsic lengths: AE/EB halves of AB; EC/ED via median formula
+        let l_ae = l_ab * 0.5;
+        let l_eb = l_ab * 0.5;
+        let l_ec_sq = (2.0 * l_ca * l_ca + 2.0 * l_bc * l_bc - l_ab * l_ab) / 4.0;
+        let l_ec = l_ec_sq.max(0.0).sqrt();
+        let l_ed_sq = (2.0 * l_ad * l_ad + 2.0 * l_db * l_db - l_ab * l_ab) / 4.0;
+        let l_ed = l_ed_sq.max(0.0).sqrt();
+
+        self.half_edge_intrinsic_len[half_edge_ae] = l_ae;  // repurposed from ab
+        self.half_edge_intrinsic_len[half_edge_ea] = l_ae;
+        self.half_edge_intrinsic_len[half_edge_eb] = l_eb;
+        self.half_edge_intrinsic_len[half_edge_be] = l_eb;  // repurposed from ba
+        self.half_edge_intrinsic_len[half_edge_ec] = l_ec;
+        self.half_edge_intrinsic_len[half_edge_ce] = l_ec;
+        self.half_edge_intrinsic_len[half_edge_ed] = l_ed;
+        self.half_edge_intrinsic_len[half_edge_de] = l_ed;
+
         true
     }
 
@@ -545,6 +637,14 @@ impl HalfEdgeMesh {
         let half_edge_ad = self.half_edge_next[half_edge_ba] as usize;
         let vertex_d = self.half_edge_dest[half_edge_ad] as usize;
         let half_edge_db = self.half_edge_next[half_edge_ad] as usize;
+
+        // Compute new intrinsic edge length for CD by unfolding the two triangles
+        let lab = self.half_edge_intrinsic_len[half_edge_ab];
+        let lbc = self.half_edge_intrinsic_len[half_edge_bc];
+        let lca = self.half_edge_intrinsic_len[half_edge_ca];
+        let lad = self.half_edge_intrinsic_len[half_edge_ad];
+        let ldb = self.half_edge_intrinsic_len[half_edge_db];
+        let lcd = intrinsic_flip_length(lab, lca, lbc, lad, ldb);
 
         let face_abc = self.half_edge_face[half_edge_ab];
         let face_bad = self.half_edge_face[half_edge_ba];
@@ -591,6 +691,10 @@ impl HalfEdgeMesh {
         self.half_edge_face[half_edge_db] = face_bcd;
         self.half_edge_face[half_edge_bc] = face_bcd;
 
+        // New intrinsic edge length for the flipped edge
+        self.half_edge_intrinsic_len[half_edge_dc] = lcd;
+        self.half_edge_intrinsic_len[half_edge_cd] = lcd;
+
         true
     }
 
@@ -623,30 +727,16 @@ impl HalfEdgeMesh {
         count
     }
 
-    // ── Mesh refinement (flip edges to optimize valences) ──────────────────
+    // ── Mesh refinement (intrinsic Delaunay flips) ──────────────────────────
 
     pub(crate) fn refine_mesh(&mut self) {
-        self.scratch_edge_counts.clear();
-        self.scratch_edge_counts.resize(self.next_vertex, 0);
-        for v in 0..self.next_vertex {
-            if self.vertex_idx[v] >= 0 {
-                self.scratch_edge_counts[v] = self.get_edge_count(v);
-            }
-        }
-
-        // Collect edges to potentially flip (only consider he where dest < dest_twin to avoid duplicates)
+        // Collect interior edges to check (deduplicate: only where dest < dest_twin)
         self.scratch_edges_to_check.clear();
         for he in 0..self.next_half_edge {
-            if self.half_edge_idx[he] < 0 {
-                continue;
-            }
-            if self.half_edge_face[he] == -1 {
-                continue;
-            }
+            if self.half_edge_idx[he] < 0 { continue; }
+            if self.half_edge_face[he] == -1 { continue; }
             let twin = self.half_edge_twin[he];
-            if twin < 0 || self.half_edge_face[twin as usize] == -1 {
-                continue;
-            }
+            if twin < 0 || self.half_edge_face[twin as usize] == -1 { continue; }
             let dest_a = self.half_edge_dest[he];
             let dest_b = self.half_edge_dest[twin as usize];
             if dest_a < dest_b {
@@ -654,138 +744,108 @@ impl HalfEdgeMesh {
             }
         }
 
-        // Need to iterate over a copy since we borrow self mutably for flip_edge
         let edges_to_check: Vec<usize> = self.scratch_edges_to_check.clone();
 
         for he in edges_to_check {
-            // Re-check validity since flips may have changed things
-            if self.half_edge_idx[he] < 0 {
-                continue;
-            }
+            if self.half_edge_idx[he] < 0 { continue; }
             let twin_i = self.half_edge_twin[he];
-            if twin_i < 0 {
-                continue;
-            }
+            if twin_i < 0 { continue; }
             let twin = twin_i as usize;
-            if self.half_edge_face[he] == -1 || self.half_edge_face[twin] == -1 {
-                continue;
-            }
+            if self.half_edge_face[he] == -1 || self.half_edge_face[twin] == -1 { continue; }
 
-            let va = self.half_edge_dest[twin] as usize;
-            let vb = self.half_edge_dest[he] as usize;
-            let vc = self.half_edge_dest[self.half_edge_next[he] as usize] as usize;
-            let vd = self.half_edge_dest[self.half_edge_next[twin] as usize] as usize;
+            // Check intrinsic Delaunay criterion: sum of opposite angles > π → flip
+            let he_bc = self.half_edge_next[he];
+            let he_ad = self.half_edge_next[twin];
+            if he_bc < 0 || he_ad < 0 { continue; }
+            let he_ca = self.half_edge_next[he_bc as usize];
+            let he_db = self.half_edge_next[he_ad as usize];
+            if he_ca < 0 || he_db < 0 { continue; }
 
-            let ec_a = self.scratch_edge_counts[va] as i32;
-            let ec_b = self.scratch_edge_counts[vb] as i32;
-            let ec_c = self.scratch_edge_counts[vc] as i32;
-            let ec_d = self.scratch_edge_counts[vd] as i32;
+            let lab = self.half_edge_intrinsic_len[he];
+            let lbc = self.half_edge_intrinsic_len[he_bc as usize];
+            let lca = self.half_edge_intrinsic_len[he_ca as usize];
+            let lad = self.half_edge_intrinsic_len[he_ad as usize];
+            let ldb = self.half_edge_intrinsic_len[he_db as usize];
 
-            let no_flip_cost = (ec_a - 6).pow(2) + (ec_b - 6).pow(2) + (ec_c - 6).pow(2) + (ec_d - 6).pow(2);
-            let flip_cost = (ec_a - 7).pow(2) + (ec_b - 7).pow(2) + (ec_c - 5).pow(2) + (ec_d - 5).pow(2);
-
-            if flip_cost < no_flip_cost {
-                if self.flip_edge(he) {
-                    self.scratch_edge_counts[va] -= 1;
-                    self.scratch_edge_counts[vb] -= 1;
-                    self.scratch_edge_counts[vc] += 1;
-                    self.scratch_edge_counts[vd] += 1;
-                }
+            if !is_intrinsic_delaunay(lab, lbc, lca, lad, ldb) {
+                self.flip_edge(he);
             }
         }
     }
 }
 
-// ── Helper: squared edge length for a half-edge ────────────────────────────────
+// ── Intrinsic geometry helpers ─────────────────────────────────────────────────
 
-fn edge_length_sq(mesh: &HalfEdgeMesh, he: usize) -> f32 {
-    let twin = mesh.half_edge_twin[he];
-    if twin < 0 { return 0.0; }
-    let src = mesh.half_edge_dest[twin as usize];
-    let dst = mesh.half_edge_dest[he];
-    if src < 0 || dst < 0 { return 0.0; }
-    let d = mesh.vertex_pos[dst as usize] - mesh.vertex_pos[src as usize];
-    d.length_squared()
+/// Check if edge AB is locally Delaunay using intrinsic edge lengths.
+/// Edge AB with opposite vertices C (in triangle ABC) and D (in triangle ABD).
+/// Arguments: lab=|AB|, lbc=|BC|, lca=|CA|, lad=|AD|, ldb=|DB|
+/// Returns true if the edge is Delaunay (opposite angles sum ≤ π).
+fn is_intrinsic_delaunay(lab: f32, lbc: f32, lca: f32, lad: f32, ldb: f32) -> bool {
+    let lab2 = lab * lab;
+    // Angle at C in triangle ACB: opposite edge is AB
+    let cos_c = (lca * lca + lbc * lbc - lab2) / (2.0 * lca * lbc).max(EPSILON);
+    let sin_c = (1.0 - cos_c * cos_c).max(0.0).sqrt();
+    // Angle at D in triangle ADB: opposite edge is AB
+    let cos_d = (lad * lad + ldb * ldb - lab2) / (2.0 * lad * ldb).max(EPSILON);
+    let sin_d = (1.0 - cos_d * cos_d).max(0.0).sqrt();
+    // sin(α_C + α_D) < 0 means sum > π → not Delaunay
+    let sin_sum = sin_c * cos_d + cos_c * sin_d;
+    sin_sum >= -EPSILON
 }
 
-// ── Helper: is this half-edge the longest edge in its face? ─────────────────────
+/// Compute the intrinsic edge length of CD after flipping edge AB→CD.
+/// Unfolds the two triangles ACB and ADB into a plane and measures |CD|.
+/// Arguments: lab=|AB|, lca=|CA|, lbc=|BC|, lad=|AD|, ldb=|DB|
+fn intrinsic_flip_length(lab: f32, lca: f32, lbc: f32, lad: f32, ldb: f32) -> f32 {
+    if lab < EPSILON { return 0.0; }
+    // Place A at origin, B at (lab, 0)
+    // C in upper half-plane (triangle ACB)
+    let cos_a_acb = (lab * lab + lca * lca - lbc * lbc) / (2.0 * lab * lca).max(EPSILON);
+    let sin_a_acb = (1.0 - cos_a_acb * cos_a_acb).max(0.0).sqrt();
+    let cx = lca * cos_a_acb;
+    let cy = lca * sin_a_acb;
+    // D in lower half-plane (triangle ADB)
+    let cos_a_adb = (lab * lab + lad * lad - ldb * ldb) / (2.0 * lab * lad).max(EPSILON);
+    let sin_a_adb = (1.0 - cos_a_adb * cos_a_adb).max(0.0).sqrt();
+    let dx = lad * cos_a_adb;
+    let dy = -lad * sin_a_adb; // opposite side of AB
+    let diffx = cx - dx;
+    let diffy = cy - dy;
+    (diffx * diffx + diffy * diffy).sqrt()
+}
 
-fn is_longest_in_face(mesh: &HalfEdgeMesh, he: usize, len_sq: f32) -> bool {
+// ── Helper: intrinsic edge length for a half-edge ─────────────────────────────
+
+fn intrinsic_len(mesh: &HalfEdgeMesh, he: usize) -> f32 {
+    mesh.half_edge_intrinsic_len[he]
+}
+
+// ── Helper: is this half-edge the longest (intrinsic) in its face? ────────────
+
+fn is_longest_in_face(mesh: &HalfEdgeMesh, he: usize, len: f32) -> bool {
     let face = mesh.half_edge_face[he];
-    if face < 0 { return true; } // boundary half-edge, no face constraint
+    if face < 0 { return true; }
     let next = mesh.half_edge_next[he] as usize;
     let prev = mesh.half_edge_prev[he] as usize;
-    len_sq >= edge_length_sq(mesh, next) && len_sq >= edge_length_sq(mesh, prev)
+    // Use averaged intrinsic lengths (same as split_long_edges threshold check)
+    let next_twin = mesh.half_edge_twin[next];
+    let prev_twin = mesh.half_edge_twin[prev];
+    let next_len = if next_twin >= 0 {
+        (mesh.half_edge_intrinsic_len[next] + mesh.half_edge_intrinsic_len[next_twin as usize]) * 0.5
+    } else {
+        mesh.half_edge_intrinsic_len[next]
+    };
+    let prev_len = if prev_twin >= 0 {
+        (mesh.half_edge_intrinsic_len[prev] + mesh.half_edge_intrinsic_len[prev_twin as usize]) * 0.5
+    } else {
+        mesh.half_edge_intrinsic_len[prev]
+    };
+    len >= next_len && len >= prev_len
 }
 
-// ── Growth: state-based splitting (Lenia growth) ────────────────────────────────
-
-pub(crate) fn generate_new_triangles(mesh: &mut HalfEdgeMesh, split_threshold: f32, split_chance: f32, spring_len: f32) -> bool {
-    mesh.scratch_splits.clear();
-    let spring_len_sq = spring_len * spring_len;
-
-    for v in 0..mesh.next_vertex {
-        if mesh.vertex_idx[v] < 0 { continue; }
-        if mesh.vertex_state[v] < split_threshold { continue; }
-
-        let he_start = mesh.vertex_half_edge[v];
-        if he_start < 0 { continue; }
-
-        // Pick a random outgoing edge
-        let mut edge_count = 0u32;
-        {
-            let mut he = he_start as usize;
-            loop {
-                edge_count += 1;
-                let twin = mesh.half_edge_twin[he];
-                if twin < 0 { break; }
-                let next = mesh.half_edge_next[twin as usize];
-                if next < 0 { break; }
-                he = next as usize;
-                if he == he_start as usize { break; }
-            }
-        }
-        if edge_count == 0 { continue; }
-        let skip = (random_f32() * edge_count as f32) as u32;
-        let mut he = he_start as usize;
-        for _ in 0..skip {
-            let twin = mesh.half_edge_twin[he];
-            if twin < 0 { break; }
-            let next = mesh.half_edge_next[twin as usize];
-            if next < 0 { break; }
-            he = next as usize;
-        }
-
-        let dest = mesh.half_edge_dest[he];
-        if dest < 0 { continue; }
-        let twin = mesh.half_edge_twin[he];
-        if twin < 0 { continue; }
-        let src = mesh.half_edge_dest[twin as usize];
-        if src < 0 { continue; }
-
-        // Scale split probability by edge length relative to spring_len.
-        // This prevents dense regions (short edges) from accumulating
-        // ever more splits — without this, per-vertex random selection
-        // creates a rich-get-richer feedback loop.
-        let len_sq = edge_length_sq(mesh, he);
-        let len_ratio = len_sq / spring_len_sq;
-        if random_f32() > split_chance * len_ratio { continue; }
-
-        let src = src as usize;
-        let dest = dest as usize;
-        let he_on_boundary = mesh.half_edge_face[he] == -1;
-        let twin_on_boundary = mesh.half_edge_face[twin as usize] == -1;
-
-        mesh.scratch_splits.push((src, dest, he_on_boundary, twin_on_boundary));
-    }
-
-    do_splits(mesh)
-}
-
-// ── Growth: split edges that exceed a length threshold ──────────────────────────
+// ── Growth: split edges that exceed an intrinsic length threshold ─────────────
 
 pub(crate) fn split_long_edges(mesh: &mut HalfEdgeMesh, max_edge_len: f32) -> bool {
-    let max_len_sq = max_edge_len * max_edge_len;
     mesh.scratch_splits.clear();
 
     for he in 0..mesh.next_half_edge {
@@ -798,15 +858,15 @@ pub(crate) fn split_long_edges(mesh: &mut HalfEdgeMesh, max_edge_len: f32) -> bo
         let dst = mesh.half_edge_dest[he];
         let src = mesh.half_edge_dest[twin];
         if src < 0 || dst < 0 { continue; }
-        // Deduplicate: only process each edge once
         if src >= dst { continue; }
 
-        let len_sq = edge_length_sq(mesh, he);
-        if len_sq < max_len_sq { continue; }
+        // Use average of both half-edges' intrinsic lengths (grown from each side)
+        let len = (mesh.half_edge_intrinsic_len[he]
+                 + mesh.half_edge_intrinsic_len[twin]) * 0.5;
+        if len < max_edge_len { continue; }
 
-        // Only split if it's the longest edge in its adjacent triangle(s)
-        if !is_longest_in_face(mesh, he, len_sq) { continue; }
-        if mesh.half_edge_face[twin] >= 0 && !is_longest_in_face(mesh, twin, len_sq) { continue; }
+        if !is_longest_in_face(mesh, he, len) { continue; }
+        if mesh.half_edge_face[twin] >= 0 && !is_longest_in_face(mesh, twin, len) { continue; }
 
         let src = src as usize;
         let dst = dst as usize;
@@ -835,14 +895,28 @@ fn do_splits(mesh: &mut HalfEdgeMesh) -> bool {
     }
 
     let mut hit_max = false;
-    for (src, dest, he_on_boundary, twin_on_boundary) in splits {
+    for (src, dest, _he_on_boundary, _twin_on_boundary) in splits {
         if mesh.active_vertex_count() >= MAX_VERTICES - 5 {
             hit_max = true;
             break;
         }
 
-        if he_on_boundary || twin_on_boundary {
-            if twin_on_boundary {
+        // Re-check edge existence and boundary status (may have changed from earlier splits)
+        let he = match mesh.get_vertex_half_edge(src, dest) {
+            Some(h) => h,
+            None => continue, // edge no longer exists
+        };
+        let twin_i = mesh.half_edge_twin[he];
+        if twin_i < 0 { continue; }
+        let twin = twin_i as usize;
+
+        let he_boundary = mesh.half_edge_face[he] == -1;
+        let twin_boundary = mesh.half_edge_face[twin] == -1;
+
+        if he_boundary && twin_boundary {
+            continue; // invalid: both sides boundary
+        } else if he_boundary || twin_boundary {
+            if twin_boundary {
                 mesh.add_internal_edge_triangle(src, dest);
             } else {
                 mesh.add_internal_edge_triangle(dest, src);

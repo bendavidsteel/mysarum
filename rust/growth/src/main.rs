@@ -18,6 +18,56 @@ use render::RenderState;
 
 const MAX_BINS_PER_DIM: u32 = 64;
 
+// ── Cell-state rule ──────────────────────────────────────────────────────────
+// How vertex states are determined: the Lenia cellular automata (evolving
+// patterns) or a static "dot" seed (a fixed growth region of configurable
+// radius, anchored at the mesh apex).
+#[derive(Clone, Copy, PartialEq)]
+enum GrowthMode {
+    Lenia,
+    Dot,
+}
+
+impl GrowthMode {
+    fn as_u32(self) -> u32 {
+        match self {
+            GrowthMode::Lenia => 0,
+            GrowthMode::Dot => 1,
+        }
+    }
+}
+
+/// Build the start mesh and seed its vertex states for the current rule.
+/// Lenia keeps the random init from `HalfEdgeMesh::new`; Dot mode overwrites
+/// states with a hard disc: 1.0 within `dot_radius` of the apex, else 0.0.
+fn build_seeded_mesh(model: &Model) -> Box<HalfEdgeMesh> {
+    let mut mesh = make_start_mesh(model.start_shape, model.spring_len, model.ico_nu);
+    if model.growth_mode == GrowthMode::Dot {
+        seed_dot_state(&mut mesh, model.dot_radius);
+    }
+    mesh
+}
+
+/// Seed a static dot of growth state centered on the mesh's apex — the vertex
+/// with the greatest Z. For the sphere/hemisphere that's the top of the curved
+/// side; for the flat circle it's the center vertex at the origin.
+fn seed_dot_state(mesh: &mut HalfEdgeMesh, radius: f32) {
+    let mut center = Vec3::ZERO;
+    let mut max_z = f32::NEG_INFINITY;
+    for v in 0..mesh.next_vertex {
+        if mesh.vertex_idx[v] < 0 { continue; }
+        if mesh.vertex_pos[v].z > max_z {
+            max_z = mesh.vertex_pos[v].z;
+            center = mesh.vertex_pos[v];
+        }
+    }
+    for v in 0..mesh.next_vertex {
+        if mesh.vertex_idx[v] < 0 { continue; }
+        let d = mesh.vertex_pos[v].distance(center);
+        mesh.vertex_state[v] = if d <= radius { 1.0 } else { 0.0 };
+    }
+}
+
 // ── Model ──────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -32,11 +82,14 @@ struct Model {
     // Cached spatial hash bounding box from GPU reduction [min_x, min_y, max_x, max_y, min_z, max_z]
     cached_spatial_bbox: [f32; 6],
     spring_len: f32,
-    elastic_constant: f32,
+    compliance: f32,
+    xpbd_iterations: u32,
     repulsion_distance: f32,
     repulsion_strength: f32,
     bulge_strength: f32,
-    planar_strength: f32,
+    smoothing_strength: f32,
+    bending_compliance: f32,
+    relaxation: f32,
     dt: f32,
     state_dt: f32,
     damping: f32,
@@ -45,8 +98,7 @@ struct Model {
     kernel_sigma: f32,
     growth_mu: f32,
     growth_sigma: f32,
-    split_threshold: f32,
-    split_chance: f32,
+    growth_rate: f32,
     max_edge_len: f32,
     cheb_order: usize,
     cheb_coeffs: [f32; 20],
@@ -61,6 +113,8 @@ struct Model {
     show_wireframe: bool,
     start_shape: StartShape,
     ico_nu: usize,
+    growth_mode: GrowthMode,
+    dot_radius: f32,
     hit_max_vertices: bool,
 }
 
@@ -103,11 +157,11 @@ fn recompute_cheb_coeffs(model: &mut Model) {
 }
 
 fn randomize_params(model: &mut Model) {
-    // Lenia-style params
-    model.kernel_mu = 4.0 + random_f32() * 5.0;
-    model.kernel_sigma = 0.5 + random_f32() * 2.0;
-    model.growth_mu = random_f32();
-    model.growth_sigma = 0.1 + random_f32() * 0.5;
+    // Lenia-style params — keep in ranges that produce coherent patterns
+    model.kernel_mu = 4.0 + random_f32() * 4.0;      // 4–8
+    model.kernel_sigma = 0.8 + random_f32() * 1.5;    // 0.8–2.3
+    model.growth_mu = 0.2 + random_f32() * 0.6;       // 0.2–0.8
+    model.growth_sigma = 0.1 + random_f32() * 0.3;    // 0.1–0.4
 
     recompute_cheb_coeffs(model);
 }
@@ -140,21 +194,25 @@ fn model(app: &App) -> Model {
         cached_scale: 1.0,
         cached_spatial_bbox: [f32::NEG_INFINITY; 6],
         spring_len: 30.0,
-        elastic_constant: 0.01,
-        repulsion_distance: 150.0,
-        repulsion_strength: 8.0,
-        bulge_strength: 10.0,
-        planar_strength: 0.4,
-        dt: 0.05,
-        state_dt: 0.05,
-        damping: 0.5,
-        kernel_mu: 8.0,
-        kernel_sigma: 1.0,
+        compliance: 0.0,
+        xpbd_iterations: 20,
+        repulsion_distance: 80.0,
+        repulsion_strength: 4.0,
+        bulge_strength: 5.0,
+        smoothing_strength: 400.0,
+        // NB: compliance is now α̃ directly (dt-invariant). Previous value
+        // 0.001 at dt=0.02 resolved to α̃ = 2.5, which this preserves.
+        bending_compliance: 2.5,
+        relaxation: 0.7,
+        dt: 0.02,
+        state_dt: 0.02,
+        damping: 10.0,
+        kernel_mu: 6.0,
+        kernel_sigma: 1.5,
         growth_mu: 0.5,
-        growth_sigma: 0.3,
-        split_threshold: 0.95,
-        split_chance: 0.001,
-        max_edge_len: 45.0,
+        growth_sigma: 0.2,
+        growth_rate: 0.3,
+        max_edge_len: 50.0,
         cheb_order: 10,
         cheb_coeffs: [0.0; 20],
         frame: 0,
@@ -167,10 +225,12 @@ fn model(app: &App) -> Model {
         show_wireframe: false,
         start_shape: StartShape::Sphere,
         ico_nu: 32,
+        growth_mode: GrowthMode::Lenia,
+        dot_radius: 100.0,
         hit_max_vertices: false,
     };
     randomize_params(&mut m);
-    m.mesh = Arc::from(make_start_mesh(m.start_shape, m.spring_len, m.ico_nu));
+    m.mesh = Arc::from(build_seeded_mesh(&m));
     m
 }
 
@@ -181,6 +241,7 @@ fn update(app: &App, model: &mut Model) {
 
     let mut kernel_changed = false;
     let mut shape_changed = false;
+    let mut reseed_changed = false;
     egui::Window::new("Settings").show(&ctx, |ui| {
         ui.label("Start shape");
         let prev_shape = model.start_shape;
@@ -188,10 +249,12 @@ fn update(app: &App, model: &mut Model) {
             .selected_text(match model.start_shape {
                 StartShape::Circle => "Circle",
                 StartShape::Sphere => "Sphere",
+                StartShape::Hemisphere => "Hemisphere",
             })
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut model.start_shape, StartShape::Circle, "Circle");
                 ui.selectable_value(&mut model.start_shape, StartShape::Sphere, "Sphere");
+                ui.selectable_value(&mut model.start_shape, StartShape::Hemisphere, "Hemisphere");
             });
         if model.start_shape == StartShape::Sphere {
             let prev_nu = model.ico_nu;
@@ -204,6 +267,26 @@ fn update(app: &App, model: &mut Model) {
             shape_changed = true;
         }
         ui.separator();
+        ui.label("State rule");
+        let prev_mode = model.growth_mode;
+        egui::ComboBox::from_id_salt("growth_mode")
+            .selected_text(match model.growth_mode {
+                GrowthMode::Lenia => "Cellular automata",
+                GrowthMode::Dot => "Dot",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut model.growth_mode, GrowthMode::Lenia, "Cellular automata");
+                ui.selectable_value(&mut model.growth_mode, GrowthMode::Dot, "Dot");
+            });
+        if model.growth_mode != prev_mode {
+            reseed_changed = true;
+        }
+        if model.growth_mode == GrowthMode::Dot {
+            if ui.add(egui::Slider::new(&mut model.dot_radius, 10.0..=500.0).text("dot radius")).changed() {
+                reseed_changed = true;
+            }
+        }
+        ui.separator();
         ui.label("Kernel (ring)");
         kernel_changed |= ui.add(egui::Slider::new(&mut model.kernel_mu, 0.0..=18.0).text("mu")).changed();
         kernel_changed |= ui.add(egui::Slider::new(&mut model.kernel_sigma, 0.1..=4.0).text("sigma")).changed();
@@ -213,10 +296,9 @@ fn update(app: &App, model: &mut Model) {
         ui.add(egui::Slider::new(&mut model.growth_mu, 0.0..=1.0).text("mu"));
         ui.add(egui::Slider::new(&mut model.growth_sigma, 0.01..=1.0).text("sigma"));
         ui.separator();
-        ui.label("Split");
-        ui.add(egui::Slider::new(&mut model.split_threshold, 0.0..=1.0).text("threshold"));
-        ui.add(egui::Slider::new(&mut model.split_chance, 0.0..=0.1).text("chance"));
-        ui.add(egui::Slider::new(&mut model.max_edge_len, 10.0..=100.0).text("max edge len"));
+        ui.label("Growth");
+        ui.add(egui::Slider::new(&mut model.growth_rate, 0.0..=5.0).text("rate"));
+        ui.add(egui::Slider::new(&mut model.max_edge_len, 30.0..=80.0).text("max edge len"));
         let n_verts = model.mesh.active_vertex_count();
         ui.label(format!("vertices: {} / {}", n_verts, mesh::MAX_VERTICES));
         if model.hit_max_vertices {
@@ -224,13 +306,18 @@ fn update(app: &App, model: &mut Model) {
         }
         ui.separator();
         ui.label("Physics");
-        ui.add(egui::Slider::new(&mut model.elastic_constant, 0.01..=0.5).text("elastic"));
+        ui.add(egui::Slider::new(&mut model.compliance, 0.0..=1000.0).text("spring compliance α̃").logarithmic(true));
+        let mut iters = model.xpbd_iterations as i32;
+        ui.add(egui::Slider::new(&mut iters, 1..=20).text("XPBD iters"));
+        model.xpbd_iterations = iters as u32;
         ui.add(egui::Slider::new(&mut model.repulsion_strength, 0.0..=10.0).text("repulsion"));
-        ui.add(egui::Slider::new(&mut model.bulge_strength, 0.0..=30.0).text("bulge"));
-        ui.add(egui::Slider::new(&mut model.planar_strength, 0.0..=0.5).text("planar"));
-        ui.add(egui::Slider::new(&mut model.dt, 0.01..=0.3).text("force dt"));
-        ui.add(egui::Slider::new(&mut model.damping, 0.01..=1.0).text("damping"));
-        ui.add(egui::Slider::new(&mut model.state_dt, 0.01..=0.5).text("state dt"));
+        ui.add(egui::Slider::new(&mut model.bulge_strength, 0.0..=15.0).text("bulge"));
+        ui.add(egui::Slider::new(&mut model.smoothing_strength, 0.0..=1000.0).text("smoothing strength"));
+        ui.add(egui::Slider::new(&mut model.bending_compliance, 0.01..=10000.0).text("bend compliance α̃").logarithmic(true));
+        ui.add(egui::Slider::new(&mut model.relaxation, 0.1..=1.0).text("XPBD relaxation (SOR)"));
+        ui.add(egui::Slider::new(&mut model.dt, 0.001..=0.1).text("force dt"));
+        ui.add(egui::Slider::new(&mut model.damping, 1.0..=30.0).text("damping"));
+        ui.add(egui::Slider::new(&mut model.state_dt, 0.005..=0.1).text("state dt"));
         ui.separator();
         ui.label("Render");
         ui.checkbox(&mut model.show_wireframe, "Wireframe");
@@ -251,12 +338,24 @@ fn update(app: &App, model: &mut Model) {
     }
 
     if shape_changed {
-        model.mesh = Arc::from(make_start_mesh(model.start_shape, model.spring_len, model.ico_nu));
+        model.mesh = Arc::from(build_seeded_mesh(model));
         model.frame = 0;
         model.hit_max_vertices = false;
         model.camera_yaw = 0.0;
         model.camera_pitch = 0.0;
         model.zoom = 1.0;
+        model.cached_spatial_bbox = [f32::NEG_INFINITY; 6];
+        if let Some(ref mut gpu) = model.gpu {
+            gpu.topology_dirty = true;
+        }
+    }
+
+    // Changing the state rule or dot radius rebuilds and re-seeds the mesh,
+    // but leaves the camera where it is.
+    if reseed_changed && !shape_changed {
+        model.mesh = Arc::from(build_seeded_mesh(model));
+        model.frame = 0;
+        model.hit_max_vertices = false;
         model.cached_spatial_bbox = [f32::NEG_INFINITY; 6];
         if let Some(ref mut gpu) = model.gpu {
             gpu.topology_dirty = true;
@@ -321,9 +420,9 @@ fn update(app: &App, model: &mut Model) {
         num_half_edges: mesh.next_half_edge as u32,
         repulsion_distance: model.repulsion_distance,
         spring_len: model.spring_len,
-        elastic_constant: model.elastic_constant,
+        compliance: model.compliance,
         bulge_strength: model.bulge_strength,
-        planar_strength: model.planar_strength,
+        smoothing_strength: model.smoothing_strength,
         dt: model.dt,
         origin_x,
         origin_y,
@@ -338,7 +437,13 @@ fn update(app: &App, model: &mut Model) {
         repulsion_strength: model.repulsion_strength,
         state_dt: model.state_dt,
         damping: model.damping,
-        _pad: [0.0; 3],
+        growth_rate: model.growth_rate,
+        xpbd_iterations: model.xpbd_iterations,
+        bending_compliance: model.bending_compliance,
+        relaxation: model.relaxation,
+        growth_mode: model.growth_mode.as_u32(),
+        frame_seed: model.frame as u32,
+        _pad: 0.0,
     };
 
     // GPU dispatch: physics + state evolution
@@ -358,8 +463,16 @@ fn update(app: &App, model: &mut Model) {
         );
     }
 
-    // Read bbox every frame so spatial hash grid stays current
-    {
+    // Full readback + topology ops only every 10/20 frames
+    let needs_topology_ops = model.frame % 10 == 0;
+
+    // Read the GPU-reduced bbox only on topology frames. Reading it requires a
+    // blocking device.poll(Wait) that serializes CPU and GPU; doing it every
+    // frame defeats async dispatch. The spatial-hash grid tolerates a stale
+    // bbox — get_bin_info clamps out-of-range vertices into edge cells — so a
+    // grid that lags up to 10 frames stays correct, just slightly coarser at
+    // the boundary during fast growth.
+    if needs_topology_ops || model.frame <= 1 {
         let window = app.window(model.window);
         let device = window.device();
         let gpu = model.gpu.as_ref().unwrap();
@@ -376,28 +489,31 @@ fn update(app: &App, model: &mut Model) {
             model.cached_scale = 8.0 / max_radius.max(1.0);
         }
     }
-
-    // Full readback + topology ops only every 10/20 frames
-    let needs_topology_ops = model.frame % 10 == 0;
     if needs_topology_ops || model.frame <= 1 {
         let window = app.window(model.window);
         let device = window.device();
         let queue = window.queue();
         let gpu = model.gpu.as_mut().unwrap();
-        let mesh = Arc::make_mut(&mut model.mesh);
+        // Heap-only clone to avoid ~5MB stack allocation from Arc::make_mut
+        let mesh: &mut HalfEdgeMesh = match Arc::get_mut(&mut model.mesh) {
+            Some(m) => m,
+            None => {
+                model.mesh = Arc::from(model.mesh.clone_boxed());
+                Arc::get_mut(&mut model.mesh).unwrap()
+            }
+        };
         readback_from_gpu(&device, &queue, gpu, mesh);
 
-        // State-based growth (every 10 frames)
-        if mesh::generate_new_triangles(mesh, model.split_threshold, model.split_chance, model.spring_len) {
-            model.hit_max_vertices = true;
+        // Split edges that have grown too long (differential growth).
+        // Skip entirely once the vertex pool is full — growth is effectively capped.
+        if !model.hit_max_vertices {
+            if mesh::split_long_edges(mesh, model.max_edge_len) {
+                model.hit_max_vertices = true;
+            }
         }
 
-        // Split long edges
-        // if mesh::split_long_edges(mesh, model.max_edge_len) {
-        //     model.hit_max_vertices = true;
-        // }
-
-        // Mesh refinement (every 20 frames)
+        // Mesh refinement (every 20 frames). Flips don't allocate, so safe
+        // even after hit_max_vertices — they improve triangle quality.
         if model.frame % 20 == 0 {
             mesh.refine_mesh();
         }
@@ -444,7 +560,7 @@ fn key_pressed(app: &App, model: &mut Model, key: KeyCode) {
     }
     if key == KeyCode::KeyR {
         randomize_params(model);
-        model.mesh = Arc::from(make_start_mesh(model.start_shape, model.spring_len, model.ico_nu));
+        model.mesh = Arc::from(build_seeded_mesh(model));
         model.frame = 0;
         model.hit_max_vertices = false;
         model.camera_yaw = 0.0;
@@ -456,7 +572,7 @@ fn key_pressed(app: &App, model: &mut Model, key: KeyCode) {
         }
     }
     if key == KeyCode::KeyT {
-        model.mesh = Arc::from(make_start_mesh(model.start_shape, model.spring_len, model.ico_nu));
+        model.mesh = Arc::from(build_seeded_mesh(model));
         model.frame = 0;
         model.hit_max_vertices = false;
         model.camera_yaw = 0.0;

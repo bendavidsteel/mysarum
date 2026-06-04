@@ -24,7 +24,7 @@ become more sensitive in dense regions ("primary special sauce").
     statistics, morphological-opening survival, and surface/volume.
   export_stl           — marching cubes on the chosen mask + binary STL.
   map_elites_run       — quality-diversity search over PhysarumParams,
-    archive indexed by (opening_ratio, edt_median).
+    archive indexed by (edt_median, volume_fill).
 
 Entry point: hydra. Run with
     python reint_jax.py                          # default config (3D, weblike)
@@ -37,6 +37,7 @@ See conf/config.yaml for all knobs.
 import os
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
+import math
 import struct
 import time
 from pathlib import Path
@@ -681,6 +682,9 @@ def render_raymarch(state: State3D, theta: float = 0.6, phi: float = 0.4,
     mode='mip'   : max-density-along-ray (robust; same 2D colormap).
     mode='alpha' : emission-absorption alpha compositing (depth shaded but
                    collapses to a translucent blob unless veins are dense).
+    mode='solid' : every voxel above 0.5 is fully opaque (alpha=1) — renders a
+                   binary mask as the solid object it would print as, shaded by
+                   a screen-space surface normal so form reads in 3D.
     """
     D, H, W = state.M.shape[:3]
     size = float(max(D, H, W))
@@ -711,6 +715,23 @@ def render_raymarch(state: State3D, theta: float = 0.6, phi: float = 0.4,
 
     if mode == "mip":
         return _colorize(mass.max(axis=-1), trail.max(axis=-1))
+
+    if mode == "solid":
+        # Treat any sample above 0.5 as opaque print material. Per ray, take
+        # the first such hit → a depth buffer; shade by a screen-space normal
+        # derived from depth gradients (flat faces bright, silhouettes dark).
+        occ = mass > 0.5
+        hit = occ.any(axis=-1)
+        first = jnp.argmax(occ, axis=-1).astype(jnp.float32)
+        zbuf = jnp.where(hit, first, float(n_steps))      # misses pushed far
+        gx = zbuf - jnp.roll(zbuf, 1, axis=1)
+        gy = zbuf - jnp.roll(zbuf, 1, axis=0)
+        ndotl = 1.0 / jnp.sqrt(gx * gx + gy * gy + 1.0)   # light along view
+        depth = jnp.clip(first / float(n_steps), 0.0, 1.0)
+        shade = (0.30 + 0.70 * ndotl) * (1.0 - 0.30 * depth)
+        gb = jnp.where(hit, shade, 0.0)
+        zero = jnp.zeros_like(gb)
+        return jnp.stack([zero, gb, gb], axis=-1)         # black→cyan, opaque
 
     ds = ts[1] - ts[0]
     density = jnp.maximum(mass - density_floor, 0.0)
@@ -759,27 +780,64 @@ def _largest_cc_gpu(mask, struct26):
     return labels == int(cp.argmax(counts))
 
 
-def printability_report(trail, r_min_voxels=1.5, thresholds=None,
+def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                         n_thresholds=12,
-                        kept_fraction_min=0.8,
-                        opening_ratio_min=0.9):
+                        opening_ratio_min=0.5,
+                        volume_fill_min=0.05, volume_fill_max=0.35,
+                        edt_median_min=1.5, edt_reward_tau=2.5,
+                        sa_reward_tau=0.25,
+                        top_clear_voxels=1,
+                        bottom_fill_min=0.1, bottom_fill_max=0.8,
+                        cylinder_penalty_scale=0.003,
+                        overhang_free=0.03, overhang_penalty_scale=0.1):
     """GPU threshold sweep for 3D-printability of a trail volume.
 
     For each candidate threshold t:
       1) mask = trail > t, then keep only the largest 26-connected component.
+         All metrics below are computed on that single component.
       2) EDT on the kept mask — interior voxel value = distance (in voxels)
          to the nearest exterior voxel, i.e. half the local thickness.
       3) Morphological opening with a Euclidean ball of radius r_min_voxels.
       4) Surface area = 6-conn boundary voxel count; volume = mask voxels.
 
-    A row is "printable" iff kept_fraction ≥ kept_fraction_min AND
-    opening_ratio ≥ opening_ratio_min. Among printable rows the "best" is
-    the one with the highest surface_area/volume (most veiny while still
-    admitting a ball of radius r_min_voxels nearly everywhere).
+    A row is "printable" iff all of:
+      • opening_ratio ≥ opening_ratio_min (a min-feature ball fits almost
+        everywhere);
+      • volume_fill ∈ (volume_fill_min, volume_fill_max) — neither specks nor a
+        near-solid block (volume_fill = occupied voxels / total grid voxels);
+      • edt_median > edt_median_min — typical wall thick enough to print;
+      • the top `top_clear_voxels` z-slices and all four side walls are empty,
+        so the object touches no ceiling or wall of the print volume;
+      • the bottom face (z=0) footprint fraction ∈ (bottom_fill_min,
+        bottom_fill_max) — a real base to stand on, but not a full slab.
+    Array axis 0 is z (spawn base at z=0); axes 1,2 are the walls. Among
+    printable rows the "best" maximizes fitness = tanh(sa_to_vol /
+    sa_reward_tau) × cyl_mult × overhang_mult × tanh(edt_median /
+    edt_reward_tau) — diminishing-returns rewards for veininess and thickness
+    (both saturate, so maxing either out doesn't dominate); overhang_mult
+    softly punishes
+    self-support violations beyond overhang_free (45° cone); cyl_mult =
+    exp(-penalty / cylinder_penalty_scale) softly punishes mass
+    outside the largest vertical cylinder that fits the volume (corner / near-
+    wall content that looks "grown in a box"); penalty = Σ over filled voxels
+    of their radial excess past the cylinder, ÷ total voxels (1.0 = all inside).
 
     Returns (df, best_mask, best_row).
     """
     trail_gpu = cp.asarray(trail, dtype=cp.float32)
+    total_voxels = int(trail_gpu.size)
+
+    # Per-(y,x) radial excess outside the largest vertical cylinder that fits
+    # the volume (axis through the centre, radius = min(H,W)/2), normalised by
+    # that radius so it is resolution-independent: 0 inside, ~0.41 at corners.
+    D_, H_, W_ = trail_gpu.shape
+    cy, cx = (H_ - 1) / 2.0, (W_ - 1) / 2.0
+    r_cyl = min(H_, W_) / 2.0
+    yy, xx = cp.meshgrid(cp.arange(H_), cp.arange(W_), indexing="ij")
+    excess_xy = cp.maximum(
+        0.0, cp.sqrt((yy - cy) ** 2 + (xx - cx) ** 2) / r_cyl - 1.0
+    ).astype(cp.float32)
+
     nz = trail_gpu[trail_gpu > 0]
     if nz.size == 0:
         raise ValueError("trail is all zeros")
@@ -791,6 +849,9 @@ def printability_report(trail, r_min_voxels=1.5, thresholds=None,
     struct26 = cp.ones((3, 3, 3), dtype=bool)
     struct6 = cp.asarray(_struct_6conn())
     ball = cp.asarray(_ball_struct(r_min_voxels))
+    # 3×3 in-plane element: a voxel is self-supported if any voxel in the 3×3
+    # x-y neighbourhood one layer below is filled (≈45° FDM support cone).
+    struct_xy = cp.ones((1, 3, 3), dtype=bool)
 
     rows = []
     masks = {}
@@ -799,9 +860,13 @@ def printability_report(trail, r_min_voxels=1.5, thresholds=None,
         vol0 = int(mask0.sum())
         if vol0 == 0:
             rows.append(dict(threshold=float(t), kept_fraction=0.0, volume=0,
+                             volume_fill=0.0, top_filled=0, wall_filled=0,
+                             bottom_frac=0.0, outside_frac=0.0, cyl_mult=1.0,
+                             overhang_frac=0.0, overhang_mult=1.0,
+                             edt_reward=0.0, sa_reward=0.0,
                              edt_min=0.0, edt_q01=0.0, edt_median=0.0,
                              opening_ratio=0.0, surface_area=0,
-                             sa_to_vol=0.0, printable=False))
+                             sa_to_vol=0.0, fitness=0.0, printable=False))
             continue
 
         mask = _largest_cc_gpu(mask0, struct26)
@@ -821,19 +886,71 @@ def printability_report(trail, r_min_voxels=1.5, thresholds=None,
         surface_area = int((mask & ~eroded).sum())
         sa_to_vol = surface_area / vol
 
-        printable = (kept_fraction >= kept_fraction_min
-                     and opening_ratio >= opening_ratio_min)
+        volume_fill = vol / total_voxels
+        # Boundary checks. Axis 0 = z (spawn base at z=0); axes 1,2 are the
+        # H,W walls. The object may rest on the bottom face but must clear the
+        # ceiling and all four walls entirely.
+        top_filled = int(mask[-top_clear_voxels:].sum())
+        wall_filled = int(mask[:, 0, :].sum() + mask[:, -1, :].sum()
+                          + mask[:, :, 0].sum() + mask[:, :, -1].sum())
+        bottom_frac = float(mask[0].sum()) / float(mask.shape[1] * mask.shape[2])
+        # Soft cylinder penalty: punish corner/near-wall mass (looks grown in a
+        # box) by how far + how much sits outside the inscribed cylinder.
+        outside_sum = float((mask * excess_xy[None, :, :]).sum())
+        outside_frac = float((mask & (excess_xy[None, :, :] > 0)).sum()) / vol
+        cyl_mult = float(np.exp(-(outside_sum / total_voxels)
+                                / cylinder_penalty_scale))
+        # Overhang / self-support: a filled voxel is supported if any voxel in
+        # the 3×3 x-y patch one layer below is filled (≈45° cone), or it rests
+        # on the base. overhang_frac = unsupported share; a free allowance is
+        # forgiven (small overhangs print fine), the rest softly penalised.
+        below = cp.zeros_like(mask)
+        below[1:] = mask[:-1]
+        support = cndi.binary_dilation(below, structure=struct_xy)
+        support[0] = True
+        overhang_frac = float((mask & ~support).sum()) / vol
+        overhang_mult = float(np.exp(-max(0.0, overhang_frac - overhang_free)
+                                     / overhang_penalty_scale))
+        # Diminishing-returns reward for thicker (more printable) structure;
+        # tanh saturates so 2→3 voxels of half-thickness helps more than 4→5.
+        edt_reward = float(np.tanh(edt_med / edt_reward_tau))
+        # Diminishing-returns veininess reward: sa_to_vol is a good signal up
+        # to a point, but maxing it out (thin spiky shapes) isn't more
+        # desirable, so saturate it with tanh.
+        sa_reward = float(np.tanh(sa_to_vol / sa_reward_tau))
+        # Veininess × thickness rewards, scaled by the cylinder and overhang
+        # penalties. opening_ratio, volume_fill, and the edt_median floor are
+        # gates, not fitness terms.
+        fitness = sa_reward * cyl_mult * overhang_mult * edt_reward
+
+        printable = (opening_ratio >= opening_ratio_min
+                     and volume_fill_min < volume_fill < volume_fill_max
+                     and edt_med > edt_median_min
+                     and top_filled == 0
+                     and wall_filled == 0
+                     and bottom_fill_min < bottom_frac < bottom_fill_max)
         rows.append(dict(threshold=float(t),
                          kept_fraction=kept_fraction,
                          volume=vol,
+                         volume_fill=volume_fill,
+                         top_filled=top_filled,
+                         wall_filled=wall_filled,
+                         bottom_frac=bottom_frac,
+                         outside_frac=outside_frac,
+                         cyl_mult=cyl_mult,
+                         overhang_frac=overhang_frac,
+                         overhang_mult=overhang_mult,
+                         edt_reward=edt_reward,
+                         sa_reward=sa_reward,
                          edt_min=edt_min, edt_q01=edt_q01, edt_median=edt_med,
                          opening_ratio=opening_ratio,
                          surface_area=surface_area,
                          sa_to_vol=sa_to_vol,
+                         fitness=fitness,
                          printable=printable))
         masks[float(t)] = mask
 
-    df = pl.DataFrame(rows).sort("sa_to_vol", descending=True)
+    df = pl.DataFrame(rows).sort("fitness", descending=True)
     printable_df = df.filter(pl.col("printable"))
     best_row = printable_df.row(0, named=True) if printable_df.height > 0 else None
     best_mask = (cp.asnumpy(masks[best_row["threshold"]]).astype(np.uint8)
@@ -899,23 +1016,26 @@ def export_stl(mask, path, voxel_size_mm=0.4, level=0.5):
 # Search bounds for each PhysarumParams field. (Conservative — sensor offsets
 # limited to ±1 voxel since they multiply against the local basis.)
 PARAM_BOUNDS = dict(
-    sd_base=(1.0, 5.0),
-    sd_power=(0.0, 3.0),
-    sd_scale=(0.0, 3.0),
-    sa_base=(0.1, 1.0),
-    sa_power=(0.0, 3.0),
-    sa_scale=(0.0, 1.0),
-    ra_base=(0.0, 0.8),
-    ra_power=(0.0, 3.0),
-    ra_scale=(0.0, 1.0),
-    md_base=(0.6, 1.5),
+    sd_base=(1.0, 8.0),
+    sd_power=(0.0, 4.0),
+    sd_scale=(0.0, 5.0),
+    sa_base=(0.1, 1.5),
+    sa_power=(0.0, 4.0),
+    sa_scale=(0.0, 1.5),
+    ra_base=(0.0, 1.5),
+    ra_power=(0.0, 4.0),
+    ra_scale=(0.0, 1.5),
+    # md is capped by the reintegration stencil (md·DT ≲ 2.5, DT=1.5 → md ≲
+    # 1.6); widen the *floor* only (slower agents), never the ceiling.
+    md_base=(0.3, 1.5),
     md_power=(0.0, 3.0),
     md_scale=(0.0, 0.5),
-    sensor_offset_right=(-1.0, 1.0),
-    sensor_offset_up=(-1.0, 1.0),
-    deposit=(0.05, 0.5),
-    decay=(0.85, 0.99),
+    sensor_offset_right=(-2.0, 2.0),
+    sensor_offset_up=(-2.0, 2.0),
+    deposit=(0.05, 1.0),
+    decay=(0.70, 0.99),
     # 0 = no pull (allow thin/veiny shapes); ~0.006 = tight compact base.
+    # Held: above this collapses to a blob that fails the fill/cylinder gates.
     center_pull=(0.0, 0.006),
 )
 PARAM_FIELDS = list(PARAM_BOUNDS.keys())
@@ -945,141 +1065,186 @@ def _bd_cell(bd, archive_shape, bd_ranges):
     return tuple(idx)
 
 
-def _evaluate_params(params: PhysarumParams, grid, frames, steps_per_frame,
-                     r_min_voxels, seed):
-    """Run a short 3D sim with `params`. Returns (fitness, (bd1, bd2),
-    best_mask, M_final).
+_INFO_KEYS = ("sa_to_vol", "opening_ratio", "volume_fill", "edt_median",
+              "bottom_frac", "top_filled", "wall_filled", "outside_frac",
+              "cyl_mult", "overhang_frac", "overhang_mult", "edt_reward",
+              "sa_reward")
 
-    fitness = sa_to_vol at the best printable threshold, or -inf if no
-    threshold was printable.
-    bd1 = opening_ratio, bd2 = edt_median at that threshold.
-    Falls back to the threshold with the highest opening_ratio when nothing
-    is printable, so unprintable individuals still get a BD coordinate.
-    M_final is the (D,H,W,2) (mass,trail) field as a host np.float32 array —
-    used downstream to render a rotating-MIP gif for printable archive cells.
-    Returned only when the individual is printable (None otherwise), to keep
-    the per-eval memory footprint bounded.
+
+def _candidate_from_trail(trail, r_min_voxels, step):
+    """Evaluate one trail volume → a candidate dict for the archive.
+
+    candidate = dict(fitness, bd=(edt_median, volume_fill), mask, info, step).
+    fitness = the printability fitness at the best printable threshold, or
+    -inf if none printable (then bd falls back to the highest-fitness row so
+    the shape still gets an archive coordinate, and mask is None).
+    """
+    df, best_mask, best_row = printability_report(
+        trail, r_min_voxels=r_min_voxels, n_thresholds=10)
+    if best_row is not None:
+        row, mask, fitness = best_row, best_mask, best_row["fitness"]
+    else:
+        idx = int(df.select(pl.col("fitness").arg_max()).item())
+        row, mask, fitness = df.row(idx, named=True), None, -float("inf")
+    return dict(fitness=fitness,
+                bd=(row["edt_median"], row["volume_fill"]),
+                mask=mask,
+                info={k: row[k] for k in _INFO_KEYS},
+                step=step)
+
+
+def _evaluate_params(params: PhysarumParams, grid, frames, steps_per_frame,
+                     r_min_voxels, seed, eval_interval):
+    """Run a short 3D sim with `params`, evaluating printability at several
+    growth checkpoints (every `eval_interval` frames, plus the final frame).
+
+    Returns a list of candidate dicts (one per checkpoint) — the sim is the
+    expensive part, so sampling it at multiple stages yields several
+    evaluatable shapes (sparse/thin early → fuller/thicker late) almost for
+    free. See `_candidate_from_trail` for the candidate schema.
     """
     D, H, W = grid
     key = jax.random.PRNGKey(int(seed))
     state = init_state_3d(key, D, H, W)
-    for _ in range(frames):
+    candidates = []
+    for fr in range(frames):
         for _ in range(steps_per_frame):
             state = step_3d_jit(state, params)
-    jax.block_until_ready(state.X)
-
-    trail = np.asarray(state.M[..., 1])
-    df, best_mask, best_row = printability_report(
-        trail, r_min_voxels=r_min_voxels, n_thresholds=10)
-    if best_row is not None:
-        return (best_row["sa_to_vol"],
-                (best_row["opening_ratio"], best_row["edt_median"]),
-                best_mask,
-                np.asarray(state.M))
-
-    best_idx = int(df.select(pl.col("opening_ratio").arg_max()).item())
-    fallback = df.row(best_idx, named=True)
-    return (-float("inf"),
-            (fallback["opening_ratio"], fallback["edt_median"]),
-            None,
-            None)
+        if (fr + 1) % eval_interval == 0 or (fr + 1) == frames:
+            jax.block_until_ready(state.X)
+            trail = np.asarray(state.M[..., 1])
+            candidates.append(_candidate_from_trail(trail, r_min_voxels, fr + 1))
+    return candidates
 
 
 def map_elites_run(cfg: DictConfig, out_dir: Path):
     """Quality-diversity search over PhysarumParams.
 
-    Archive is a 2D grid indexed by (opening_ratio, edt_median).  Each cell
-    holds the highest-sa_to_vol individual whose BDs land there. We:
+    Archive is a 2-D grid indexed by (edt_median, volume_fill).  Each cell
+    holds the highest-fitness (= sa_to_vol) individual whose descriptors land
+    there. We:
       1) seed the archive with `init_evals` uniform-random params
       2) loop `n_evals - init_evals` more times, each iteration mutating a
-         random archive member with Gaussian noise
+         random *printable* archive member with Gaussian noise (unprintable
+         cells are never chosen as parents)
+      Each sim is evaluated at several growth checkpoints (every
+      `eval_interval` frames), so one sim yields multiple archive candidates.
       3) save final archive as a CSV, drop the best mask per occupied cell
          under <out_dir>/archive/, and emit per-cell STLs for printable
          survivors.
     """
     me = cfg.mapelites
     archive_shape = tuple(me.archive_shape)
-    bd_ranges = (tuple(me.bd_ranges.opening_ratio),
-                 tuple(me.bd_ranges.edt_median))
+    bd_ranges = (tuple(me.bd_ranges.edt_median),
+                 tuple(me.bd_ranges.volume_fill))
     grid = tuple(me.grid)
+    eval_interval = int(me.eval_interval)
     rng = np.random.default_rng(int(cfg.seed))
 
-    archive = {}  # (i,j) -> dict(params, fitness, bd, mask, eval_idx)
+    archive = {}  # (i,j) -> dict(params, fitness, bd, mask, info, eval_idx, step)
     arch_dir = out_dir / "archive"
     arch_dir.mkdir(exist_ok=True)
 
-    print(f"\n=== MAP-Elites: {me.n_evals} evals, archive {archive_shape}, "
-          f"eval grid {grid}, frames {me.frames}×{me.steps_per_frame} ===")
+    n_chk = len(range(eval_interval, int(me.frames) + 1, eval_interval)) or 1
+    print(f"\n=== MAP-Elites: {me.n_evals} sims × ~{n_chk} checkpoints, archive "
+          f"{archive_shape}, eval grid {grid}, "
+          f"frames {me.frames}×{me.steps_per_frame} ===")
     t0 = time.perf_counter()
     for i in range(int(me.n_evals)):
-        if i < int(me.init_evals) or len(archive) == 0:
+        # Only mutate from printable elites — unprintable (-inf) cells are dead
+        # ends and would waste the budget orbiting infeasible shapes.
+        printable_cells = [c for c, e in archive.items()
+                           if np.isfinite(e["fitness"])]
+        if i < int(me.init_evals) or not printable_cells:
             params = _sample_params_uniform(rng)
             origin = "init"
         else:
-            parent_cell = list(archive.keys())[rng.integers(len(archive))]
+            parent_cell = printable_cells[rng.integers(len(printable_cells))]
             parent = archive[parent_cell]["params"]
             params = _mutate_params(rng, parent, float(me.mutation_sigma))
-            origin = f"mut[{parent_cell[0]},{parent_cell[1]}]"
+            origin = "mut[" + ",".join(map(str, parent_cell)) + "]"
 
-        fitness, bd, mask, M_final = _evaluate_params(
+        # One sim → several candidates (growth checkpoints). Insert each.
+        candidates = _evaluate_params(
             params, grid, int(me.frames), int(me.steps_per_frame),
-            float(me.r_min_voxels), int(cfg.seed) + i)
-        cell = _bd_cell(bd, archive_shape, bd_ranges)
-
-        cur = archive.get(cell)
-        replaced = cur is None or fitness > cur["fitness"]
-        if replaced:
-            archive[cell] = dict(params=params, fitness=fitness, bd=bd,
-                                 mask=mask, M_final=M_final, eval_idx=i)
+            float(me.r_min_voxels), int(cfg.seed) + i, eval_interval)
+        n_new = 0
+        best = max(candidates, key=lambda c: c["fitness"])
+        for cand in candidates:
+            cell = _bd_cell(cand["bd"], archive_shape, bd_ranges)
+            cur = archive.get(cell)
+            if cur is None or cand["fitness"] > cur["fitness"]:
+                archive[cell] = dict(params=params, fitness=cand["fitness"],
+                                     bd=cand["bd"], mask=cand["mask"],
+                                     info=cand["info"], eval_idx=i,
+                                     step=cand["step"])
+                n_new += 1
         elapsed = time.perf_counter() - t0
         rate = (i + 1) / max(elapsed, 1e-6)
-        print(f"  eval {i+1:3d}/{me.n_evals} {origin:>14s}  "
-              f"bd=({bd[0]:.3f},{bd[1]:.2f})  cell={cell}  "
-              f"fit={fitness:7.3f}  archive={len(archive):3d}  "
-              f"{rate:.2f} ev/s  {'*' if replaced else ''}")
+        bd_str = "(" + ",".join(f"{v:.2f}" for v in best["bd"]) + ")"
+        print(f"  sim {i+1:4d}/{me.n_evals} {origin:>13s}  "
+              f"best edt,fill={bd_str}  fit={best['fitness']:7.4f}  "
+              f"+{n_new}cells  archive={len(archive):3d}  {rate:.2f} sim/s")
 
-    # Persist final archive: per-cell .npy + .stl + a rotating-MIP gif for
-    # every printable survivor, plus a single archive.csv with all params.
+    # Persist final archive: per-cell .npy + .stl + a rotating solid-render gif
+    # for every printable survivor, plus a single archive.csv with all params.
     rows = []
     n_gif = 0
-    gif_screen = max(96, int(cfg.render_size) // 2)
-    gif_n_steps = max(64, int(cfg.n_steps) // 2)
-    for (i, j), e in archive.items():
-        d = dict(cell_i=i, cell_j=j,
-                 opening_ratio=e["bd"][0], edt_median=e["bd"][1],
-                 fitness=e["fitness"], eval_idx=e["eval_idx"])
+    gif_screen = max(384, int(cfg.render_size) * 2)   # 4× the previous 96 px
+    gif_n_steps = max(256, int(cfg.n_steps) * 2)       # 4× the previous 64
+    for cell, e in archive.items():
+        d = dict(cell_edt=cell[0], cell_fill=cell[1],
+                 sa_to_vol=e["info"]["sa_to_vol"],
+                 opening_ratio=e["info"]["opening_ratio"],
+                 volume_fill=e["info"]["volume_fill"],
+                 edt_median=e["info"]["edt_median"],
+                 bottom_frac=e["info"]["bottom_frac"],
+                 top_filled=e["info"]["top_filled"],
+                 wall_filled=e["info"]["wall_filled"],
+                 outside_frac=e["info"]["outside_frac"],
+                 cyl_mult=e["info"]["cyl_mult"],
+                 overhang_frac=e["info"]["overhang_frac"],
+                 overhang_mult=e["info"]["overhang_mult"],
+                 edt_reward=e["info"]["edt_reward"],
+                 sa_reward=e["info"]["sa_reward"],
+                 fitness=e["fitness"], eval_idx=e["eval_idx"], step=e["step"])
         for f in PARAM_FIELDS:
             d[f] = getattr(e["params"], f)
         rows.append(d)
         if e["mask"] is not None:
-            stem = f"cell_{i:02d}_{j:02d}_fit{e['fitness']:.3f}"
+            stem = "cell_" + "_".join(f"{c:02d}" for c in cell) \
+                   + f"_fit{e['fitness']:.4f}"
             np.save(arch_dir / f"{stem}.npy", e["mask"])
             export_stl(e["mask"], arch_dir / f"{stem}.stl",
                        voxel_size_mm=float(cfg.printability.voxel_size_mm))
-            if e["M_final"] is not None:
-                M_jax = jnp.asarray(e["M_final"])
-                D_, H_, W_ = M_jax.shape[:3]
-                # render_mip walks state.X/V shapes but only samples state.M;
-                # pass dummy X/V of the right shape so the JIT cache reuses.
-                dummy = jnp.zeros((D_, H_, W_, 3), dtype=jnp.float32)
-                state = State3D(dummy, dummy, M_jax)
-                gif_frames = []
-                n_views = 48
-                for v in range(n_views):
-                    theta, phi = orbit_view(v, n_views, phi_amp=1.0)
-                    img = np.asarray(render_mip_jit(state,
-                                                    theta=float(theta),
-                                                    phi=float(phi),
-                                                    screen=gif_screen,
-                                                    n_steps=gif_n_steps))
-                    gif_frames.append((img * 255).astype(np.uint8))
-                iio.imwrite(arch_dir / f"{stem}.gif", gif_frames,
-                            duration=110, loop=0)
-                n_gif += 1
+            # Render exactly what gets printed: the binary mask (optimal
+            # threshold, largest connected component) as a fully opaque solid,
+            # so thin density regions don't read as wispy.
+            mask_jax = jnp.asarray(e["mask"], dtype=jnp.float32)
+            M_jax = jnp.stack([mask_jax, mask_jax], axis=-1)
+            D_, H_, W_ = M_jax.shape[:3]
+            # render walks state.X/V shapes but only samples state.M;
+            # pass dummy X/V of the right shape so the JIT cache reuses.
+            dummy = jnp.zeros((D_, H_, W_, 3), dtype=jnp.float32)
+            state = State3D(dummy, dummy, M_jax)
+            gif_frames = []
+            n_views = 48
+            for v in range(n_views):
+                theta, phi = orbit_view(v, n_views, phi_amp=1.0)
+                img = np.asarray(render_rm_jit(state,
+                                               theta=float(theta),
+                                               phi=float(phi),
+                                               screen=gif_screen,
+                                               n_steps=gif_n_steps,
+                                               mode="solid"))
+                gif_frames.append((img * 255).astype(np.uint8))
+            iio.imwrite(arch_dir / f"{stem}.gif", gif_frames,
+                        duration=110, loop=0)
+            n_gif += 1
 
     df = pl.DataFrame(rows).sort("fitness", descending=True)
     df.write_csv(out_dir / "mapelites_archive.csv")
-    print(f"\nfilled {len(archive)} / {archive_shape[0]*archive_shape[1]} cells "
+    print(f"\nfilled {len(archive)} / {math.prod(archive_shape)} cells "
           f"in {time.perf_counter() - t0:.1f}s — "
           f"wrote {out_dir / 'mapelites_archive.csv'} and "
           f"{arch_dir} ({sum(e['mask'] is not None for e in archive.values())} "
@@ -1182,8 +1347,18 @@ def run_3d(cfg: DictConfig, params: PhysarumParams, out_dir: Path):
             trail,
             r_min_voxels=float(pcfg.r_min_voxels),
             n_thresholds=int(pcfg.n_thresholds),
-            kept_fraction_min=float(pcfg.kept_fraction_min),
-            opening_ratio_min=float(pcfg.opening_ratio_min))
+            opening_ratio_min=float(pcfg.opening_ratio_min),
+            volume_fill_min=float(pcfg.volume_fill_min),
+            volume_fill_max=float(pcfg.volume_fill_max),
+            edt_median_min=float(pcfg.edt_median_min),
+            edt_reward_tau=float(pcfg.edt_reward_tau),
+            sa_reward_tau=float(pcfg.sa_reward_tau),
+            top_clear_voxels=int(pcfg.top_clear_voxels),
+            bottom_fill_min=float(pcfg.bottom_fill_min),
+            bottom_fill_max=float(pcfg.bottom_fill_max),
+            cylinder_penalty_scale=float(pcfg.cylinder_penalty_scale),
+            overhang_free=float(pcfg.overhang_free),
+            overhang_penalty_scale=float(pcfg.overhang_penalty_scale))
         print(f"  sweep took {time.perf_counter() - ts:.2f}s")
         with pl.Config(tbl_rows=int(pcfg.n_thresholds), tbl_cols=-1,
                        float_precision=3):
@@ -1191,11 +1366,13 @@ def run_3d(cfg: DictConfig, params: PhysarumParams, out_dir: Path):
         df.write_csv(out_dir / cfg.out_report)
         print(f"wrote {out_dir / cfg.out_report}")
         if best_row is None:
-            print("no printable threshold found — lower r_min_voxels, loosen "
-                  "the printability thresholds, or tune params toward thicker "
-                  "structure (higher deposit, lower decay, lower sd/ra).")
+            print("no printable threshold found — lower r_min_voxels or "
+                  "opening_ratio_min, or tune params toward thicker structure "
+                  "(higher deposit, lower decay, lower sd/ra).")
         else:
             print(f"best printable threshold: t={best_row['threshold']:.3f}  "
+                  f"fitness={best_row['fitness']:.3f}  "
+                  f"fill={best_row['volume_fill']:.3f}  "
                   f"sa/vol={best_row['sa_to_vol']:.3f}  "
                   f"volume={best_row['volume']}  "
                   f"opening_ratio={best_row['opening_ratio']:.3f}  "

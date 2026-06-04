@@ -11,11 +11,13 @@ const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
 const FILL_BINS_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/fill_bins.wgsl"));
 const PREFIX_SUM_WGSL: &str = include_str!("shaders/prefix_sum.wgsl");
 const SORT_VERTICES_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/sort_vertices.wgsl"));
-const REPULSION_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/repulsion.wgsl"));
 const TOPO_FORCES_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/topo_forces.wgsl"));
-const INTEGRATE_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/integrate.wgsl"));
+const PROJECT_COLLISION_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/project_collision.wgsl"));
+const PREDICT_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/predict.wgsl"));
+const PROJECT_SPRINGS_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/project_springs.wgsl"));
 const CHEBYSHEV_INIT_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/chebyshev_init.wgsl"));
 const CHEBYSHEV_STEP_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/chebyshev_step.wgsl"));
+const PROJECT_BENDING_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/project_bending.wgsl"));
 const GROWTH_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/growth.wgsl"));
 const BBOX_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/bbox.wgsl"));
 
@@ -26,9 +28,9 @@ pub(crate) struct GpuSimParams {
     pub(crate) num_half_edges: u32,
     pub(crate) repulsion_distance: f32,
     pub(crate) spring_len: f32,
-    pub(crate) elastic_constant: f32,
+    pub(crate) compliance: f32,
     pub(crate) bulge_strength: f32,
-    pub(crate) planar_strength: f32,
+    pub(crate) smoothing_strength: f32,
     pub(crate) dt: f32,
     pub(crate) origin_x: f32,
     pub(crate) origin_y: f32,
@@ -43,7 +45,17 @@ pub(crate) struct GpuSimParams {
     pub(crate) repulsion_strength: f32,
     pub(crate) state_dt: f32,
     pub(crate) damping: f32,
-    pub(crate) _pad: [f32; 3],
+    pub(crate) growth_rate: f32,
+    pub(crate) xpbd_iterations: u32,
+    pub(crate) bending_compliance: f32,
+    pub(crate) relaxation: f32,
+    // State rule: 0 = Lenia cellular automata, 1 = static dot seed.
+    pub(crate) growth_mode: u32,
+    // Per-frame seed mixed into the growth RNG so stochastic edge growth
+    // resamples each step (matches the Python reference's per-step noise).
+    pub(crate) frame_seed: u32,
+    // Pad to 16-byte alignment for the WGSL uniform struct.
+    pub(crate) _pad: f32,
 }
 
 #[repr(C)]
@@ -70,7 +82,6 @@ pub(crate) struct GpuCompute {
     bin_offset_buf: wgpu::Buffer,
     bin_offset_tmp_buf: wgpu::Buffer,
     sorted_idx_buf: wgpu::Buffer,
-    prefix_sum_step_buf: wgpu::Buffer,
 
     // Topology buffers (packed: vec4<i32> = dest, twin, next, face)
     he_packed_buf: wgpu::Buffer,
@@ -79,6 +90,9 @@ pub(crate) struct GpuCompute {
     // State evolution buffers
     pub(crate) vertex_state_buf: wgpu::Buffer,
     vertex_u_buf: wgpu::Buffer,
+
+    // Intrinsic edge length buffer (per half-edge)
+    he_intrinsic_len_buf: wgpu::Buffer,
     cheb_a_buf: wgpu::Buffer,
     cheb_b_buf: wgpu::Buffer,
     cheb_c_buf: wgpu::Buffer,
@@ -93,6 +107,7 @@ pub(crate) struct GpuCompute {
     // Readback
     pos_readback_buf: wgpu::Buffer,
     state_readback_buf: wgpu::Buffer,
+    intrinsic_len_readback_buf: wgpu::Buffer,
 
     // Bounding box reduction
     bbox_atomic_buf: wgpu::Buffer,
@@ -108,26 +123,32 @@ pub(crate) struct GpuCompute {
     prefix_sum_pipeline: wgpu::ComputePipeline,
     sort_clear_pipeline: wgpu::ComputePipeline,
     sort_vertices_pipeline: wgpu::ComputePipeline,
-    repulsion_pipeline: wgpu::ComputePipeline,
     topo_forces_pipeline: wgpu::ComputePipeline,
-    integrate_pipeline: wgpu::ComputePipeline,
+    predict_pipeline: wgpu::ComputePipeline,
+    project_springs_pipeline: wgpu::ComputePipeline,
+    project_bending_pipeline: wgpu::ComputePipeline,
+    project_collision_pipeline: wgpu::ComputePipeline,
     chebyshev_init_pipeline: wgpu::ComputePipeline,
     chebyshev_step_pipeline: wgpu::ComputePipeline,
     growth_pipeline: wgpu::ComputePipeline,
 
     // Bind groups - spatial hash
     fill_bins_bg: [wgpu::BindGroup; 3],  // [pos, params, bins]
-    prefix_sum_bgs: [wgpu::BindGroup; 3], // ping-pong: [0]bin_size→offset, [1]offset→tmp, [2]tmp→offset
+    prefix_sum_bgs: Vec<wgpu::BindGroup>, // one per step, each with correct source/dest and step_size
     sort_data_bg: wgpu::BindGroup,
     sort_params_bg: wgpu::BindGroup,
 
     // Bind groups - forces
-    repulsion_data_bg: wgpu::BindGroup,
-    repulsion_params_bg: wgpu::BindGroup,
     topo_data_bg: wgpu::BindGroup,
     topo_params_bg: wgpu::BindGroup,
-    integrate_data_bg: wgpu::BindGroup,
-    integrate_params_bg: wgpu::BindGroup,
+    predict_data_bg: wgpu::BindGroup,
+    predict_params_bg: wgpu::BindGroup,
+    project_springs_data_bg: wgpu::BindGroup,
+    project_springs_params_bg: wgpu::BindGroup,
+    project_bending_data_bg: wgpu::BindGroup,
+    project_bending_params_bg: wgpu::BindGroup,
+    project_collision_data_bg: wgpu::BindGroup,
+    project_collision_params_bg: wgpu::BindGroup,
 
     // Bind groups - chebyshev
     cheb_init_data_bg: wgpu::BindGroup,
@@ -190,9 +211,6 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
     let sorted_idx_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("sorted_idx"), size: idx_buf_size, usage: storage_rw, mapped_at_creation: false,
     });
-    let prefix_sum_step_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("prefix_sum_step"), size: 4, usage: uniform, mapped_at_creation: false,
-    });
     let he_packed_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("he_packed"), size: he_packed_size, usage: storage_r, mapped_at_creation: false,
     });
@@ -201,6 +219,9 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
     });
     let vertex_state_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("vertex_state"), size: state_buf_size, usage: storage_rw, mapped_at_creation: false,
+    });
+    let he_intrinsic_len_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("he_intrinsic_len"), size: (MAX_HALF_EDGES * 4) as u64, usage: storage_rw, mapped_at_creation: false,
     });
     let vertex_u_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("vertex_u"), size: state_buf_size, usage: storage_rw, mapped_at_creation: false,
@@ -248,6 +269,9 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
     let state_readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("state_readback"), size: state_buf_size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
     });
+    let intrinsic_len_readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("intrinsic_len_readback"), size: (MAX_HALF_EDGES * 4) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+    });
     let bbox_atomic_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("bbox_atomic"), size: 24, usage: storage_rw, mapped_at_creation: false,
     });
@@ -292,14 +316,20 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
     let sort_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("sort_vertices"), source: wgpu::ShaderSource::Wgsl(SORT_VERTICES_WGSL.into()),
     });
-    let repulsion_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("repulsion"), source: wgpu::ShaderSource::Wgsl(REPULSION_WGSL.into()),
-    });
     let topo_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("topo_forces"), source: wgpu::ShaderSource::Wgsl(TOPO_FORCES_WGSL.into()),
     });
-    let integrate_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("integrate"), source: wgpu::ShaderSource::Wgsl(INTEGRATE_WGSL.into()),
+    let predict_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("predict"), source: wgpu::ShaderSource::Wgsl(PREDICT_WGSL.into()),
+    });
+    let project_springs_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("project_springs"), source: wgpu::ShaderSource::Wgsl(PROJECT_SPRINGS_WGSL.into()),
+    });
+    let project_bending_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("project_bending"), source: wgpu::ShaderSource::Wgsl(PROJECT_BENDING_WGSL.into()),
+    });
+    let project_collision_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("project_collision"), source: wgpu::ShaderSource::Wgsl(PROJECT_COLLISION_WGSL.into()),
     });
     let cheb_init_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("cheb_init"), source: wgpu::ShaderSource::Wgsl(CHEBYSHEV_INIT_WGSL.into()),
@@ -344,14 +374,6 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
         .storage_buffer(cs, false, false)  // bin_counter (reuse bin_size)
         .build(device);
 
-    // repulsion: group0=pos(R)+force(RW)+sorted(R)+offset(R), group1=params(U)
-    let repulsion_data_layout = wgpu::BindGroupLayoutBuilder::new()
-        .storage_buffer(cs, false, true)   // vertex_pos
-        .storage_buffer(cs, false, false)  // vertex_force
-        .storage_buffer(cs, false, true)   // sorted_idx
-        .storage_buffer(cs, false, true)   // bin_offset
-        .build(device);
-
     // topo_forces: group0=pos(R)+force(RW)+he_packed(R)+vertex_he(R), group1=params(U)
     let topo_data_layout = wgpu::BindGroupLayoutBuilder::new()
         .storage_buffer(cs, false, true)   // vertex_pos
@@ -360,10 +382,34 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
         .storage_buffer(cs, false, true)   // vertex_he
         .build(device);
 
-    // integrate: group0=pos(RW)+force(R), group1=params(U)
-    let integrate_data_layout = wgpu::BindGroupLayoutBuilder::new()
+    // predict: group0=pos(RW)+force(R), group1=params(U)
+    let predict_data_layout = wgpu::BindGroupLayoutBuilder::new()
         .storage_buffer(cs, false, false)  // vertex_pos (RW)
         .storage_buffer(cs, false, true)   // vertex_force (R)
+        .build(device);
+
+    // project_springs: group0=pos(RW)+he_packed(R)+vertex_he(R)+he_intrinsic_len(R), group1=params(U)
+    let project_springs_data_layout = wgpu::BindGroupLayoutBuilder::new()
+        .storage_buffer(cs, false, false)  // vertex_pos (RW)
+        .storage_buffer(cs, false, true)   // he_packed (R)
+        .storage_buffer(cs, false, true)   // vertex_he (R)
+        .storage_buffer(cs, false, true)   // he_intrinsic_len (R)
+        .build(device);
+
+    // project_bending: group0=pos(RW)+he_packed(R)+vertex_he(R), group1=params(U)
+    let project_bending_data_layout = wgpu::BindGroupLayoutBuilder::new()
+        .storage_buffer(cs, false, false)  // vertex_pos (RW)
+        .storage_buffer(cs, false, true)   // he_packed (R)
+        .storage_buffer(cs, false, true)   // vertex_he (R)
+        .build(device);
+
+    // project_collision: group0=pos(RW)+sorted(R)+offset(R)+he_packed(R)+vertex_he(R), group1=params(U)
+    let project_collision_data_layout = wgpu::BindGroupLayoutBuilder::new()
+        .storage_buffer(cs, false, false)  // vertex_pos (RW)
+        .storage_buffer(cs, false, true)   // sorted_idx (R)
+        .storage_buffer(cs, false, true)   // bin_offset (R)
+        .storage_buffer(cs, false, true)   // he_packed (R)
+        .storage_buffer(cs, false, true)   // vertex_he (R)
         .build(device);
 
     // chebyshev_init: group0=state(R)+t_a(RW)+t_b(RW)+result(RW)+he_packed(R)+vertex_he(R)
@@ -397,12 +443,15 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
         .uniform_buffer(cs, false)  // coeff
         .build(device);
 
-    // growth: group0=state(RW)+u(RW)+result(R)+pos(R), group1=params(U)
+    // growth: group0=state(RW)+u(RW)+result(R)+pos(R)+intrinsic_len(RW)+he_packed(R)+vertex_he(R), group1=params(U)
     let growth_data_layout = wgpu::BindGroupLayoutBuilder::new()
         .storage_buffer(cs, false, false)  // vertex_state
         .storage_buffer(cs, false, false)  // vertex_u
         .storage_buffer(cs, false, true)   // result
         .storage_buffer(cs, false, true)   // vertex_pos (active check)
+        .storage_buffer(cs, false, false)  // he_intrinsic_len
+        .storage_buffer(cs, false, true)   // he_packed
+        .storage_buffer(cs, false, true)   // vertex_he
         .build(device);
 
     // bbox: group0=pos(R)+bbox_atomic(RW), group1=params(U)
@@ -428,19 +477,29 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
         bind_group_layouts: &[&sort_data_layout, &params_layout],
         push_constant_ranges: &[],
     });
-    let repulsion_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("repulsion_pl"),
-        bind_group_layouts: &[&repulsion_data_layout, &params_layout],
-        push_constant_ranges: &[],
-    });
     let topo_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("topo_pl"),
         bind_group_layouts: &[&topo_data_layout, &params_layout],
         push_constant_ranges: &[],
     });
-    let integrate_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("integrate_pl"),
-        bind_group_layouts: &[&integrate_data_layout, &params_layout],
+    let predict_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("predict_pl"),
+        bind_group_layouts: &[&predict_data_layout, &params_layout],
+        push_constant_ranges: &[],
+    });
+    let project_springs_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("project_springs_pl"),
+        bind_group_layouts: &[&project_springs_data_layout, &params_layout],
+        push_constant_ranges: &[],
+    });
+    let project_bending_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("project_bending_pl"),
+        bind_group_layouts: &[&project_bending_data_layout, &params_layout],
+        push_constant_ranges: &[],
+    });
+    let project_collision_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("project_collision_pl"),
+        bind_group_layouts: &[&project_collision_data_layout, &params_layout],
         push_constant_ranges: &[],
     });
     let cheb_init_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -482,9 +541,11 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
     let prefix_sum_pipeline = make_pipeline("prefix_sum", &prefix_sum_pl, &prefix_sum_shader, "main");
     let sort_clear_pipeline = make_pipeline("sort_clear", &sort_pl, &sort_shader, "clear_counters");
     let sort_vertices_pipeline = make_pipeline("sort_vertices", &sort_pl, &sort_shader, "sort_vertices");
-    let repulsion_pipeline = make_pipeline("repulsion", &repulsion_pl, &repulsion_shader, "main");
     let topo_forces_pipeline = make_pipeline("topo_forces", &topo_pl, &topo_shader, "main");
-    let integrate_pipeline = make_pipeline("integrate", &integrate_pl, &integrate_shader, "main");
+    let predict_pipeline = make_pipeline("predict", &predict_pl, &predict_shader, "main");
+    let project_springs_pipeline = make_pipeline("project_springs", &project_springs_pl, &project_springs_shader, "main");
+    let project_bending_pipeline = make_pipeline("project_bending", &project_bending_pl, &project_bending_shader, "main");
+    let project_collision_pipeline = make_pipeline("project_collision", &project_collision_pl, &project_collision_shader, "main");
     let chebyshev_init_pipeline = make_pipeline("cheb_init", &cheb_init_pl, &cheb_init_shader, "main");
     let chebyshev_step_pipeline = make_pipeline("cheb_step", &cheb_step_pl, &cheb_step_shader, "main");
     let growth_pipeline = make_pipeline("growth", &growth_pl, &growth_shader, "main");
@@ -506,27 +567,26 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
             .build(device, &bins_layout),
     ];
 
-    // prefix sum bind groups (ping-pong)
-    let prefix_sum_bgs = [
-        // [0] bin_size → bin_offset
-        wgpu::BindGroupBuilder::new()
-            .buffer_bytes(&bin_size_buf, 0, None)
-            .buffer_bytes(&bin_offset_buf, 0, None)
-            .buffer_bytes(&prefix_sum_step_buf, 0, None)
-            .build(device, &prefix_layout),
-        // [1] bin_offset → bin_offset_tmp
-        wgpu::BindGroupBuilder::new()
-            .buffer_bytes(&bin_offset_buf, 0, None)
-            .buffer_bytes(&bin_offset_tmp_buf, 0, None)
-            .buffer_bytes(&prefix_sum_step_buf, 0, None)
-            .build(device, &prefix_layout),
-        // [2] bin_offset_tmp → bin_offset
-        wgpu::BindGroupBuilder::new()
-            .buffer_bytes(&bin_offset_tmp_buf, 0, None)
-            .buffer_bytes(&bin_offset_buf, 0, None)
-            .buffer_bytes(&prefix_sum_step_buf, 0, None)
-            .build(device, &prefix_layout),
-    ];
+    // prefix sum bind groups — one per step, each binding the correct
+    // source/dest ping-pong buffers AND the pre-baked step_size uniform.
+    // Step 0: bin_size → bin_offset; odd steps: bin_offset → bin_offset_tmp;
+    // even steps (>0): bin_offset_tmp → bin_offset.
+    let prefix_sum_bgs: Vec<wgpu::BindGroup> = (0..max_prefix_steps)
+        .map(|i| {
+            let (src, dst) = if i == 0 {
+                (&bin_size_buf, &bin_offset_buf)
+            } else if i % 2 == 1 {
+                (&bin_offset_buf, &bin_offset_tmp_buf)
+            } else {
+                (&bin_offset_tmp_buf, &bin_offset_buf)
+            };
+            wgpu::BindGroupBuilder::new()
+                .buffer_bytes(src, 0, None)
+                .buffer_bytes(dst, 0, None)
+                .buffer_bytes(&prefix_sum_step_bufs[i], 0, None)
+                .build(device, &prefix_layout)
+        })
+        .collect();
 
     // sort bind groups
     let sort_data_bg = wgpu::BindGroupBuilder::new()
@@ -536,17 +596,6 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
         .buffer_bytes(&bin_size_buf, 0, None) // reuse as counter
         .build(device, &sort_data_layout);
     let sort_params_bg = wgpu::BindGroupBuilder::new()
-        .buffer_bytes(&sim_params_buf, 0, None)
-        .build(device, &params_layout);
-
-    // repulsion bind groups
-    let repulsion_data_bg = wgpu::BindGroupBuilder::new()
-        .buffer_bytes(&vertex_pos_buf, 0, None)
-        .buffer_bytes(&vertex_force_buf, 0, None)
-        .buffer_bytes(&sorted_idx_buf, 0, None)
-        .buffer_bytes(&bin_offset_buf, 0, None)
-        .build(device, &repulsion_data_layout);
-    let repulsion_params_bg = wgpu::BindGroupBuilder::new()
         .buffer_bytes(&sim_params_buf, 0, None)
         .build(device, &params_layout);
 
@@ -561,12 +610,45 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
         .buffer_bytes(&sim_params_buf, 0, None)
         .build(device, &params_layout);
 
-    // integrate bind groups
-    let integrate_data_bg = wgpu::BindGroupBuilder::new()
+    // predict bind groups
+    let predict_data_bg = wgpu::BindGroupBuilder::new()
         .buffer_bytes(&vertex_pos_buf, 0, None)
         .buffer_bytes(&vertex_force_buf, 0, None)
-        .build(device, &integrate_data_layout);
-    let integrate_params_bg = wgpu::BindGroupBuilder::new()
+        .build(device, &predict_data_layout);
+    let predict_params_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&sim_params_buf, 0, None)
+        .build(device, &params_layout);
+
+    // project springs bind groups
+    let project_springs_data_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&vertex_pos_buf, 0, None)
+        .buffer_bytes(&he_packed_buf, 0, None)
+        .buffer_bytes(&vertex_he_buf, 0, None)
+        .buffer_bytes(&he_intrinsic_len_buf, 0, None)
+        .build(device, &project_springs_data_layout);
+    let project_springs_params_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&sim_params_buf, 0, None)
+        .build(device, &params_layout);
+
+    // project bending bind groups
+    let project_bending_data_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&vertex_pos_buf, 0, None)
+        .buffer_bytes(&he_packed_buf, 0, None)
+        .buffer_bytes(&vertex_he_buf, 0, None)
+        .build(device, &project_bending_data_layout);
+    let project_bending_params_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&sim_params_buf, 0, None)
+        .build(device, &params_layout);
+
+    // project collision bind groups
+    let project_collision_data_bg = wgpu::BindGroupBuilder::new()
+        .buffer_bytes(&vertex_pos_buf, 0, None)
+        .buffer_bytes(&sorted_idx_buf, 0, None)
+        .buffer_bytes(&bin_offset_buf, 0, None)
+        .buffer_bytes(&he_packed_buf, 0, None)
+        .buffer_bytes(&vertex_he_buf, 0, None)
+        .build(device, &project_collision_data_layout);
+    let project_collision_params_bg = wgpu::BindGroupBuilder::new()
         .buffer_bytes(&sim_params_buf, 0, None)
         .build(device, &params_layout);
 
@@ -630,6 +712,9 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
         .buffer_bytes(&vertex_u_buf, 0, None)
         .buffer_bytes(&cheb_result_buf, 0, None)
         .buffer_bytes(&vertex_pos_buf, 0, None)
+        .buffer_bytes(&he_intrinsic_len_buf, 0, None)
+        .buffer_bytes(&he_packed_buf, 0, None)
+        .buffer_bytes(&vertex_he_buf, 0, None)
         .build(device, &growth_data_layout);
     let growth_params_bg = wgpu::BindGroupBuilder::new()
         .buffer_bytes(&sim_params_buf, 0, None)
@@ -646,25 +731,29 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
 
     GpuCompute {
         vertex_pos_buf, vertex_force_buf,
-        bin_size_buf, bin_offset_buf, bin_offset_tmp_buf, sorted_idx_buf, prefix_sum_step_buf,
+        bin_size_buf, bin_offset_buf, bin_offset_tmp_buf, sorted_idx_buf,
         he_packed_buf, vertex_he_buf,
         vertex_state_buf, vertex_u_buf,
+        he_intrinsic_len_buf,
         cheb_a_buf, cheb_b_buf, cheb_c_buf, cheb_result_buf,
         cheb_coeff_buf, cheb_c0_buf, cheb_c1_buf,
         sim_params_buf,
-        pos_readback_buf, state_readback_buf,
+        pos_readback_buf, state_readback_buf, intrinsic_len_readback_buf,
         bbox_atomic_buf, bbox_readback_buf,
         bbox_clear_pipeline, bbox_reduce_pipeline,
         bbox_data_bg, bbox_params_bg,
         clear_bins_pipeline, fill_bins_pipeline, prefix_sum_pipeline,
         sort_clear_pipeline, sort_vertices_pipeline,
-        repulsion_pipeline, topo_forces_pipeline, integrate_pipeline,
+        topo_forces_pipeline, predict_pipeline,
+        project_springs_pipeline, project_bending_pipeline, project_collision_pipeline,
         chebyshev_init_pipeline, chebyshev_step_pipeline, growth_pipeline,
         fill_bins_bg, prefix_sum_bgs,
         sort_data_bg, sort_params_bg,
-        repulsion_data_bg, repulsion_params_bg,
         topo_data_bg, topo_params_bg,
-        integrate_data_bg, integrate_params_bg,
+        predict_data_bg, predict_params_bg,
+        project_springs_data_bg, project_springs_params_bg,
+        project_bending_data_bg, project_bending_params_bg,
+        project_collision_data_bg, project_collision_params_bg,
         cheb_init_data_bg, cheb_init_params_bg,
         cheb_step_data_bgs, cheb_step_params_bgs,
         growth_data_bg, growth_params_bg,
@@ -692,6 +781,10 @@ pub(crate) fn upload_mesh_to_gpu(queue: &wgpu::Queue, gpu: &mut GpuCompute, mesh
 
     // Upload vertex states (only active range)
     queue.write_buffer(&gpu.vertex_state_buf, 0, bytemuck::cast_slice(&mesh.vertex_state[..n]));
+
+    // Upload intrinsic edge lengths (per half-edge)
+    let nhe = mesh.next_half_edge;
+    queue.write_buffer(&gpu.he_intrinsic_len_buf, 0, bytemuck::cast_slice(&mesh.half_edge_intrinsic_len[..nhe]));
 
     // Upload packed half-edge topology (vec4<i32>: dest, twin, next, face) — reuse staging buffer
     let nhe = mesh.next_half_edge;
@@ -738,11 +831,12 @@ pub(crate) fn readback_bbox_only(device: &wgpu::Device, gpu: &GpuCompute) -> [f3
 
 /// Read back positions, states, and GPU-computed bounding box.
 /// Returns [min_x, min_y, max_x, max_y, min_z, max_z] from the GPU bbox reduction.
-pub(crate) fn readback_from_gpu(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &mut GpuCompute, mesh: &mut HalfEdgeMesh) -> [f32; 6] {
+pub(crate) fn readback_from_gpu(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &mut GpuCompute, mesh: &mut HalfEdgeMesh) {
     let n = mesh.next_vertex;
-    // Only copy the active vertex range instead of the full MAX_VERTICES
+    let nhe = mesh.next_half_edge;
     let pos_size = (n * 16) as u64;
     let state_size = (n * 4) as u64;
+    let intrinsic_size = (nhe * 4) as u64;
 
     // Copy GPU buffers to staging (bbox was already copied in gpu_dispatch_frame)
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -750,6 +844,7 @@ pub(crate) fn readback_from_gpu(device: &wgpu::Device, queue: &wgpu::Queue, gpu:
     });
     encoder.copy_buffer_to_buffer(&gpu.vertex_pos_buf, 0, &gpu.pos_readback_buf, 0, pos_size);
     encoder.copy_buffer_to_buffer(&gpu.vertex_state_buf, 0, &gpu.state_readback_buf, 0, state_size);
+    encoder.copy_buffer_to_buffer(&gpu.he_intrinsic_len_buf, 0, &gpu.intrinsic_len_readback_buf, 0, intrinsic_size);
     queue.submit(Some(encoder.finish()));
 
     // Map all readback buffers, then poll once
@@ -757,8 +852,8 @@ pub(crate) fn readback_from_gpu(device: &wgpu::Device, queue: &wgpu::Queue, gpu:
     pos_slice.map_async(wgpu::MapMode::Read, |_| {});
     let state_slice = gpu.state_readback_buf.slice(..state_size);
     state_slice.map_async(wgpu::MapMode::Read, |_| {});
-    let bbox_slice = gpu.bbox_readback_buf.slice(..);
-    bbox_slice.map_async(wgpu::MapMode::Read, |_| {});
+    let intrinsic_len_slice = gpu.intrinsic_len_readback_buf.slice(..intrinsic_size);
+    intrinsic_len_slice.map_async(wgpu::MapMode::Read, |_| {});
     device.poll(wgpu::PollType::Wait).unwrap();
 
     // Read positions
@@ -779,22 +874,13 @@ pub(crate) fn readback_from_gpu(device: &wgpu::Device, queue: &wgpu::Queue, gpu:
     }
     gpu.state_readback_buf.unmap();
 
-    // Read bounding box (sortable uint → float conversion) — now 6 values
-    let bbox = {
-        let data = bbox_slice.get_mapped_range();
-        let uints: &[u32] = bytemuck::cast_slice(&data);
-        [
-            sortable_to_float(uints[0]),
-            sortable_to_float(uints[1]),
-            sortable_to_float(uints[2]),
-            sortable_to_float(uints[3]),
-            sortable_to_float(uints[4]),
-            sortable_to_float(uints[5]),
-        ]
-    };
-    gpu.bbox_readback_buf.unmap();
-
-    bbox
+    // Read intrinsic edge lengths
+    {
+        let data = intrinsic_len_slice.get_mapped_range();
+        let floats: &[f32] = bytemuck::cast_slice(&data);
+        mesh.half_edge_intrinsic_len[..nhe].copy_from_slice(&floats[..nhe]);
+    }
+    gpu.intrinsic_len_readback_buf.unmap();
 }
 
 pub(crate) fn rebuild_render_indices(queue: &wgpu::Queue, gpu: &mut GpuCompute, mesh: &HalfEdgeMesh) {
@@ -910,17 +996,12 @@ pub(crate) fn gpu_dispatch_frame(
     // 3. Prefix sum
     let num_prefix_steps = (num_bins_total as f32).log2().ceil() as u32;
     for i in 0..num_prefix_steps {
-        let step_size = 1u32 << i;
-        queue.write_buffer(&gpu.prefix_sum_step_buf, 0, bytemuck::bytes_of(&step_size));
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("prefix_sum"), timestamp_writes: None,
-            });
-            pass.set_pipeline(&gpu.prefix_sum_pipeline);
-            let bg_idx = if i == 0 { 0 } else if i % 2 == 1 { 1 } else { 2 };
-            pass.set_bind_group(0, &gpu.prefix_sum_bgs[bg_idx], &[]);
-            pass.dispatch_workgroups(dispatch_count(num_bins_total), 1, 1);
-        }
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("prefix_sum"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&gpu.prefix_sum_pipeline);
+        pass.set_bind_group(0, &gpu.prefix_sum_bgs[i as usize], &[]);
+        pass.dispatch_workgroups(dispatch_count(num_bins_total), 1, 1);
     }
     // If even number of steps > 1, result is in tmp; copy back
     if num_prefix_steps > 1 && num_prefix_steps % 2 == 0 {
@@ -955,18 +1036,10 @@ pub(crate) fn gpu_dispatch_frame(
 
     // ── Forces ──────────────────────────────────────────────────────────
 
-    // Repulsion (initializes vertex_force_buf)
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("repulsion"), timestamp_writes: None,
-        });
-        pass.set_pipeline(&gpu.repulsion_pipeline);
-        pass.set_bind_group(0, &gpu.repulsion_data_bg, &[]);
-        pass.set_bind_group(1, &gpu.repulsion_params_bg, &[]);
-        pass.dispatch_workgroups(dispatch_count(n), 1, 1);
-    }
+    // Clear force buffer (repulsion is now handled as XPBD collision constraint)
+    encoder.clear_buffer(&gpu.vertex_force_buf, 0, None);
 
-    // Topology forces (spring + planar + bulge, adds to vertex_force_buf)
+    // Topology forces (bulge + Laplacian, adds to vertex_force_buf)
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("topo_forces"), timestamp_writes: None,
@@ -977,15 +1050,51 @@ pub(crate) fn gpu_dispatch_frame(
         pass.dispatch_workgroups(dispatch_count(n), 1, 1);
     }
 
-    // Integrate positions
+    // Predict: overdamped position update from forces (bulge + Laplacian)
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("integrate"), timestamp_writes: None,
+            label: Some("predict"), timestamp_writes: None,
         });
-        pass.set_pipeline(&gpu.integrate_pipeline);
-        pass.set_bind_group(0, &gpu.integrate_data_bg, &[]);
-        pass.set_bind_group(1, &gpu.integrate_params_bg, &[]);
+        pass.set_pipeline(&gpu.predict_pipeline);
+        pass.set_bind_group(0, &gpu.predict_data_bg, &[]);
+        pass.set_bind_group(1, &gpu.predict_params_bg, &[]);
         pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+    }
+
+    // XPBD constraint projection (Jacobi, N iterations): springs + bending + collision
+    let xpbd_iters = params.xpbd_iterations.max(1);
+    for i in 0..xpbd_iters {
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("project_springs"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&gpu.project_springs_pipeline);
+            pass.set_bind_group(0, &gpu.project_springs_data_bg, &[]);
+            pass.set_bind_group(1, &gpu.project_springs_params_bg, &[]);
+            pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("project_bending"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&gpu.project_bending_pipeline);
+            pass.set_bind_group(0, &gpu.project_bending_data_bg, &[]);
+            pass.set_bind_group(1, &gpu.project_bending_params_bg, &[]);
+            pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+        }
+        // Collision is the most expensive pass (per-candidate is_mesh_neighbor
+        // walk × spatial-hash neighborhood). Topology is fixed within a frame,
+        // so running it every other iteration — always including the last, so
+        // it has the final say on penetrations — roughly halves its cost.
+        if i % 2 == 1 || i == xpbd_iters - 1 {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("project_collision"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&gpu.project_collision_pipeline);
+            pass.set_bind_group(0, &gpu.project_collision_data_bg, &[]);
+            pass.set_bind_group(1, &gpu.project_collision_params_bg, &[]);
+            pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+        }
     }
 
     // ── State evolution (Chebyshev) ─────────────────────────────────────

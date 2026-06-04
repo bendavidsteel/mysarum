@@ -72,10 +72,10 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @loca
         // Normal map visualization
         final_color = normal * 0.5 + 0.5;
     } else {
-        // Default: lit + state color
-        let blue = vec3<f32>(0.1, 0.3, 0.9);
-        let orange = vec3<f32>(1.0, 0.55, 0.1);
-        let base_color = mix(blue, orange, state);
+        // Default: lit + state color (brown = no growth, green = growth)
+        let brown = vec3<f32>(0.36, 0.24, 0.12);
+        let green = vec3<f32>(0.2, 0.7, 0.15);
+        let base_color = mix(brown, green, state);
 
         let light_dir = normalize(uniforms.light.xyz);
         let n_dot_l = abs(dot(normal, light_dir));

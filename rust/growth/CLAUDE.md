@@ -25,17 +25,20 @@ A growing mesh simulation using **Nannou** (bevy-refactor branch) + **Bevy 0.17*
 Single-file app (`src/main.rs`) with Nannou's `app(model).update(update).render(render).run()` pattern.
 
 ### Half-Edge Mesh (structure-of-arrays)
-- `HalfEdgeMesh` — fixed-size arrays (MAX_VERTICES=8000, MAX_HALF_EDGES=48000, MAX_FACES=16000) with `-1` sentinel for inactive/null indices
+- `HalfEdgeMesh` — fixed-size arrays (MAX_VERTICES=32000, MAX_HALF_EDGES=192000, MAX_FACES=64000) with `-1` sentinel for inactive/null indices
 - Uses `i32` indices throughout (not `Option<usize>`) — check `>= 0` before use
 - Allocation via watermark counters (`next_vertex`, `next_face`, `next_half_edge`)
 - Three growth operations: `add_external_triangle` (boundary), `add_internal_edge_triangle` (one side boundary), `add_internal_triangles` (fully internal edge split)
-- `flip_edge` and `refine_mesh` for Delaunay-style valence optimization (target valence 6)
+- **Intrinsic triangulations**: per-half-edge `half_edge_intrinsic_len` stores intrinsic edge lengths, decoupled from 3D embedding. Growth modifies intrinsic lengths; XPBD springs use them as rest lengths.
+- `flip_edge` computes new intrinsic edge length via planar unfold; `refine_mesh` uses intrinsic Delaunay criterion (opposite angle sum > π)
+- Split operations compute new intrinsic lengths via the median formula
 
 ### Simulation Loop (`update()`)
-1. **Physics** — spring forces, pairwise repulsion (O(n²)), bulge force (boundary outward push), planar force (Laplacian smoothing)
-2. **State evolution** — neighbor-averaging message pass → Gaussian growth function on vertex states
-3. **Mesh growth** (every 10 frames) — vertices with high growth potential split adjacent edges
-4. **Mesh refinement** (every 20 frames) — edge flips to regularize valences
+1. **Physics (XPBD)** — pairwise repulsion + bulge forces applied as overdamped position prediction, then XPBD constraint projection (Jacobi, N iterations): spring constraints enforce intrinsic edge lengths, dihedral angle bending constraints resist folding. No velocity — first-order overdamped system.
+2. **State evolution** — Chebyshev polynomial convolution (Lenia-style ring kernel) → Gaussian growth function updates vertex states
+3. **Differential growth** — intrinsic edge lengths grow continuously based on vertex state: each vertex walks its half-edge fan and grows outgoing edges proportionally to `max(2s-1, 0)^2`. The spring shader averages he and twin intrinsic lengths for each edge's rest length.
+4. **Adaptive subdivision** (every 10 frames) — edges exceeding `max_edge_len` (intrinsic) are split (longest-in-face priority)
+5. **Mesh refinement** (every 20 frames) — intrinsic Delaunay edge flips
 
 ### Rendering (`render()` — GPU-direct)
 - Custom wgpu render pipeline bypasses Nannou's draw API — no per-frame GPU→CPU readback

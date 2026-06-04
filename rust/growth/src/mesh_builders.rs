@@ -106,6 +106,28 @@ pub fn build_halfedge_from_faces(mesh: &mut HalfEdgeMesh, faces_list: &[[usize; 
         }
     }
 
+    // Fix vertex_half_edge for boundary vertices: walk backward to find the start of the open fan.
+    // The forward fan walk (he → twin → next) breaks when twin < 0. For boundary vertices, if
+    // vertex_half_edge points to the middle of an open fan, the walk misses neighbors on one side.
+    // Walking backward (he → prev(he).twin) finds the outgoing edge at the START of the open fan,
+    // so the forward walk traverses ALL neighbors before hitting the boundary at the other end.
+    for v in 0..mesh.next_vertex {
+        let start = mesh.vertex_half_edge[v];
+        if start < 0 { continue; }
+        let mut he = start as usize;
+        loop {
+            let prev = mesh.half_edge_prev[he];
+            if prev < 0 { break; }
+            let prev_twin = mesh.half_edge_twin[prev as usize];
+            if prev_twin < 0 { break; }
+            let prev_twin = prev_twin as usize;
+            // Back to where we started means closed fan; no fix needed
+            if prev_twin == start as usize { break; }
+            he = prev_twin;
+        }
+        mesh.vertex_half_edge[v] = he as i32;
+    }
+
     // Set face data
     let n_faces = faces_list.len();
     mesh.next_face = n_faces;
@@ -152,6 +174,106 @@ pub fn make_circle(spring_len: f32, n_rings: usize, segments_inner: usize) -> Bo
     };
 
     // Build faces
+    let mut faces_list: Vec<[usize; 3]> = Vec::new();
+
+    // Center to first ring
+    let n_seg0 = ring_vertex_counts[0];
+    for i in 0..n_seg0 {
+        let v0 = 0;
+        let v1 = get_vertex_idx(0, i);
+        let v2 = get_vertex_idx(0, i + 1);
+        faces_list.push([v0, v1, v2]);
+    }
+
+    // Ring-to-ring
+    for ring_idx in 0..n_rings - 1 {
+        let n_inner = ring_vertex_counts[ring_idx];
+        let n_outer = ring_vertex_counts[ring_idx + 1];
+
+        let mut inner_idx = 0usize;
+        let mut outer_idx = 0usize;
+
+        while inner_idx < n_inner || outer_idx < n_outer {
+            let v_inner_curr = get_vertex_idx(ring_idx as i32, inner_idx);
+            let v_inner_next = get_vertex_idx(ring_idx as i32, inner_idx + 1);
+            let v_outer_curr = get_vertex_idx(ring_idx as i32 + 1, outer_idx);
+            let v_outer_next = get_vertex_idx(ring_idx as i32 + 1, outer_idx + 1);
+
+            let inner_angle_next = (inner_idx + 1) as f32 / n_inner as f32;
+            let outer_angle_curr = outer_idx as f32 / n_outer as f32;
+            let outer_angle_next = (outer_idx + 1) as f32 / n_outer as f32;
+
+            if outer_angle_next < inner_angle_next {
+                faces_list.push([v_inner_curr, v_outer_curr, v_outer_next]);
+                outer_idx += 1;
+            } else {
+                faces_list.push([v_inner_curr, v_outer_curr, v_inner_next]);
+                if outer_angle_curr < inner_angle_next {
+                    faces_list.push([v_inner_next, v_outer_curr, v_outer_next]);
+                    outer_idx += 1;
+                }
+                inner_idx += 1;
+            }
+        }
+    }
+
+    build_halfedge_from_faces(&mut mesh, &faces_list);
+    mesh
+}
+
+// ── make_hemisphere: domed disc (open boundary at the equator) ───────────────
+
+/// Build an initial hemisphere mesh. Topology is identical to `make_circle`
+/// (a center pole vertex plus concentric rings, open boundary), but vertices
+/// are placed on a hemisphere surface: the center sits at the pole and the
+/// outermost ring lies on the equator (z = 0). The sphere radius is chosen so
+/// the arc spacing between rings along a meridian is roughly `spring_len`.
+pub fn make_hemisphere(spring_len: f32, n_rings: usize, segments_inner: usize) -> Box<HalfEdgeMesh> {
+    let mut mesh = HalfEdgeMesh::new();
+
+    // Sphere radius: n_rings meridian steps of arc length spring_len span a
+    // quarter circle (pole → equator), so R * (PI/2) = spring_len * n_rings.
+    let radius = spring_len * n_rings as f32 * 2.0 / std::f32::consts::PI;
+
+    // Map a planar ring index (0..n_rings) to a polar angle from the pole.
+    // ring_idx + 1 == n_rings lands exactly on the equator (theta = PI/2).
+    let polar_angle = |ring_idx: usize| -> f32 {
+        (ring_idx + 1) as f32 / n_rings as f32 * std::f32::consts::FRAC_PI_2
+    };
+
+    // Center vertex (pole)
+    let center = mesh.alloc_vertex().unwrap();
+    mesh.vertex_pos[center] = Vec3::new(0.0, 0.0, radius);
+
+    // Ring vertices
+    let mut ring_vertex_counts = Vec::new();
+    let mut ring_starts = Vec::new();
+
+    for ring_idx in 0..n_rings {
+        let theta = polar_angle(ring_idx);
+        let ring_radius = radius * theta.sin();
+        let z = radius * theta.cos();
+        let n_segments = segments_inner * (ring_idx + 1);
+        ring_vertex_counts.push(n_segments);
+        let ring_start = mesh.next_vertex;
+        ring_starts.push(ring_start);
+
+        for seg in 0..n_segments {
+            let angle = 2.0 * std::f32::consts::PI * seg as f32 / n_segments as f32;
+            let v = mesh.alloc_vertex().unwrap();
+            mesh.vertex_pos[v] = Vec3::new(ring_radius * angle.cos(), ring_radius * angle.sin(), z);
+        }
+    }
+
+    let get_vertex_idx = |ring: i32, segment: usize| -> usize {
+        if ring < 0 {
+            return 0; // center
+        }
+        let ring = ring as usize;
+        ring_starts[ring] + (segment % ring_vertex_counts[ring])
+    };
+
+    // Build faces (same connectivity logic as make_circle)
     let mut faces_list: Vec<[usize; 3]> = Vec::new();
 
     // Center to first ring
@@ -257,8 +379,9 @@ pub fn make_icosphere(radius: f32, nu: usize) -> Box<HalfEdgeMesh> {
             let (a, b) = if p[0] < p[1] { (p[0], p[1]) } else { (p[1], p[0]) };
             if !edge_lookup.contains_key(&(a, b)) {
                 let idx = edge_set.len();
-                edge_lookup.insert((a, b), idx as i64);
-                edge_lookup.insert((b, a), -(idx as i64));
+                // Use 1-based signed indices so edge 0 is distinguishable from -0
+                edge_lookup.insert((a, b), (idx as i64) + 1);
+                edge_lookup.insert((b, a), -((idx as i64) + 1));
                 edge_set.push([a, b]);
             }
         }
@@ -353,7 +476,7 @@ pub fn make_icosphere(radius: f32, nu: usize) -> Box<HalfEdgeMesh> {
 /// Resolve on-edge vertex indices, reversing if the edge is stored in opposite direction.
 fn resolve_edge_verts(edge_signed: i64, v_count: usize, nu: usize, r: &[usize]) -> Vec<usize> {
     let reversed = edge_signed < 0;
-    let edge_idx = edge_signed.unsigned_abs() as usize;
+    let edge_idx = (edge_signed.unsigned_abs() - 1) as usize;
     let mut indices: Vec<usize> = r.iter().map(|&k| v_count + edge_idx * (nu - 1) + k).collect();
     if reversed {
         indices.reverse();
@@ -428,14 +551,19 @@ fn compute_inside_points(vertices: &mut Vec<[f32; 3]>, ab: &[usize], ac: &[usize
 pub enum StartShape {
     Circle,
     Sphere,
+    Hemisphere,
 }
 
 pub fn make_start_mesh(start_shape: StartShape, spring_len: f32, ico_nu: usize) -> Box<HalfEdgeMesh> {
-    match start_shape {
+    let mut mesh = match start_shape {
         StartShape::Circle => make_circle(spring_len, N_RINGS, SEGMENTS_INNER),
         StartShape::Sphere => {
             let radius = spring_len * ico_nu as f32;
             make_icosphere(radius, ico_nu)
         }
-    }
+        StartShape::Hemisphere => make_hemisphere(spring_len, N_RINGS, SEGMENTS_INNER),
+    };
+    // Initialize intrinsic edge lengths from extrinsic geometry
+    mesh.compute_intrinsic_lengths();
+    mesh
 }

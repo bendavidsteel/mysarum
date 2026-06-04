@@ -479,8 +479,14 @@ def _get_he_ab(state, va, vb):
     return he
 
 
+@jax.jit
 def add_external_triangle(state, va, vb):
-    """Add a triangle outside boundary edge va->vb."""
+    """Add a triangle outside boundary edge va->vb.
+
+    Jitted: va/vb trace as dynamic int scalars, so this compiles once and each
+    subsequent call is a single executable launch instead of an eager op-by-op
+    dispatch with lax.cond/while_loop re-tracing (~600 ms/call unjitted).
+    """
     he_ab = _get_he_ab(state, va, vb)
     new_f = jnp.max(state.face_idx) + 1
     new_v = jnp.max(state.vertex_idx) + 1
@@ -540,6 +546,7 @@ def _add_external_triangle(state, va, vb, he_ab, nf, nv, nhe):
     return state._replace(**u)
 
 
+@jax.jit
 def add_internal_edge_triangle(state, va, vb):
     """Split edge va->vb where one side is internal, other is boundary."""
     he_ab = _get_he_ab(state, va, vb)
@@ -610,6 +617,7 @@ def add_internal_edge_triangle(state, va, vb):
     return state._replace(**u)
 
 
+@jax.jit
 def add_internal_triangles(state, va, vb):
     """Split interior edge va->vb, creating 2 new faces."""
     he_ab = _get_he_ab(state, va, vb)
@@ -986,43 +994,39 @@ def split_long_edges(state, params, key, max_splits=20):
 # ── External Forces (Predict Step) ──────────────────────────────────────────
 
 @jax.jit
-def compute_external_forces(state, params):
-    """Bulge (boundary outward push) + Laplacian smoothing."""
-    pos = state.vertex_pos
-    active = (state.vertex_idx != -1)[:, None].astype(jnp.float32)
+def compute_external_forces(pos, topo, params):
+    """Bulge (boundary outward push) + Laplacian smoothing + gravity.
 
-    boundary = (state.half_edge_face == -1) & (state.half_edge_idx != -1)
-    safe_twin = jnp.clip(state.half_edge_twin, 0)
-    src_idx = state.half_edge_dest[safe_twin]
-    dst_idx = state.half_edge_dest
+    Uses the precomputed XpbdTopo. The clipped (safe_*) indices match the raw
+    half_edge_dest values on every valid boundary edge; invalid/non-boundary
+    edges contribute zero (edge_n is masked, neighbor_sum uses he_valid), so
+    the clip does not change the result.
+    """
+    active = topo.active[:, None].astype(jnp.float32)
+    he_src = topo.he_src
+    safe_dest = topo.safe_dest
 
-    edge_vec = pos[dst_idx] - pos[src_idx]
-    safe_twin_next = jnp.clip(state.half_edge_next[safe_twin], 0)
-    next_dst = state.half_edge_dest[safe_twin_next]
-    next_vec = pos[next_dst] - pos[src_idx]
+    edge_vec = pos[safe_dest] - pos[he_src]
+    next_dst = safe_dest[topo.safe_twin_next]
+    next_vec = pos[next_dst] - pos[he_src]
 
     surface_n = jnp.cross(edge_vec, next_vec)
     edge_n = jnp.cross(edge_vec, surface_n)
     edge_n_len = jnp.linalg.norm(edge_n, axis=-1, keepdims=True)
     edge_n = edge_n / jnp.maximum(edge_n_len, EPSILON)
-    edge_n = jnp.where(boundary[:, None], edge_n, 0.0)
+    edge_n = jnp.where(topo.boundary[:, None], edge_n, 0.0)
 
     bulge = jnp.zeros_like(pos)
-    bulge = bulge.at[src_idx].add(edge_n)
-    bulge = bulge.at[dst_idx].add(edge_n)
+    bulge = bulge.at[he_src].add(edge_n)
+    bulge = bulge.at[safe_dest].add(edge_n)
     fnorm = jnp.linalg.norm(bulge, axis=-1, keepdims=True)
     bulge = bulge / jnp.maximum(fnorm, EPSILON)
 
-    he_valid = state.half_edge_idx != -1
-    safe_dest = jnp.clip(state.half_edge_dest, 0)
-    he_src = safe_dest[safe_twin]
     dst_pos = pos[safe_dest]
-
     neighbor_sum = jnp.zeros_like(pos).at[he_src].add(
-        jnp.where(he_valid[:, None], dst_pos, 0.0)
+        jnp.where(topo.he_valid[:, None], dst_pos, 0.0)
     )
-    degree = jnp.zeros(MAX_VERTICES).at[he_src].add(he_valid.astype(jnp.float32))
-    centroid = neighbor_sum / jnp.maximum(degree[:, None], 1.0)
+    centroid = neighbor_sum / jnp.maximum(topo.degree_raw[:, None], 1.0)
     laplacian = centroid - pos
 
     gravity = jnp.zeros_like(pos)
@@ -1114,42 +1118,106 @@ def build_neighbor_list(state):
     """(MAX_VERTICES, MAX_FAN_SIZE) of mesh-neighbor vertex indices (-1 pad).
 
     Used by collision to skip direct mesh neighbors.
+
+    Vectorized via a stable sort on source vertex + a segmented rank, instead
+    of a MAX_HALF_EDGES-long sequential scan. A stable argsort keeps half-edge
+    index order within each source group, so for vertices with > MAX_FAN_SIZE
+    neighbours the same first-MAX_FAN_SIZE are retained as the old scan kept.
     """
     he_valid = state.half_edge_idx != -1
     safe_twin = jnp.clip(state.half_edge_twin, 0)
     safe_dest = jnp.clip(state.half_edge_dest, 0)
     he_src = safe_dest[safe_twin]
 
-    neighbors = jnp.full((MAX_VERTICES, MAX_FAN_SIZE), -1, jnp.int32)
-    count = jnp.zeros(MAX_VERTICES, jnp.int32)
+    # Group half-edges by source vertex; invalid ones get a sentinel key that
+    # sorts after every real vertex so they cluster at the tail.
+    src_key = jnp.where(he_valid, he_src, MAX_VERTICES)
+    order = jnp.argsort(src_key)  # stable
+    sorted_src = src_key[order]
+    sorted_dst = safe_dest[order]
+    sorted_valid = he_valid[order]
 
-    def add_edge(carry, he_i):
-        nbrs, cnt = carry
-        src = he_src[he_i]
-        dst = safe_dest[he_i]
-        valid = he_valid[he_i]
-        slot = cnt[src]
-        in_range = slot < MAX_FAN_SIZE
-        do_write = valid & in_range
-        nbrs = nbrs.at[src, slot].set(jnp.where(do_write, dst, nbrs[src, slot]))
-        cnt = cnt.at[src].add(jnp.where(do_write, 1, 0))
-        return (nbrs, cnt), None
-
-    (neighbors, _), _ = jax.lax.scan(
-        add_edge, (neighbors, count), jnp.arange(MAX_HALF_EDGES)
+    # Segmented rank: position minus the start index of the current group.
+    pos = jnp.arange(MAX_HALF_EDGES)
+    is_new = jnp.concatenate(
+        [jnp.array([True]), sorted_src[1:] != sorted_src[:-1]]
     )
-    return neighbors
+    group_start = jax.lax.cummax(jnp.where(is_new, pos, 0))
+    slot = pos - group_start
+
+    do_write = sorted_valid & (sorted_src < MAX_VERTICES) & (slot < MAX_FAN_SIZE)
+
+    # Route non-writes to a throwaway row at index MAX_VERTICES, then drop it.
+    write_row = jnp.where(do_write, sorted_src, MAX_VERTICES)
+    write_slot = jnp.where(do_write, slot, 0)
+    neighbors = jnp.full((MAX_VERTICES + 1, MAX_FAN_SIZE), -1, jnp.int32)
+    neighbors = neighbors.at[write_row, write_slot].set(sorted_dst)
+    return neighbors[:MAX_VERTICES]
 
 
 # ── XPBD Constraints ─────────────────────────────────────────────────────────
 
+XpbdTopo = collections.namedtuple('XpbdTopo', [
+    'he_valid', 'safe_twin', 'safe_dest', 'safe_twin_next',
+    'he_src', 'opp_c', 'opp_d', 'interior', 'boundary', 'active',
+    'degree_raw', 'bend_count_raw',
+])
+
+
 @jax.jit
-def project_springs(pos, state, params):
-    """XPBD spring: enforce dist = intrinsic rest length (Jacobi over half-edges)."""
+def build_xpbd_topo(state):
+    """Precompute the topology-derived index arrays, masks and degree counts
+    shared by project_springs / project_bending / compute_external_forces.
+
+    Topology (all half_edge_* arrays + vertex_idx) is constant for an entire
+    batched_physics_step call — growth only mutates intrinsic lengths / state /
+    positions, and splits/refines happen outside the step — so this is computed
+    once and reused across every substep and XPBD iteration instead of being
+    re-derived each time (the index gathers and the two degree scatter-adds are
+    the bulk of project_springs / project_bending's non-position work).
+    """
     he_valid = state.half_edge_idx != -1
     safe_twin = jnp.clip(state.half_edge_twin, 0)
     safe_dest = jnp.clip(state.half_edge_dest, 0)
+    safe_next = jnp.clip(state.half_edge_next, 0)
     he_src = safe_dest[safe_twin]
+    safe_twin_next = jnp.clip(state.half_edge_next[safe_twin], 0)
+    opp_c = safe_dest[safe_next]
+    opp_d = safe_dest[safe_twin_next]
+
+    he_face = state.half_edge_face
+    twin_face = he_face[safe_twin]
+    he_idx = jnp.arange(MAX_HALF_EDGES)
+    interior = he_valid & (he_face >= 0) & (twin_face >= 0) \
+        & (state.half_edge_twin >= 0) & (he_idx < state.half_edge_twin)
+    boundary = (he_face == -1) & he_valid
+    active = state.vertex_idx != -1
+
+    degree_raw = jnp.zeros(MAX_VERTICES).at[he_src].add(he_valid.astype(jnp.float32))
+
+    int_f = interior.astype(jnp.float32)
+    bend_count_raw = jnp.zeros(MAX_VERTICES)
+    bend_count_raw = bend_count_raw.at[he_src].add(int_f)
+    bend_count_raw = bend_count_raw.at[safe_dest].add(int_f)
+    bend_count_raw = bend_count_raw.at[opp_c].add(int_f)
+    bend_count_raw = bend_count_raw.at[opp_d].add(int_f)
+
+    return XpbdTopo(
+        he_valid=he_valid, safe_twin=safe_twin, safe_dest=safe_dest,
+        safe_twin_next=safe_twin_next, he_src=he_src, opp_c=opp_c, opp_d=opp_d,
+        interior=interior, boundary=boundary, active=active,
+        degree_raw=degree_raw, bend_count_raw=bend_count_raw,
+    )
+
+
+@jax.jit
+def project_springs(pos, topo, rest, params):
+    """XPBD spring: enforce dist = intrinsic rest length (Jacobi over half-edges).
+
+    `topo` is the precomputed XpbdTopo; `rest` the per-substep rest lengths.
+    """
+    he_src = topo.he_src
+    safe_dest = topo.safe_dest
 
     alpha_tilde = params.compliance / (params.dt * params.dt + EPSILON)
 
@@ -1159,7 +1227,6 @@ def project_springs(pos, state, params):
     dist = jnp.sqrt(jnp.sum(d * d, axis=-1) + EPSILON)
     dist_safe = jnp.maximum(dist, EPSILON)
 
-    rest = (state.half_edge_intrinsic_len + state.half_edge_intrinsic_len[safe_twin]) * 0.5
     C = dist - rest
     dlambda = -C / (2.0 + alpha_tilde)
     edge_corr = dlambda[:, None] * (d / dist_safe[:, None])
@@ -1169,30 +1236,23 @@ def project_springs(pos, state, params):
     edge_corr = jnp.where(corr_mag > max_corr[:, None],
                            edge_corr * max_corr[:, None] / corr_mag,
                            edge_corr)
-    edge_corr = jnp.where(he_valid[:, None], edge_corr, 0.0)
+    edge_corr = jnp.where(topo.he_valid[:, None], edge_corr, 0.0)
 
     correction = jnp.zeros_like(pos).at[he_src].add(edge_corr)
-    degree = jnp.zeros(MAX_VERTICES).at[he_src].add(he_valid.astype(jnp.float32))
-    degree = jnp.maximum(degree, 1.0)
+    degree = jnp.maximum(topo.degree_raw, 1.0)
 
-    active = (state.vertex_idx != -1)[:, None].astype(jnp.float32)
+    active = topo.active[:, None].astype(jnp.float32)
     return pos + (correction / degree[:, None]) * active
 
 
 @jax.jit
-def project_bending(pos, state, params):
+def project_bending(pos, topo, params):
     """XPBD dihedral bending (Jacobi over unique interior edges)."""
-    he_valid = state.half_edge_idx != -1
-    safe_twin = jnp.clip(state.half_edge_twin, 0)
-    safe_dest = jnp.clip(state.half_edge_dest, 0)
-    safe_next = jnp.clip(state.half_edge_next, 0)
-    he_src = safe_dest[safe_twin]
-
-    he_face = state.half_edge_face
-    twin_face = he_face[safe_twin]
-    he_idx = jnp.arange(MAX_HALF_EDGES)
-    interior = he_valid & (he_face >= 0) & (twin_face >= 0) \
-        & (state.half_edge_twin >= 0) & (he_idx < state.half_edge_twin)
+    he_src = topo.he_src
+    safe_dest = topo.safe_dest
+    interior = topo.interior
+    opp_c = topo.opp_c
+    opp_d = topo.opp_d
 
     alpha_tilde = params.bending_compliance / (params.dt * params.dt + EPSILON)
 
@@ -1202,10 +1262,6 @@ def project_bending(pos, state, params):
     dist = jnp.sqrt(jnp.sum(diff * diff, axis=-1) + EPSILON)
     dist_safe = jnp.maximum(dist, EPSILON)
     e_hat = diff / dist_safe[:, None]
-
-    opp_c = safe_dest[safe_next]
-    safe_twin_next = jnp.clip(state.half_edge_next[safe_twin], 0)
-    opp_d = safe_dest[safe_twin_next]
 
     pc = pos[opp_c]
     pd = pos[opp_d]
@@ -1257,28 +1313,26 @@ def project_bending(pos, state, params):
     correction = correction.at[opp_c].add(corr_c)
     correction = correction.at[opp_d].add(corr_d)
 
-    count = jnp.zeros(MAX_VERTICES)
-    int_f = interior.astype(jnp.float32)
-    count = count.at[he_src].add(int_f)
-    count = count.at[safe_dest].add(int_f)
-    count = count.at[opp_c].add(int_f)
-    count = count.at[opp_d].add(int_f)
-    count = jnp.maximum(count, 1.0)
+    count = jnp.maximum(topo.bend_count_raw, 1.0)
 
     avg_corr = correction / count[:, None]
     corr_mag = jnp.linalg.norm(avg_corr, axis=-1, keepdims=True)
     max_corr = params.spring_len * 0.1
     avg_corr = jnp.where(corr_mag > max_corr, avg_corr * max_corr / corr_mag, avg_corr)
 
-    active = (state.vertex_idx != -1)[:, None].astype(jnp.float32)
+    active = topo.active[:, None].astype(jnp.float32)
     return pos + avg_corr * active
 
 
 @jax.jit
-def project_collision(pos, state, params, sort_order, bstart, bend,
-                      cell_coords, neighbor_list):
-    """XPBD collision: push apart non-neighbor vertices within repulsion_dist."""
-    N = MAX_VERTICES
+def collision_candidates(state, sort_order, bstart, bend, cell_coords,
+                         neighbor_list):
+    """Candidate collision pairs + validity mask for the current cell layout.
+
+    Depends only on the spatial hash (built once per substep) and topology, not
+    on the live positions mutated during XPBD iterations — so it is computed
+    once per substep and reused across every iteration of project_collision.
+    """
     active = state.vertex_idx != -1
     cand_idx, mask = _gather_candidates(cell_coords, active, sort_order, bstart, bend)
 
@@ -1286,7 +1340,17 @@ def project_collision(pos, state, params, sort_order, bstart, bend,
         cand_idx[:, :, None] == neighbor_list[:, None, :], axis=-1
     )
     mask = mask & ~is_neighbor
+    return cand_idx, mask
 
+
+@jax.jit
+def project_collision(pos, cand_idx, mask, active, params):
+    """XPBD collision: push apart non-neighbor vertices within repulsion_dist.
+
+    `cand_idx` / `mask` come from collision_candidates; only the per-candidate
+    distance and correction depend on `pos`, so this is the only part that has
+    to rerun each XPBD iteration.
+    """
     cand_pos = pos[cand_idx]
     diff = pos[:, None, :] - cand_pos
     dist = jnp.sqrt(jnp.sum(diff ** 2, axis=-1) + EPSILON)
@@ -1525,12 +1589,11 @@ def boundary_source(state, channel, value, ground_z, band):
     return state._replace(vertex_state=state.vertex_state.at[:, channel].set(new))
 
 
-def project_ground(pos, state, params):
+def project_ground(pos, on_b, params):
     """Snap boundary vertices to z=ground_z and prevent any vertex from going
-    below it. Boundary half-edges are detected from topology, so the equator
-    of a hemisphere stays anchored even as new vertices appear from splits.
+    below it. `on_b` is the topology-derived boundary mask (get_on_boundary),
+    precomputed once per substep since topology is fixed across XPBD iterations.
     """
-    on_b = get_on_boundary(state)
     z = pos[:, 2]
     z = jnp.where(on_b, params.ground_z, z)
     z = jnp.maximum(z, params.ground_z)
@@ -1631,6 +1694,15 @@ def batched_physics_step(state, params, cheb_coeffs, key, n_substeps, growth_mod
     growth_mode: "lenia" or "nca" (static argument, controls trace).
     """
 
+    # Topology is constant across substeps (the scan carry holds only
+    # positions / state / intrinsic lengths / key), so the neighbor list,
+    # boundary mask and the shared topology bundle are computed once here
+    # rather than inside every substep / XPBD iteration.
+    neighbor_list = build_neighbor_list(state)
+    on_b = get_on_boundary(state)
+    topo = build_xpbd_topo(state)
+    active_v = topo.active
+
     def substep(carry, _):
         pos, vertex_state, he_intrinsic, key = carry
 
@@ -1640,25 +1712,30 @@ def batched_physics_step(state, params, cheb_coeffs, key, n_substeps, growth_mod
             half_edge_intrinsic_len=he_intrinsic,
         )
 
-        f_ext = compute_external_forces(st, params)
+        f_ext = compute_external_forces(pos, topo, params)
         pos = predict_positions(st, f_ext, params)
 
-        active_v = state.vertex_idx != -1
         sort_order, bstart, bend, cell_coords = \
             _build_spatial_hash(pos, active_v, params.repulsion_dist)
-        neighbor_list = build_neighbor_list(st)
+        # Candidate pairs depend on the cell layout (fixed for this substep)
+        # and topology, not on the positions mutated below — gather once.
+        cand_idx, coll_mask = collision_candidates(
+            st, sort_order, bstart, bend, cell_coords, neighbor_list
+        )
+
+        # Rest lengths depend on intrinsic lengths (per-substep) but not on the
+        # positions mutated by the XPBD iterations, so derive them once here.
+        rest = (he_intrinsic + he_intrinsic[topo.safe_twin]) * 0.5
 
         def xpbd_iter(p, _):
-            p = project_springs(p, st._replace(vertex_pos=p), params)
-            p = project_bending(p, st._replace(vertex_pos=p), params)
-            p = project_collision(p, st, params,
-                                  sort_order, bstart, bend, cell_coords,
-                                  neighbor_list)
+            p = project_springs(p, topo, rest, params)
+            p = project_bending(p, topo, params)
+            p = project_collision(p, cand_idx, coll_mask, active_v, params)
             return p, None
 
         pos, _ = jax.lax.scan(xpbd_iter, pos, None, length=XPBD_ITERATIONS)
 
-        pos = project_ground(pos, st, params)
+        pos = project_ground(pos, on_b, params)
         st = st._replace(vertex_pos=pos)
 
         key, subkey = jax.random.split(key)

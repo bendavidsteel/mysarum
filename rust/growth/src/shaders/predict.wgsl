@@ -9,7 +9,8 @@
 fn main(@builtin(global_invocation_id) id: vec3u) {
     if id.x >= params.num_vertices { return; }
     var p = vertex_pos[id.x];
-    if p.w < 0.0 { return; }
+    // Skip inactive (w < 0) and pinned (w == 0) vertices
+    if p.w < 0.5 { return; }
 
     let f = vertex_force[id.x].xyz;
     var displacement = (params.dt / params.damping) * f;
@@ -21,6 +22,6 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         displacement = displacement * (max_disp / disp_len);
     }
 
-    p = vec4f(p.xyz + displacement, p.w);
+    p = vec4f(apply_floor(p.xyz + displacement, params), p.w);
     vertex_pos[id.x] = p;
 }

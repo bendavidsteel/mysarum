@@ -42,20 +42,22 @@ pub(crate) struct GpuSimParams {
     pub(crate) growth_mu: f32,
     pub(crate) growth_sigma: f32,
     pub(crate) cheb_order: u32,
-    pub(crate) repulsion_strength: f32,
     pub(crate) state_dt: f32,
     pub(crate) damping: f32,
     pub(crate) growth_rate: f32,
     pub(crate) xpbd_iterations: u32,
     pub(crate) bending_compliance: f32,
     pub(crate) relaxation: f32,
-    // State rule: 0 = Lenia cellular automata, 1 = static dot seed.
+    // State rule: 0 = Lenia cellular automata, 1 = phototropism (vertex
+    // normal · overhead light direction drives growth).
     pub(crate) growth_mode: u32,
     // Per-frame seed mixed into the growth RNG so stochastic edge growth
     // resamples each step (matches the Python reference's per-step noise).
     pub(crate) frame_seed: u32,
-    // Pad to 16-byte alignment for the WGSL uniform struct.
-    pub(crate) _pad: f32,
+    // Ground plane: when floor_enabled > 0.5, physics clamps every vertex to
+    // z >= floor_z (used by the hemisphere's flat bottom cap).
+    pub(crate) floor_enabled: f32,
+    pub(crate) floor_z: f32,
 }
 
 #[repr(C)]
@@ -770,10 +772,18 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
 }
 
 pub(crate) fn upload_mesh_to_gpu(queue: &wgpu::Queue, gpu: &mut GpuCompute, mesh: &HalfEdgeMesh) {
-    // Upload vertex positions (vec4: xyz + active flag in w) — reuse staging buffer
+    // Upload vertex positions (vec4: xyz + flag in w) — reuse staging buffer.
+    // w encodes vertex status: 1.0 = active, 0.0 = pinned (active but immovable,
+    // skipped by physics and growth), -1.0 = inactive.
     let n = mesh.next_vertex;
     for v in 0..n {
-        let active = if mesh.vertex_idx[v] >= 0 { 1.0f32 } else { -1.0 };
+        let active = if mesh.vertex_idx[v] < 0 {
+            -1.0f32
+        } else if mesh.vertex_pinned[v] {
+            0.0
+        } else {
+            1.0
+        };
         gpu.pos_staging[v] = [mesh.vertex_pos[v].x, mesh.vertex_pos[v].y, mesh.vertex_pos[v].z, active];
     }
     // Zero out remaining entries up to MAX_VERTICES is unnecessary — GPU uses num_vertices param
@@ -881,6 +891,11 @@ pub(crate) fn readback_from_gpu(device: &wgpu::Device, queue: &wgpu::Queue, gpu:
         mesh.half_edge_intrinsic_len[..nhe].copy_from_slice(&floats[..nhe]);
     }
     gpu.intrinsic_len_readback_buf.unmap();
+
+    // Symmetrize he/twin lengths so CPU topology ops see the same metric the
+    // spring shader enforces (it averages the two sides). The symmetrized
+    // values are re-uploaded by upload_mesh_to_gpu after the topology ops.
+    mesh.symmetrize_intrinsic_lengths();
 }
 
 pub(crate) fn rebuild_render_indices(queue: &wgpu::Queue, gpu: &mut GpuCompute, mesh: &HalfEdgeMesh) {

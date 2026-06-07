@@ -1,6 +1,10 @@
 // Apply Gaussian growth function: state += dt * gaussian(result, mu, sigma)
 // + stochastic intrinsic edge length growth driven by vertex state
 
+// Phototropism mode: direction toward the virtual overhead light source.
+// Matches the mesh convention that +Z is "up" (apex = max Z).
+const LIGHT_DIR: vec3<f32> = vec3<f32>(0.0, 0.0, 1.0);
+
 // Integer hash — maps vertex index to a stable pseudo-random float in [0,1)
 fn hash_u32(n: u32) -> f32 {
     var x = n;
@@ -21,6 +25,50 @@ fn hash_u32(n: u32) -> f32 {
 @group(0) @binding(6) var<storage, read> vertex_he: array<i32>;
 @group(1) @binding(0) var<uniform> params: SimParams;
 
+// Area-weighted vertex normal: walk the half-edge fan and accumulate the face
+// normal of each interior wedge. Each wedge face is (dest, v, next_dest) in
+// the mesh's own winding order, so the cross product is consistently oriented
+// (outward for the closed sphere) without any per-mesh sign fixup.
+fn vertex_normal(v: u32, p: vec3<f32>) -> vec3<f32> {
+    var acc = vec3<f32>(0.0);
+    let start_he = vertex_he[v];
+    if start_he < 0 { return acc; }
+    let start_dest = he_packed[start_he].x;
+    var he = start_he;
+    var first = true;
+
+    for (var iter = 0u; iter < 20u; iter += 1u) {
+        let data = he_packed[he];
+        let dest = data.x;
+        let twin = data.y;
+
+        if twin < 0 { break; }
+        let twin_data = he_packed[twin];
+        let twin_next = twin_data.z;
+        if twin_next < 0 { break; }
+
+        // Wedge face containing the incoming edge dest -> v; skip the open
+        // boundary wedge (face == -1) on circle meshes.
+        if twin_data.w >= 0 && dest >= 0 {
+            let next_dest = he_packed[twin_next].x;
+            if next_dest >= 0 {
+                let p_d = vertex_pos[dest].xyz;
+                let p_n = vertex_pos[next_dest].xyz;
+                acc += cross(p - p_d, p_n - p_d);
+            }
+        }
+
+        // Walk fan: he -> twin -> next
+        he = twin_next;
+        if he_packed[he].x == start_dest && !first { break; }
+        first = false;
+    }
+
+    let len = length(acc);
+    if len > EPSILON { return acc / len; }
+    return vec3<f32>(0.0);
+}
+
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3u) {
     if id.x >= params.num_vertices { return; }
@@ -32,16 +80,27 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     vertex_u[id.x] = r;
 
     var s = vertex_state[id.x];
-    // Lenia mode: evolve state via the Gaussian growth function.
-    // Dot mode (growth_mode == 1): leave the seeded state untouched — the
-    // static dot keeps driving differential edge growth below.
     if params.growth_mode == 0u {
+        // Lenia mode: evolve state via the Gaussian growth function.
         let x = r - params.growth_mu;
         let sigma = params.growth_sigma + EPSILON;
         let g = 2.0 * exp(-0.5 * (x * x) / (sigma * sigma)) - 1.0;
         s = clamp(s + params.state_dt * g, 0.0, 1.0);
         vertex_state[id.x] = s;
+    } else {
+        // Phototropism mode (growth_mode == 1): state is how directly this
+        // vertex faces the overhead light — the dot product of the vertex
+        // normal with the light direction, clamped to [0, 1]. The most
+        // light-aligned regions get the highest state and so grow the most
+        // via the differential edge growth below.
+        let n = vertex_normal(id.x, pos.xyz);
+        s = clamp(dot(n, LIGHT_DIR), 0.0, 1.0);
+        vertex_state[id.x] = s;
     }
+
+    // Pinned vertices (w == 0): state still evolves above, but their outgoing
+    // edges never grow, so a pinned region stays static (no subdivision either).
+    if pos.w < 0.5 { return; }
 
     // Intrinsic edge length growth: walk half-edge fan, grow each outgoing edge.
     // Each vertex only writes to its own outgoing half-edges (no race condition).

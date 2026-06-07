@@ -138,6 +138,66 @@ pub fn build_halfedge_from_faces(mesh: &mut HalfEdgeMesh, faces_list: &[[usize; 
     }
 }
 
+// ── Disc face triangulation (center fan + ring-to-ring strips) ──────────────
+
+/// Append faces for a disc triangulation: a fan from the center vertex to the
+/// first ring, then strips between consecutive rings. `get_vertex_idx` maps
+/// (ring, segment) to a vertex index (ring < 0 means the center vertex).
+/// `flip` reverses the winding order (for caps whose outward normal points
+/// opposite the usual orientation).
+fn push_disc_faces(
+    faces_list: &mut Vec<[usize; 3]>,
+    get_vertex_idx: &dyn Fn(i32, usize) -> usize,
+    ring_vertex_counts: &[usize],
+    flip: bool,
+) {
+    let n_rings = ring_vertex_counts.len();
+    let mut push = |f: [usize; 3]| {
+        faces_list.push(if flip { [f[0], f[2], f[1]] } else { f });
+    };
+
+    // Center to first ring
+    let n_seg0 = ring_vertex_counts[0];
+    for i in 0..n_seg0 {
+        let v0 = get_vertex_idx(-1, 0);
+        let v1 = get_vertex_idx(0, i);
+        let v2 = get_vertex_idx(0, i + 1);
+        push([v0, v1, v2]);
+    }
+
+    // Ring-to-ring
+    for ring_idx in 0..n_rings - 1 {
+        let n_inner = ring_vertex_counts[ring_idx];
+        let n_outer = ring_vertex_counts[ring_idx + 1];
+
+        let mut inner_idx = 0usize;
+        let mut outer_idx = 0usize;
+
+        while inner_idx < n_inner || outer_idx < n_outer {
+            let v_inner_curr = get_vertex_idx(ring_idx as i32, inner_idx);
+            let v_inner_next = get_vertex_idx(ring_idx as i32, inner_idx + 1);
+            let v_outer_curr = get_vertex_idx(ring_idx as i32 + 1, outer_idx);
+            let v_outer_next = get_vertex_idx(ring_idx as i32 + 1, outer_idx + 1);
+
+            let inner_angle_next = (inner_idx + 1) as f32 / n_inner as f32;
+            let outer_angle_curr = outer_idx as f32 / n_outer as f32;
+            let outer_angle_next = (outer_idx + 1) as f32 / n_outer as f32;
+
+            if outer_angle_next < inner_angle_next {
+                push([v_inner_curr, v_outer_curr, v_outer_next]);
+                outer_idx += 1;
+            } else {
+                push([v_inner_curr, v_outer_curr, v_inner_next]);
+                if outer_angle_curr < inner_angle_next {
+                    push([v_inner_next, v_outer_curr, v_outer_next]);
+                    outer_idx += 1;
+                }
+                inner_idx += 1;
+            }
+        }
+    }
+}
+
 // ── make_circle: build initial circular disc mesh ───────────────────────────
 
 pub fn make_circle(spring_len: f32, n_rings: usize, segments_inner: usize) -> Box<HalfEdgeMesh> {
@@ -175,59 +235,20 @@ pub fn make_circle(spring_len: f32, n_rings: usize, segments_inner: usize) -> Bo
 
     // Build faces
     let mut faces_list: Vec<[usize; 3]> = Vec::new();
-
-    // Center to first ring
-    let n_seg0 = ring_vertex_counts[0];
-    for i in 0..n_seg0 {
-        let v0 = 0;
-        let v1 = get_vertex_idx(0, i);
-        let v2 = get_vertex_idx(0, i + 1);
-        faces_list.push([v0, v1, v2]);
-    }
-
-    // Ring-to-ring
-    for ring_idx in 0..n_rings - 1 {
-        let n_inner = ring_vertex_counts[ring_idx];
-        let n_outer = ring_vertex_counts[ring_idx + 1];
-
-        let mut inner_idx = 0usize;
-        let mut outer_idx = 0usize;
-
-        while inner_idx < n_inner || outer_idx < n_outer {
-            let v_inner_curr = get_vertex_idx(ring_idx as i32, inner_idx);
-            let v_inner_next = get_vertex_idx(ring_idx as i32, inner_idx + 1);
-            let v_outer_curr = get_vertex_idx(ring_idx as i32 + 1, outer_idx);
-            let v_outer_next = get_vertex_idx(ring_idx as i32 + 1, outer_idx + 1);
-
-            let inner_angle_next = (inner_idx + 1) as f32 / n_inner as f32;
-            let outer_angle_curr = outer_idx as f32 / n_outer as f32;
-            let outer_angle_next = (outer_idx + 1) as f32 / n_outer as f32;
-
-            if outer_angle_next < inner_angle_next {
-                faces_list.push([v_inner_curr, v_outer_curr, v_outer_next]);
-                outer_idx += 1;
-            } else {
-                faces_list.push([v_inner_curr, v_outer_curr, v_inner_next]);
-                if outer_angle_curr < inner_angle_next {
-                    faces_list.push([v_inner_next, v_outer_curr, v_outer_next]);
-                    outer_idx += 1;
-                }
-                inner_idx += 1;
-            }
-        }
-    }
+    push_disc_faces(&mut faces_list, &get_vertex_idx, &ring_vertex_counts, false);
 
     build_halfedge_from_faces(&mut mesh, &faces_list);
     mesh
 }
 
-// ── make_hemisphere: domed disc (open boundary at the equator) ───────────────
+// ── make_hemisphere: dome with a flat bottom cap (closed surface) ────────────
 
-/// Build an initial hemisphere mesh. Topology is identical to `make_circle`
-/// (a center pole vertex plus concentric rings, open boundary), but vertices
-/// are placed on a hemisphere surface: the center sits at the pole and the
-/// outermost ring lies on the equator (z = 0). The sphere radius is chosen so
-/// the arc spacing between rings along a meridian is roughly `spring_len`.
+/// Build an initial hemisphere mesh: a dome (center pole vertex plus
+/// concentric rings, as in `make_circle`) whose vertices are placed on a
+/// hemisphere surface — the center sits at the pole and the outermost ring
+/// lies on the equator (z = 0) — closed by a flat disc at z = 0 that shares
+/// the equator ring, so the mesh has no boundary. The sphere radius is chosen
+/// so the arc spacing between rings along a meridian is roughly `spring_len`.
 pub fn make_hemisphere(spring_len: f32, n_rings: usize, segments_inner: usize) -> Box<HalfEdgeMesh> {
     let mut mesh = HalfEdgeMesh::new();
 
@@ -273,49 +294,52 @@ pub fn make_hemisphere(spring_len: f32, n_rings: usize, segments_inner: usize) -
         ring_starts[ring] + (segment % ring_vertex_counts[ring])
     };
 
-    // Build faces (same connectivity logic as make_circle)
-    let mut faces_list: Vec<[usize; 3]> = Vec::new();
-
-    // Center to first ring
-    let n_seg0 = ring_vertex_counts[0];
-    for i in 0..n_seg0 {
-        let v0 = 0;
-        let v1 = get_vertex_idx(0, i);
-        let v2 = get_vertex_idx(0, i + 1);
-        faces_list.push([v0, v1, v2]);
+    // Bottom cap: flat disc at z = 0 sharing the equator ring. Inner rings are
+    // evenly spaced (radius * (ring_idx+1) / n_rings) with the same per-ring
+    // segment counts as the dome, plus a center vertex at the origin.
+    // The whole cap (equator included) is pinned: physics and growth skip
+    // these vertices, so the dome grows from a static base.
+    let equator_start = ring_starts[n_rings - 1];
+    for v in equator_start..mesh.next_vertex {
+        mesh.vertex_pinned[v] = true;
     }
+    let mut bottom_ring_starts = Vec::new();
 
-    // Ring-to-ring
     for ring_idx in 0..n_rings - 1 {
-        let n_inner = ring_vertex_counts[ring_idx];
-        let n_outer = ring_vertex_counts[ring_idx + 1];
+        let ring_radius = radius * (ring_idx + 1) as f32 / n_rings as f32;
+        let n_segments = ring_vertex_counts[ring_idx];
+        let ring_start = mesh.next_vertex;
+        bottom_ring_starts.push(ring_start);
 
-        let mut inner_idx = 0usize;
-        let mut outer_idx = 0usize;
-
-        while inner_idx < n_inner || outer_idx < n_outer {
-            let v_inner_curr = get_vertex_idx(ring_idx as i32, inner_idx);
-            let v_inner_next = get_vertex_idx(ring_idx as i32, inner_idx + 1);
-            let v_outer_curr = get_vertex_idx(ring_idx as i32 + 1, outer_idx);
-            let v_outer_next = get_vertex_idx(ring_idx as i32 + 1, outer_idx + 1);
-
-            let inner_angle_next = (inner_idx + 1) as f32 / n_inner as f32;
-            let outer_angle_curr = outer_idx as f32 / n_outer as f32;
-            let outer_angle_next = (outer_idx + 1) as f32 / n_outer as f32;
-
-            if outer_angle_next < inner_angle_next {
-                faces_list.push([v_inner_curr, v_outer_curr, v_outer_next]);
-                outer_idx += 1;
-            } else {
-                faces_list.push([v_inner_curr, v_outer_curr, v_inner_next]);
-                if outer_angle_curr < inner_angle_next {
-                    faces_list.push([v_inner_next, v_outer_curr, v_outer_next]);
-                    outer_idx += 1;
-                }
-                inner_idx += 1;
-            }
+        for seg in 0..n_segments {
+            let angle = 2.0 * std::f32::consts::PI * seg as f32 / n_segments as f32;
+            let v = mesh.alloc_vertex().unwrap();
+            mesh.vertex_pos[v] = Vec3::new(ring_radius * angle.cos(), ring_radius * angle.sin(), 0.0);
+            mesh.vertex_pinned[v] = true;
         }
     }
+
+    let bottom_center = mesh.alloc_vertex().unwrap();
+    mesh.vertex_pos[bottom_center] = Vec3::ZERO;
+    mesh.vertex_pinned[bottom_center] = true;
+
+    let get_bottom_vertex_idx = |ring: i32, segment: usize| -> usize {
+        if ring < 0 {
+            return bottom_center;
+        }
+        let ring = ring as usize;
+        if ring == n_rings - 1 {
+            // Equator ring is shared with the dome
+            return ring_starts[ring] + (segment % ring_vertex_counts[ring]);
+        }
+        bottom_ring_starts[ring] + (segment % ring_vertex_counts[ring])
+    };
+
+    // Build faces: dome with the usual winding, bottom cap flipped so its
+    // outward normal points down and equator edges get opposite-direction twins.
+    let mut faces_list: Vec<[usize; 3]> = Vec::new();
+    push_disc_faces(&mut faces_list, &get_vertex_idx, &ring_vertex_counts, false);
+    push_disc_faces(&mut faces_list, &get_bottom_vertex_idx, &ring_vertex_counts, true);
 
     build_halfedge_from_faces(&mut mesh, &faces_list);
     mesh
@@ -566,4 +590,56 @@ pub fn make_start_mesh(start_shape: StartShape, spring_len: f32, ico_nu: usize) 
     // Initialize intrinsic edge lengths from extrinsic geometry
     mesh.compute_intrinsic_lengths();
     mesh
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh::validate_mesh;
+
+    #[test]
+    fn hemisphere_is_closed() {
+        let mesh = make_hemisphere(1.0, N_RINGS, SEGMENTS_INNER);
+        validate_mesh(&mesh);
+
+        // No boundary half-edges
+        let n_boundary = (0..mesh.next_half_edge)
+            .filter(|&he| mesh.half_edge_idx[he] >= 0 && mesh.half_edge_face[he] < 0)
+            .count();
+        assert_eq!(n_boundary, 0, "closed hemisphere should have no boundary half-edges");
+
+        // Euler characteristic V - E + F = 2 for a closed genus-0 surface
+        let v = mesh.next_vertex as i64;
+        let e = (mesh.next_half_edge / 2) as i64;
+        let f = mesh.next_face as i64;
+        assert_eq!(v - e + f, 2, "Euler characteristic should be 2 (V={v}, E={e}, F={f})");
+
+        // Bottom cap (everything at z == 0, equator included) is pinned;
+        // dome vertices (z > 0) are free.
+        for v in 0..mesh.next_vertex {
+            let at_bottom = mesh.vertex_pos[v].z.abs() < 1e-5;
+            assert_eq!(
+                mesh.vertex_pinned[v], at_bottom,
+                "vertex {v} at z={} has pinned={}",
+                mesh.vertex_pos[v].z, mesh.vertex_pinned[v]
+            );
+        }
+        let n_pinned = (0..mesh.next_vertex).filter(|&v| mesh.vertex_pinned[v]).count();
+        assert!(n_pinned > 0 && n_pinned < mesh.next_vertex);
+    }
+
+    #[test]
+    fn circle_has_boundary() {
+        let mesh = make_circle(1.0, N_RINGS, SEGMENTS_INNER);
+        validate_mesh(&mesh);
+
+        let n_boundary = (0..mesh.next_half_edge)
+            .filter(|&he| mesh.half_edge_idx[he] >= 0 && mesh.half_edge_face[he] < 0)
+            .count();
+        assert_eq!(
+            n_boundary,
+            SEGMENTS_INNER * N_RINGS,
+            "circle should have one boundary half-edge per outer-ring segment"
+        );
+    }
 }

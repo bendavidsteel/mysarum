@@ -30,7 +30,8 @@ fn xpbd_bend_correction(
 fn main(@builtin(global_invocation_id) id: vec3u) {
     if id.x >= params.num_vertices { return; }
     let pos = vertex_pos[id.x];
-    if pos.w < 0.0 { return; }
+    // Skip inactive (w < 0) and pinned (w == 0) vertices
+    if pos.w < 0.5 { return; }
 
     // Compliance is pre-scaled (α̃ in XPBD notation) so behavior is dt-invariant.
     let alpha_tilde = params.bending_compliance;
@@ -57,7 +58,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let np = vertex_pos[dest].xyz;
 
         // ── Part 1: Vertex as ENDPOINT of edge v→dest ──────────────────
-        if twin >= 0 && next_he >= 0 {
+        // face >= 0 guard: for a boundary half-edge, next_he walks the boundary
+        // loop, so its dest is NOT a triangle corner — skip, or we'd project a
+        // dihedral constraint against a phantom triangle.
+        if face >= 0 && twin >= 0 && next_he >= 0 {
             let c_idx = he_packed[next_he].x;
             let twin_data = he_packed[twin];
             let twin_next = twin_data.z;
@@ -194,6 +198,6 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             avg_corr = avg_corr * (max_corr / corr_mag);
         }
         // SOR under-relaxation (see SimParams.relaxation)
-        vertex_pos[id.x] = vec4f(pos.xyz + params.relaxation * avg_corr, pos.w);
+        vertex_pos[id.x] = vec4f(apply_floor(pos.xyz + params.relaxation * avg_corr, params), pos.w);
     }
 }

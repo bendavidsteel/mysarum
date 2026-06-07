@@ -20,52 +20,35 @@ const MAX_BINS_PER_DIM: u32 = 64;
 
 // ── Cell-state rule ──────────────────────────────────────────────────────────
 // How vertex states are determined: the Lenia cellular automata (evolving
-// patterns) or a static "dot" seed (a fixed growth region of configurable
-// radius, anchored at the mesh apex).
+// patterns) or phototropism (state = alignment of the vertex normal with a
+// virtual overhead light source, recomputed on the GPU every frame).
 #[derive(Clone, Copy, PartialEq)]
 enum GrowthMode {
     Lenia,
-    Dot,
+    Phototropism,
 }
 
 impl GrowthMode {
     fn as_u32(self) -> u32 {
         match self {
             GrowthMode::Lenia => 0,
-            GrowthMode::Dot => 1,
+            GrowthMode::Phototropism => 1,
         }
     }
 }
 
 /// Build the start mesh and seed its vertex states for the current rule.
-/// Lenia keeps the random init from `HalfEdgeMesh::new`; Dot mode overwrites
-/// states with a hard disc: 1.0 within `dot_radius` of the apex, else 0.0.
+/// Lenia keeps the random init from `HalfEdgeMesh::new`; Phototropism zeroes
+/// states — the growth shader overwrites them from vertex normals each frame.
 fn build_seeded_mesh(model: &Model) -> Box<HalfEdgeMesh> {
     let mut mesh = make_start_mesh(model.start_shape, model.spring_len, model.ico_nu);
-    if model.growth_mode == GrowthMode::Dot {
-        seed_dot_state(&mut mesh, model.dot_radius);
-    }
-    mesh
-}
-
-/// Seed a static dot of growth state centered on the mesh's apex — the vertex
-/// with the greatest Z. For the sphere/hemisphere that's the top of the curved
-/// side; for the flat circle it's the center vertex at the origin.
-fn seed_dot_state(mesh: &mut HalfEdgeMesh, radius: f32) {
-    let mut center = Vec3::ZERO;
-    let mut max_z = f32::NEG_INFINITY;
-    for v in 0..mesh.next_vertex {
-        if mesh.vertex_idx[v] < 0 { continue; }
-        if mesh.vertex_pos[v].z > max_z {
-            max_z = mesh.vertex_pos[v].z;
-            center = mesh.vertex_pos[v];
+    if model.growth_mode == GrowthMode::Phototropism {
+        for v in 0..mesh.next_vertex {
+            if mesh.vertex_idx[v] < 0 { continue; }
+            mesh.vertex_state[v] = 0.0;
         }
     }
-    for v in 0..mesh.next_vertex {
-        if mesh.vertex_idx[v] < 0 { continue; }
-        let d = mesh.vertex_pos[v].distance(center);
-        mesh.vertex_state[v] = if d <= radius { 1.0 } else { 0.0 };
-    }
+    mesh
 }
 
 // ── Model ──────────────────────────────────────────────────────────────────────
@@ -85,7 +68,6 @@ struct Model {
     compliance: f32,
     xpbd_iterations: u32,
     repulsion_distance: f32,
-    repulsion_strength: f32,
     bulge_strength: f32,
     smoothing_strength: f32,
     bending_compliance: f32,
@@ -114,7 +96,6 @@ struct Model {
     start_shape: StartShape,
     ico_nu: usize,
     growth_mode: GrowthMode,
-    dot_radius: f32,
     hit_max_vertices: bool,
 }
 
@@ -197,7 +178,6 @@ fn model(app: &App) -> Model {
         compliance: 0.0,
         xpbd_iterations: 20,
         repulsion_distance: 80.0,
-        repulsion_strength: 4.0,
         bulge_strength: 5.0,
         smoothing_strength: 400.0,
         // NB: compliance is now α̃ directly (dt-invariant). Previous value
@@ -226,7 +206,6 @@ fn model(app: &App) -> Model {
         start_shape: StartShape::Sphere,
         ico_nu: 32,
         growth_mode: GrowthMode::Lenia,
-        dot_radius: 100.0,
         hit_max_vertices: false,
     };
     randomize_params(&mut m);
@@ -272,19 +251,14 @@ fn update(app: &App, model: &mut Model) {
         egui::ComboBox::from_id_salt("growth_mode")
             .selected_text(match model.growth_mode {
                 GrowthMode::Lenia => "Cellular automata",
-                GrowthMode::Dot => "Dot",
+                GrowthMode::Phototropism => "Phototropism",
             })
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut model.growth_mode, GrowthMode::Lenia, "Cellular automata");
-                ui.selectable_value(&mut model.growth_mode, GrowthMode::Dot, "Dot");
+                ui.selectable_value(&mut model.growth_mode, GrowthMode::Phototropism, "Phototropism");
             });
         if model.growth_mode != prev_mode {
             reseed_changed = true;
-        }
-        if model.growth_mode == GrowthMode::Dot {
-            if ui.add(egui::Slider::new(&mut model.dot_radius, 10.0..=500.0).text("dot radius")).changed() {
-                reseed_changed = true;
-            }
         }
         ui.separator();
         ui.label("Kernel (ring)");
@@ -310,7 +284,6 @@ fn update(app: &App, model: &mut Model) {
         let mut iters = model.xpbd_iterations as i32;
         ui.add(egui::Slider::new(&mut iters, 1..=20).text("XPBD iters"));
         model.xpbd_iterations = iters as u32;
-        ui.add(egui::Slider::new(&mut model.repulsion_strength, 0.0..=10.0).text("repulsion"));
         ui.add(egui::Slider::new(&mut model.bulge_strength, 0.0..=15.0).text("bulge"));
         ui.add(egui::Slider::new(&mut model.smoothing_strength, 0.0..=1000.0).text("smoothing strength"));
         ui.add(egui::Slider::new(&mut model.bending_compliance, 0.01..=10000.0).text("bend compliance α̃").logarithmic(true));
@@ -350,7 +323,7 @@ fn update(app: &App, model: &mut Model) {
         }
     }
 
-    // Changing the state rule or dot radius rebuilds and re-seeds the mesh,
+    // Changing the state rule rebuilds and re-seeds the mesh,
     // but leaves the camera where it is.
     if reseed_changed && !shape_changed {
         model.mesh = Arc::from(build_seeded_mesh(model));
@@ -434,7 +407,6 @@ fn update(app: &App, model: &mut Model) {
         growth_mu: model.growth_mu,
         growth_sigma: model.growth_sigma,
         cheb_order: model.cheb_order as u32,
-        repulsion_strength: model.repulsion_strength,
         state_dt: model.state_dt,
         damping: model.damping,
         growth_rate: model.growth_rate,
@@ -443,7 +415,10 @@ fn update(app: &App, model: &mut Model) {
         relaxation: model.relaxation,
         growth_mode: model.growth_mode.as_u32(),
         frame_seed: model.frame as u32,
-        _pad: 0.0,
+        // Hemisphere starts have a pinned bottom cap at z == 0; the floor keeps
+        // free vertices from sagging below that plane.
+        floor_enabled: if model.start_shape == StartShape::Hemisphere { 1.0 } else { 0.0 },
+        floor_z: 0.0,
     };
 
     // GPU dispatch: physics + state evolution
@@ -514,8 +489,10 @@ fn update(app: &App, model: &mut Model) {
 
         // Mesh refinement (every 20 frames). Flips don't allocate, so safe
         // even after hit_max_vertices — they improve triangle quality.
+        // Flips are capped at the same edge-length ceiling growth and springs
+        // use (spring_len * 3) so they can never mint an over-long edge.
         if model.frame % 20 == 0 {
-            mesh.refine_mesh();
+            mesh.refine_mesh(model.spring_len * 3.0);
         }
 
         // Upload new mesh data to GPU immediately so render indices stay in sync

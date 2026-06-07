@@ -40,7 +40,9 @@ fn is_mesh_neighbor(i: u32, j: u32) -> bool {
 fn main(@builtin(global_invocation_id) id: vec3u) {
     if id.x >= params.num_vertices { return; }
     let pos = vertex_pos[id.x];
-    if pos.w < 0.0 { return; }
+    // Skip inactive (w < 0) and pinned (w == 0) vertices; pinned vertices
+    // still repel free vertices (they remain in the spatial bins below).
+    if pos.w < 0.5 { return; }
 
     let info = get_bin_info(pos.x, pos.y, pos.z, params);
 
@@ -100,8 +102,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     }
 
     if num_collisions > 0u {
-        // SOR under-relaxation (see SimParams.relaxation)
-        let step = params.relaxation * params.repulsion_strength * correction / f32(num_collisions);
-        vertex_pos[id.x] = vec4f(pos.xyz + step, pos.w);
+        // SOR under-relaxation (see SimParams.relaxation). No strength multiplier:
+        // the XPBD correction already resolves the constraint exactly, and any
+        // gain > 1 injects energy instead of removing violation.
+        let step = params.relaxation * correction / f32(num_collisions);
+        vertex_pos[id.x] = vec4f(apply_floor(pos.xyz + step, params), pos.w);
     }
 }

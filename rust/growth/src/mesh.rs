@@ -22,6 +22,9 @@ pub(crate) struct HalfEdgeMesh {
     pub(crate) vertex_pos: [Vec3; MAX_VERTICES],
     pub(crate) vertex_state: [f32; MAX_VERTICES],
     pub(crate) vertex_u: [f32; MAX_VERTICES],
+    // Pinned vertices are excluded from physics (positions never move) and
+    // from intrinsic edge growth. Uploaded to the GPU as vertex_pos.w == 0.0.
+    pub(crate) vertex_pinned: [bool; MAX_VERTICES],
 
     // Half-edge arrays
     pub(crate) half_edge_idx: [i32; MAX_HALF_EDGES],
@@ -169,6 +172,26 @@ impl HalfEdgeMesh {
         }
     }
 
+    /// Symmetrize intrinsic lengths: set each half-edge and its twin to their
+    /// average. The growth shader grows each side independently (a vertex only
+    /// writes its outgoing half-edges), and the spring shader enforces the
+    /// twin-averaged rest length — but the CPU topology ops (Delaunay flips,
+    /// split median formulas) read single-sided values. Left unsymmetrized, a
+    /// divergent he/twin pair presents a triangle-inequality-violating triangle
+    /// to the flip unfold, which then mints spuriously long edges. Call after
+    /// reading lengths back from the GPU, before any topology op.
+    pub(crate) fn symmetrize_intrinsic_lengths(&mut self) {
+        for he in 0..self.next_half_edge {
+            if self.half_edge_idx[he] < 0 { continue; }
+            let twin = self.half_edge_twin[he];
+            if twin < 0 || (twin as usize) < he { continue; }
+            let twin = twin as usize;
+            let avg = (self.half_edge_intrinsic_len[he] + self.half_edge_intrinsic_len[twin]) * 0.5;
+            self.half_edge_intrinsic_len[he] = avg;
+            self.half_edge_intrinsic_len[twin] = avg;
+        }
+    }
+
     // ── Get half-edge from vertex a to vertex b ────────────────────────────
 
     pub(crate) fn get_vertex_half_edge(&self, vertex_a: usize, vertex_b: usize) -> Option<usize> {
@@ -242,6 +265,7 @@ impl HalfEdgeMesh {
         new_pos.z += (random_f32() - 0.5) * edge_len * 0.05;
         self.vertex_pos[vertex_c] = new_pos;
         self.vertex_state[vertex_c] = (self.vertex_state[vertex_a] + self.vertex_state[vertex_b]) * 0.5;
+        self.vertex_pinned[vertex_c] = self.vertex_pinned[vertex_a] && self.vertex_pinned[vertex_b];
         self.vertex_half_edge[vertex_c] = half_edge_ca as i32;
 
         // Face
@@ -367,6 +391,7 @@ impl HalfEdgeMesh {
         new_pos.z += (random_f32() - 0.5) * edge_len * 0.05;
         self.vertex_pos[vertex_d] = new_pos;
         self.vertex_state[vertex_d] = (self.vertex_state[vertex_a] + self.vertex_state[vertex_b]) * 0.5;
+        self.vertex_pinned[vertex_d] = self.vertex_pinned[vertex_a] && self.vertex_pinned[vertex_b];
         self.vertex_half_edge[vertex_d] = half_edge_db as i32;
 
         // Faces
@@ -425,7 +450,9 @@ impl HalfEdgeMesh {
         let l_ad = l_ab * 0.5;
         let l_db = l_ab * 0.5;
         let l_dc_sq = (2.0 * l_ca * l_ca + 2.0 * l_bc * l_bc - l_ab * l_ab) / 4.0;
-        let l_dc = l_dc_sq.max(0.0).sqrt();
+        // Floor at EPSILON: a triangle-inequality-violating split would yield a
+        // zero length, which poisons later Delaunay checks and flip unfolds.
+        let l_dc = l_dc_sq.max(0.0).sqrt().max(EPSILON);
         self.half_edge_intrinsic_len[half_edge_ad] = l_ad;  // repurposed from ab
         self.half_edge_intrinsic_len[half_edge_da] = l_ad;
         self.half_edge_intrinsic_len[half_edge_db] = l_db;
@@ -523,6 +550,7 @@ impl HalfEdgeMesh {
         new_pos.z += (random_f32() - 0.5) * edge_len * 0.05;
         self.vertex_pos[vertex_e] = new_pos;
         self.vertex_state[vertex_e] = (self.vertex_state[vertex_a] + self.vertex_state[vertex_b]) * 0.5;
+        self.vertex_pinned[vertex_e] = self.vertex_pinned[vertex_a] && self.vertex_pinned[vertex_b];
         self.vertex_half_edge[vertex_e] = half_edge_eb as i32;
 
         // Faces (must update repurposed faces too, not just new ones)
@@ -596,10 +624,11 @@ impl HalfEdgeMesh {
         // Intrinsic lengths: AE/EB halves of AB; EC/ED via median formula
         let l_ae = l_ab * 0.5;
         let l_eb = l_ab * 0.5;
+        // Floor at EPSILON: see add_internal_edge_triangle's median formula.
         let l_ec_sq = (2.0 * l_ca * l_ca + 2.0 * l_bc * l_bc - l_ab * l_ab) / 4.0;
-        let l_ec = l_ec_sq.max(0.0).sqrt();
+        let l_ec = l_ec_sq.max(0.0).sqrt().max(EPSILON);
         let l_ed_sq = (2.0 * l_ad * l_ad + 2.0 * l_db * l_db - l_ab * l_ab) / 4.0;
-        let l_ed = l_ed_sq.max(0.0).sqrt();
+        let l_ed = l_ed_sq.max(0.0).sqrt().max(EPSILON);
 
         self.half_edge_intrinsic_len[half_edge_ae] = l_ae;  // repurposed from ab
         self.half_edge_intrinsic_len[half_edge_ea] = l_ae;
@@ -615,7 +644,7 @@ impl HalfEdgeMesh {
 
     // ── Flip edge ──────────────────────────────────────────────────────────
 
-    fn flip_edge(&mut self, half_edge_ab: usize) -> bool {
+    fn flip_edge(&mut self, half_edge_ab: usize, max_flip_len: f32) -> bool {
         let half_edge_ba_i = self.half_edge_twin[half_edge_ab];
         if half_edge_ba_i < 0 {
             return false;
@@ -638,13 +667,36 @@ impl HalfEdgeMesh {
         let vertex_d = self.half_edge_dest[half_edge_ad] as usize;
         let half_edge_db = self.half_edge_next[half_edge_ad] as usize;
 
+        // Link condition: if C and D are already adjacent, flipping would create
+        // a double edge. The GPU fan walks terminate by destination comparison,
+        // so a double edge silently truncates them — part of the fan stops
+        // receiving spring constraints and drifts apart unboundedly.
+        if self.get_vertex_half_edge(vertex_c, vertex_d).is_some() {
+            return false;
+        }
+
         // Compute new intrinsic edge length for CD by unfolding the two triangles
         let lab = self.half_edge_intrinsic_len[half_edge_ab];
         let lbc = self.half_edge_intrinsic_len[half_edge_bc];
         let lca = self.half_edge_intrinsic_len[half_edge_ca];
         let lad = self.half_edge_intrinsic_len[half_edge_ad];
         let ldb = self.half_edge_intrinsic_len[half_edge_db];
+
+        // Only flip if both intrinsic triangles are metrically valid. On
+        // triangle-inequality-violating input the clamped unfold degenerates to
+        // a colinear placement and the "diagonal" comes out near lca + lad —
+        // a spuriously long edge that then compounds through later flips.
+        if !triangle_inequality_holds(lab, lbc, lca) || !triangle_inequality_holds(lab, lad, ldb) {
+            return false;
+        }
+
         let lcd = intrinsic_flip_length(lab, lca, lbc, lad, ldb);
+
+        // Backstop: never mint an edge longer than the system-wide ceiling
+        // (growth and springs both cap at spring_len * 3) or degenerate-short.
+        if lcd > max_flip_len || lcd < EPSILON {
+            return false;
+        }
 
         let face_abc = self.half_edge_face[half_edge_ab];
         let face_bad = self.half_edge_face[half_edge_ba];
@@ -729,7 +781,7 @@ impl HalfEdgeMesh {
 
     // ── Mesh refinement (intrinsic Delaunay flips) ──────────────────────────
 
-    pub(crate) fn refine_mesh(&mut self) {
+    pub(crate) fn refine_mesh(&mut self, max_flip_len: f32) {
         // Collect interior edges to check (deduplicate: only where dest < dest_twin)
         self.scratch_edges_to_check.clear();
         for he in 0..self.next_half_edge {
@@ -768,7 +820,7 @@ impl HalfEdgeMesh {
             let ldb = self.half_edge_intrinsic_len[he_db as usize];
 
             if !is_intrinsic_delaunay(lab, lbc, lca, lad, ldb) {
-                self.flip_edge(he);
+                self.flip_edge(he, max_flip_len);
             }
         }
     }
@@ -776,17 +828,28 @@ impl HalfEdgeMesh {
 
 // ── Intrinsic geometry helpers ─────────────────────────────────────────────────
 
+/// Check the triangle inequality with a small relative tolerance. Intrinsic
+/// lengths are decoupled from the embedding, so violations can and do occur;
+/// callers use this to skip operations whose math is meaningless on such input.
+fn triangle_inequality_holds(a: f32, b: f32, c: f32) -> bool {
+    let tol = (a + b + c) * 1e-4;
+    a <= b + c + tol && b <= a + c + tol && c <= a + b + tol
+}
+
 /// Check if edge AB is locally Delaunay using intrinsic edge lengths.
 /// Edge AB with opposite vertices C (in triangle ABC) and D (in triangle ABD).
 /// Arguments: lab=|AB|, lbc=|BC|, lca=|CA|, lad=|AD|, ldb=|DB|
 /// Returns true if the edge is Delaunay (opposite angles sum ≤ π).
 fn is_intrinsic_delaunay(lab: f32, lbc: f32, lca: f32, lad: f32, ldb: f32) -> bool {
     let lab2 = lab * lab;
+    // Cosines are clamped to [-1, 1]: intrinsic lengths can violate the triangle
+    // inequality (growth/splits are decoupled from the embedding), and unclamped
+    // values make the criterion garbage on degenerate data.
     // Angle at C in triangle ACB: opposite edge is AB
-    let cos_c = (lca * lca + lbc * lbc - lab2) / (2.0 * lca * lbc).max(EPSILON);
+    let cos_c = ((lca * lca + lbc * lbc - lab2) / (2.0 * lca * lbc).max(EPSILON)).clamp(-1.0, 1.0);
     let sin_c = (1.0 - cos_c * cos_c).max(0.0).sqrt();
     // Angle at D in triangle ADB: opposite edge is AB
-    let cos_d = (lad * lad + ldb * ldb - lab2) / (2.0 * lad * ldb).max(EPSILON);
+    let cos_d = ((lad * lad + ldb * ldb - lab2) / (2.0 * lad * ldb).max(EPSILON)).clamp(-1.0, 1.0);
     let sin_d = (1.0 - cos_d * cos_d).max(0.0).sqrt();
     // sin(α_C + α_D) < 0 means sum > π → not Delaunay
     let sin_sum = sin_c * cos_d + cos_c * sin_d;
@@ -798,14 +861,17 @@ fn is_intrinsic_delaunay(lab: f32, lbc: f32, lca: f32, lad: f32, ldb: f32) -> bo
 /// Arguments: lab=|AB|, lca=|CA|, lbc=|BC|, lad=|AD|, ldb=|DB|
 fn intrinsic_flip_length(lab: f32, lca: f32, lbc: f32, lad: f32, ldb: f32) -> f32 {
     if lab < EPSILON { return 0.0; }
+    // Cosines are clamped to [-1, 1] (project degenerate triangles onto a line):
+    // unclamped, a triangle-inequality-violating configuration yields |cos| >> 1
+    // and an astronomically long flipped edge, which the springs then enforce.
     // Place A at origin, B at (lab, 0)
     // C in upper half-plane (triangle ACB)
-    let cos_a_acb = (lab * lab + lca * lca - lbc * lbc) / (2.0 * lab * lca).max(EPSILON);
+    let cos_a_acb = ((lab * lab + lca * lca - lbc * lbc) / (2.0 * lab * lca).max(EPSILON)).clamp(-1.0, 1.0);
     let sin_a_acb = (1.0 - cos_a_acb * cos_a_acb).max(0.0).sqrt();
     let cx = lca * cos_a_acb;
     let cy = lca * sin_a_acb;
     // D in lower half-plane (triangle ADB)
-    let cos_a_adb = (lab * lab + lad * lad - ldb * ldb) / (2.0 * lab * lad).max(EPSILON);
+    let cos_a_adb = ((lab * lab + lad * lad - ldb * ldb) / (2.0 * lab * lad).max(EPSILON)).clamp(-1.0, 1.0);
     let sin_a_adb = (1.0 - cos_a_adb * cos_a_adb).max(0.0).sqrt();
     let dx = lad * cos_a_adb;
     let dy = -lad * sin_a_adb; // opposite side of AB
@@ -926,6 +992,84 @@ fn do_splits(mesh: &mut HalfEdgeMesh) -> bool {
         }
     }
     hit_max
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh_builders::make_icosphere;
+
+    /// Count distinct edges between each vertex pair; a healthy triangulation
+    /// never has two edges connecting the same two vertices.
+    fn assert_no_double_edges(mesh: &HalfEdgeMesh) {
+        use std::collections::HashSet;
+        let mut seen: HashSet<(i32, i32)> = HashSet::new();
+        for he in 0..mesh.next_half_edge {
+            if mesh.half_edge_idx[he] < 0 { continue; }
+            let twin = mesh.half_edge_twin[he];
+            if twin < 0 { continue; }
+            let a = mesh.half_edge_dest[twin as usize];
+            let b = mesh.half_edge_dest[he];
+            if a < b {
+                assert!(seen.insert((a, b)), "double edge between vertices {a} and {b}");
+            }
+        }
+    }
+
+    /// Regression test for the runaway-edge-length bug: divergent one-sided
+    /// intrinsic lengths used to present triangle-inequality-violating
+    /// triangles to the Delaunay flip, whose clamped unfold then minted edges
+    /// near lca + lad — far past every other cap in the system — and the
+    /// garbage compounded across refine passes.
+    #[test]
+    fn refine_on_garbage_lengths_mints_no_long_edges() {
+        let spring_len = 30.0;
+        let max_flip_len = spring_len * 3.0;
+        let mut mesh = make_icosphere(spring_len * 4.0, 8);
+        mesh.compute_intrinsic_lengths();
+
+        // Simulate worst-case one-sided growth divergence: every even-indexed
+        // half-edge saturated at the growth cap, its twin left untouched.
+        for he in 0..mesh.next_half_edge {
+            if mesh.half_edge_idx[he] < 0 { continue; }
+            if he % 2 == 0 {
+                mesh.half_edge_intrinsic_len[he] = max_flip_len;
+            }
+        }
+        mesh.symmetrize_intrinsic_lengths();
+
+        let max_before = mesh.half_edge_intrinsic_len[..mesh.next_half_edge]
+            .iter().cloned().fold(0.0f32, f32::max);
+
+        // Several refine passes: the old bug compounded across passes.
+        for _ in 0..5 {
+            mesh.refine_mesh(max_flip_len);
+        }
+
+        validate_mesh(&mesh);
+        assert_no_double_edges(&mesh);
+        let max_after = mesh.half_edge_intrinsic_len[..mesh.next_half_edge]
+            .iter().cloned().fold(0.0f32, f32::max);
+        assert!(
+            max_after <= max_before.max(max_flip_len) + EPSILON,
+            "refine minted a long edge: max {max_after} > {max_before}"
+        );
+    }
+
+    #[test]
+    fn symmetrize_averages_he_and_twin() {
+        let mut mesh = make_icosphere(100.0, 4);
+        mesh.compute_intrinsic_lengths();
+        let he = (0..mesh.next_half_edge)
+            .find(|&h| mesh.half_edge_idx[h] >= 0 && mesh.half_edge_twin[h] >= 0)
+            .unwrap();
+        let twin = mesh.half_edge_twin[he] as usize;
+        mesh.half_edge_intrinsic_len[he] = 10.0;
+        mesh.half_edge_intrinsic_len[twin] = 30.0;
+        mesh.symmetrize_intrinsic_lengths();
+        assert_eq!(mesh.half_edge_intrinsic_len[he], 20.0);
+        assert_eq!(mesh.half_edge_intrinsic_len[twin], 20.0);
+    }
 }
 
 // ── Debug validation ───────────────────────────────────────────────────────────

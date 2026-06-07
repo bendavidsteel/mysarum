@@ -12,7 +12,9 @@
 fn main(@builtin(global_invocation_id) id: vec3u) {
     if id.x >= params.num_vertices { return; }
     let pos = vertex_pos[id.x];
-    if pos.w < 0.0 { return; }
+    // Skip inactive (w < 0) and pinned (w == 0) vertices; pinned vertices
+    // still act as constraint anchors for their free neighbors.
+    if pos.w < 0.5 { return; }
 
     let start_he = vertex_he[id.x];
     if start_he < 0 { return; }
@@ -44,11 +46,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             // Rest length = average of both half-edges' intrinsic lengths
             // (each side grown independently by its source vertex). Floor to the
             // same value so a newly-allocated half-edge (rest == 0) can still heal.
+            // Cap at the growth shader's edge-length ceiling (spring_len * 3, see
+            // growth.wgsl) so a corrupted buffer value can't dictate max_corr below.
             var rest = he_intrinsic_len[he];
             if twin >= 0 {
                 rest = (rest + he_intrinsic_len[twin]) * 0.5;
             }
-            rest = max(rest, dist_floor);
+            rest = clamp(rest, dist_floor, params.spring_len * 3.0);
             let C = dist - rest;
 
             // XPBD correction: w_i = w_j = 1, so denominator = 2 + alpha_tilde
@@ -77,6 +81,6 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     // then apply SOR under-relaxation so chained projection passes don't overshoot.
     if num_edges > 0u {
         let step = params.relaxation * correction / f32(num_edges);
-        vertex_pos[id.x] = vec4f(pos.xyz + step, pos.w);
+        vertex_pos[id.x] = vec4f(apply_floor(pos.xyz + step, params), pos.w);
     }
 }

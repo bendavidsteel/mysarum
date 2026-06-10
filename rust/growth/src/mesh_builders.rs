@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use nannou::prelude::*;
 
-use crate::mesh::{HalfEdgeMesh, N_RINGS, SEGMENTS_INNER};
+use crate::mesh::{HalfEdgeMesh, MAX_VERTICES, N_RINGS, SEGMENTS_INNER};
 
 // ── Shared half-edge builder from face list ─────────────────────────────────
 
@@ -67,20 +67,18 @@ pub fn build_halfedge_from_faces(mesh: &mut HalfEdgeMesh, faces_list: &[[usize; 
         }
     }
 
-    // Connect boundary half-edges
-    let boundary_dict: HashMap<(usize, usize), usize> = boundary_half_edges
+    // Connect boundary half-edges. Each boundary vertex has exactly one
+    // outgoing boundary half-edge, so a from-vertex → half-edge map suffices.
+    let boundary_by_src: HashMap<usize, usize> = boundary_half_edges
         .iter()
-        .map(|&(vf, vt, he)| ((vf, vt), he))
+        .map(|&(vf, _vt, he)| (vf, he))
         .collect();
 
     for &(_v_from, _v_to, he_idx) in &boundary_half_edges {
         let dest = half_edge_list[he_idx].dest;
-        for (&(bnf, _bnt), &bhe) in boundary_dict.iter() {
-            if bnf == dest {
-                half_edge_list[he_idx].next = bhe as i32;
-                half_edge_list[bhe].prev = he_idx as i32;
-                break;
-            }
+        if let Some(&bhe) = boundary_by_src.get(&dest) {
+            half_edge_list[he_idx].next = bhe as i32;
+            half_edge_list[bhe].prev = he_idx as i32;
         }
     }
 
@@ -96,13 +94,11 @@ pub fn build_halfedge_from_faces(mesh: &mut HalfEdgeMesh, faces_list: &[[usize; 
         mesh.half_edge_prev[i] = he.prev;
     }
 
-    // Set vertex half-edges
-    for v in 0..mesh.next_vertex {
-        for (&(vf, _vt), &he_idx) in &edge_dict {
-            if vf == v {
-                mesh.vertex_half_edge[v] = he_idx as i32;
-                break;
-            }
+    // Set vertex half-edges: one pass over the edges, first outgoing wins
+    // (the boundary fixup below normalizes the choice where it matters).
+    for (&(vf, _vt), &he_idx) in &edge_dict {
+        if mesh.vertex_half_edge[vf] < 0 {
+            mesh.vertex_half_edge[vf] = he_idx as i32;
         }
     }
 
@@ -348,6 +344,11 @@ pub fn make_hemisphere(spring_len: f32, n_rings: usize, segments_inner: usize) -
 // ── make_icosphere: geodesic icosahedron ────────────────────────────────────
 
 pub fn make_icosphere(radius: f32, nu: usize) -> Box<HalfEdgeMesh> {
+    // A subdivided icosahedron has 10·nu² + 2 vertices; clamp nu so the mesh
+    // fits in the fixed vertex pool instead of panicking in alloc_vertex.
+    let max_nu = (((MAX_VERTICES - 2) / 10) as f32).sqrt() as usize;
+    let nu = nu.min(max_nu);
+
     let mut mesh = HalfEdgeMesh::new();
 
     // Base icosahedron: 12 vertices, 20 faces
@@ -626,6 +627,21 @@ mod tests {
         }
         let n_pinned = (0..mesh.next_vertex).filter(|&v| mesh.vertex_pinned[v]).count();
         assert!(n_pinned > 0 && n_pinned < mesh.next_vertex);
+    }
+
+    #[test]
+    fn icosphere_large_nu_clamps_instead_of_panicking() {
+        // 10·64² + 2 = 40,962 vertices would overflow MAX_VERTICES (32,000);
+        // make_icosphere must clamp the frequency rather than panic in alloc_vertex.
+        let mesh = make_icosphere(100.0, 64);
+        validate_mesh(&mesh);
+        assert!(mesh.next_vertex <= MAX_VERTICES);
+
+        // Still a closed genus-0 surface after clamping
+        let v = mesh.next_vertex as i64;
+        let e = (mesh.next_half_edge / 2) as i64;
+        let f = mesh.next_face as i64;
+        assert_eq!(v - e + f, 2, "Euler characteristic should be 2 (V={v}, E={e}, F={f})");
     }
 
     #[test]

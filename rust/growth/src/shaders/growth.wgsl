@@ -5,6 +5,13 @@
 // Matches the mesh convention that +Z is "up" (apex = max Z).
 const LIGHT_DIR: vec3<f32> = vec3<f32>(0.0, 0.0, 1.0);
 
+// Unit vector for the preferred anisotropy axis (0 = X, 1 = Y, 2 = Z).
+fn anisotropy_axis_vec(axis: u32) -> vec3<f32> {
+    if axis == 0u { return vec3<f32>(1.0, 0.0, 0.0); }
+    if axis == 1u { return vec3<f32>(0.0, 1.0, 0.0); }
+    return vec3<f32>(0.0, 0.0, 1.0);
+}
+
 // Integer hash — maps vertex index to a stable pseudo-random float in [0,1)
 fn hash_u32(n: u32) -> f32 {
     var x = n;
@@ -17,12 +24,12 @@ fn hash_u32(n: u32) -> f32 {
 }
 
 @group(0) @binding(0) var<storage, read_write> vertex_state: array<f32>;
-@group(0) @binding(1) var<storage, read_write> vertex_u: array<f32>;
-@group(0) @binding(2) var<storage, read> result: array<f32>;
-@group(0) @binding(3) var<storage, read> vertex_pos: array<vec4<f32>>;
-@group(0) @binding(4) var<storage, read_write> he_intrinsic_len: array<f32>;
-@group(0) @binding(5) var<storage, read> he_packed: array<vec4<i32>>;
-@group(0) @binding(6) var<storage, read> vertex_he: array<i32>;
+@group(0) @binding(1) var<storage, read> result: array<f32>;
+@group(0) @binding(2) var<storage, read> vertex_pos: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> he_intrinsic_len: array<f32>;
+@group(0) @binding(4) var<storage, read> he_packed: array<vec4<i32>>;
+@group(0) @binding(5) var<storage, read> vertex_he: array<i32>;
+@group(0) @binding(6) var<storage, read> vertex_source: array<f32>;
 @group(1) @binding(0) var<uniform> params: SimParams;
 
 // Area-weighted vertex normal: walk the half-edge fan and accumulate the face
@@ -77,7 +84,6 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     if pos.w < 0.0 { return; }
 
     let r = result[id.x];
-    vertex_u[id.x] = r;
 
     var s = vertex_state[id.x];
     if params.growth_mode == 0u {
@@ -86,6 +92,24 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let sigma = params.growth_sigma + EPSILON;
         let g = 2.0 * exp(-0.5 * (x * x) / (sigma * sigma)) - 1.0;
         s = clamp(s + params.state_dt * g, 0.0, 1.0);
+        vertex_state[id.x] = s;
+    } else if params.growth_mode == 2u {
+        // Grow-at-dot mode: the growth potential diffuses outward from a fixed
+        // set of source vertices via an explicit heat equation. `result` holds
+        // the 1-ring neighbour average of the (read-only) previous state — the
+        // Chebyshev pass is configured to compute exactly W(state) for this mode
+        // — so the graph Laplacian is just (avg - s), evaluated race-free.
+        // dot_diffusion / dot_decay are direct per-step rates (not scaled by
+        // state_dt) so the potential spreads in a useful number of frames; the
+        // steady-state falloff radius is ~sqrt(dot_diffusion / dot_decay) edges,
+        // so a small decay gives a large growth zone (decay 0 fills the mesh).
+        let lap = r - s;
+        s = s + params.dot_diffusion * lap - params.dot_decay * s;
+        // Source vertices are held at full potential (Dirichlet boundary).
+        if vertex_source[id.x] > 0.5 {
+            s = 1.0;
+        }
+        s = clamp(s, 0.0, 1.0);
         vertex_state[id.x] = s;
     } else {
         // Phototropism mode (growth_mode == 1): state is how directly this
@@ -112,6 +136,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let noise = 0.5 + hash_u32(id.x * 0x9e3779b9u + params.frame_seed);
         let delta = grow * grow * noise * params.state_dt * params.growth_rate;
 
+        let axis = anisotropy_axis_vec(params.anisotropy_axis);
         let start_he = vertex_he[id.x];
         if start_he >= 0 {
             let start_dest = he_packed[start_he].x;
@@ -124,7 +149,18 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
                 let twin = data.y;
 
                 if dest >= 0 {
-                    let new_len = he_intrinsic_len[he] + delta;
+                    // Anisotropy: scale this edge's growth by how well its 3D
+                    // direction aligns with the preferred axis. |dot| treats the
+                    // two edge orientations symmetrically. mix(1, align, strength)
+                    // ramps from isotropic (strength 0) to axis-only (strength 1).
+                    let edge = vertex_pos[dest].xyz - pos.xyz;
+                    let elen = length(edge);
+                    var aniso = 1.0;
+                    if elen > EPSILON {
+                        let align = abs(dot(edge / elen, axis));
+                        aniso = mix(1.0, align, params.anisotropy_strength);
+                    }
+                    let new_len = he_intrinsic_len[he] + delta * aniso;
                     he_intrinsic_len[he] = min(new_len, params.spring_len * 3.0);
                 }
 

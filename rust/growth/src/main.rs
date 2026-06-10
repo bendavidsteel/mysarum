@@ -26,6 +26,7 @@ const MAX_BINS_PER_DIM: u32 = 64;
 enum GrowthMode {
     Lenia,
     Phototropism,
+    GrowAtDot,
 }
 
 impl GrowthMode {
@@ -33,6 +34,7 @@ impl GrowthMode {
         match self {
             GrowthMode::Lenia => 0,
             GrowthMode::Phototropism => 1,
+            GrowthMode::GrowAtDot => 2,
         }
     }
 }
@@ -40,12 +42,44 @@ impl GrowthMode {
 /// Build the start mesh and seed its vertex states for the current rule.
 /// Lenia keeps the random init from `HalfEdgeMesh::new`; Phototropism zeroes
 /// states — the growth shader overwrites them from vertex normals each frame.
+/// GrowAtDot zeroes states and marks a small cluster of source vertices near
+/// the apex, from which the growth potential diffuses outward.
 fn build_seeded_mesh(model: &Model) -> Box<HalfEdgeMesh> {
     let mut mesh = make_start_mesh(model.start_shape, model.spring_len, model.ico_nu);
     if model.growth_mode == GrowthMode::Phototropism {
         for v in 0..mesh.next_vertex {
             if mesh.vertex_idx[v] < 0 { continue; }
             mesh.vertex_state[v] = 0.0;
+        }
+    } else if model.growth_mode == GrowthMode::GrowAtDot {
+        // Zero the potential and source flags everywhere first.
+        for v in 0..mesh.next_vertex {
+            if mesh.vertex_idx[v] < 0 { continue; }
+            mesh.vertex_state[v] = 0.0;
+            mesh.vertex_source[v] = 0.0;
+        }
+        // Locate the apex (highest free vertex) as the dot centre.
+        let mut apex = -1i32;
+        let mut apex_z = f32::NEG_INFINITY;
+        for v in 0..mesh.next_vertex {
+            if mesh.vertex_idx[v] < 0 || mesh.vertex_pinned[v] { continue; }
+            if mesh.vertex_pos[v].z > apex_z {
+                apex_z = mesh.vertex_pos[v].z;
+                apex = v as i32;
+            }
+        }
+        if apex >= 0 {
+            let centre = mesh.vertex_pos[apex as usize];
+            let radius = model.dot_seed_radius;
+            // Mark every free vertex within the seed radius (and always the apex
+            // itself) as a fixed growth source held at full potential.
+            for v in 0..mesh.next_vertex {
+                if mesh.vertex_idx[v] < 0 || mesh.vertex_pinned[v] { continue; }
+                if v as i32 == apex || mesh.vertex_pos[v].distance(centre) <= radius {
+                    mesh.vertex_source[v] = 1.0;
+                    mesh.vertex_state[v] = 1.0;
+                }
+            }
         }
     }
     mesh
@@ -90,6 +124,9 @@ struct Model {
     camera_pitch: f32,
     zoom: f32,
     dragging: bool,
+    // True while egui owns the pointer (hovering or dragging a widget);
+    // camera drag must not start then. Updated once per frame in update().
+    egui_owns_pointer: bool,
     last_mouse: Vec2,
     render_mode: u32,
     show_wireframe: bool,
@@ -97,6 +134,15 @@ struct Model {
     ico_nu: usize,
     growth_mode: GrowthMode,
     hit_max_vertices: bool,
+    // Anisotropic growth: preferred axis (0 = X, 1 = Y, 2 = Z) and how strongly
+    // it is favoured (0 = isotropic, 1 = grow only along the axis).
+    anisotropy_axis: u32,
+    anisotropy_strength: f32,
+    // Grow-at-dot params: diffusion rate and decay of the heat-equation growth
+    // potential, plus the radius around the apex used to seed source vertices.
+    dot_diffusion: f32,
+    dot_decay: f32,
+    dot_seed_radius: f32,
 }
 
 fn recompute_cheb_coeffs(model: &mut Model) {
@@ -200,6 +246,7 @@ fn model(app: &App) -> Model {
         camera_pitch: 0.0,
         zoom: 1.0,
         dragging: false,
+        egui_owns_pointer: false,
         last_mouse: Vec2::ZERO,
         render_mode: 0,
         show_wireframe: false,
@@ -207,6 +254,11 @@ fn model(app: &App) -> Model {
         ico_nu: 32,
         growth_mode: GrowthMode::Lenia,
         hit_max_vertices: false,
+        anisotropy_axis: 2,
+        anisotropy_strength: 0.0,
+        dot_diffusion: 0.8,
+        dot_decay: 0.02,
+        dot_seed_radius: 45.0,
     };
     randomize_params(&mut m);
     m.mesh = Arc::from(build_seeded_mesh(&m));
@@ -237,7 +289,9 @@ fn update(app: &App, model: &mut Model) {
             });
         if model.start_shape == StartShape::Sphere {
             let prev_nu = model.ico_nu;
-            ui.add(egui::Slider::new(&mut model.ico_nu, 2..=64).text("subdivisions"));
+            // An icosphere has 10·nu² + 2 vertices; nu = 56 is the largest
+            // frequency that fits in MAX_VERTICES (32000).
+            ui.add(egui::Slider::new(&mut model.ico_nu, 2..=56).text("subdivisions"));
             if model.ico_nu != prev_nu {
                 shape_changed = true;
             }
@@ -252,23 +306,42 @@ fn update(app: &App, model: &mut Model) {
             .selected_text(match model.growth_mode {
                 GrowthMode::Lenia => "Cellular automata",
                 GrowthMode::Phototropism => "Phototropism",
+                GrowthMode::GrowAtDot => "Grow at dot",
             })
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut model.growth_mode, GrowthMode::Lenia, "Cellular automata");
                 ui.selectable_value(&mut model.growth_mode, GrowthMode::Phototropism, "Phototropism");
+                ui.selectable_value(&mut model.growth_mode, GrowthMode::GrowAtDot, "Grow at dot");
             });
         if model.growth_mode != prev_mode {
             reseed_changed = true;
         }
-        ui.separator();
-        ui.label("Kernel (ring)");
-        kernel_changed |= ui.add(egui::Slider::new(&mut model.kernel_mu, 0.0..=18.0).text("mu")).changed();
-        kernel_changed |= ui.add(egui::Slider::new(&mut model.kernel_sigma, 0.1..=4.0).text("sigma")).changed();
-        ui.label(format!("order: {} (auto)", model.cheb_order));
-        ui.separator();
-        ui.label("Growth function");
-        ui.add(egui::Slider::new(&mut model.growth_mu, 0.0..=1.0).text("mu"));
-        ui.add(egui::Slider::new(&mut model.growth_sigma, 0.01..=1.0).text("sigma"));
+        // Cellular-automata-only controls: the Lenia ring kernel and its
+        // Gaussian growth function. Hidden in the other state rules.
+        if model.growth_mode == GrowthMode::Lenia {
+            ui.separator();
+            ui.label("Kernel (ring)");
+            kernel_changed |= ui.add(egui::Slider::new(&mut model.kernel_mu, 0.0..=18.0).text("mu")).changed();
+            kernel_changed |= ui.add(egui::Slider::new(&mut model.kernel_sigma, 0.1..=4.0).text("sigma")).changed();
+            ui.label(format!("order: {} (auto)", model.cheb_order));
+            ui.separator();
+            ui.label("Growth function");
+            ui.add(egui::Slider::new(&mut model.growth_mu, 0.0..=1.0).text("mu"));
+            ui.add(egui::Slider::new(&mut model.growth_sigma, 0.01..=1.0).text("sigma"));
+        }
+        // Grow-at-dot-only controls.
+        if model.growth_mode == GrowthMode::GrowAtDot {
+            ui.separator();
+            ui.label("Grow at dot");
+            ui.add(egui::Slider::new(&mut model.dot_diffusion, 0.0..=0.95).text("diffusion"));
+            ui.add(egui::Slider::new(&mut model.dot_decay, 0.0..=0.2).text("falloff (decay)").logarithmic(true));
+            let prev_radius = model.dot_seed_radius;
+            ui.add(egui::Slider::new(&mut model.dot_seed_radius, 0.0..=400.0).text("seed radius"));
+            // The seed set is baked into the mesh, so changing it re-seeds.
+            if (model.dot_seed_radius - prev_radius).abs() > f32::EPSILON {
+                reseed_changed = true;
+            }
+        }
         ui.separator();
         ui.label("Growth");
         ui.add(egui::Slider::new(&mut model.growth_rate, 0.0..=5.0).text("rate"));
@@ -278,6 +351,20 @@ fn update(app: &App, model: &mut Model) {
         if model.hit_max_vertices {
             ui.colored_label(egui::Color32::YELLOW, "⚠ Max vertices reached — no more splits");
         }
+        ui.separator();
+        ui.label("Anisotropy");
+        egui::ComboBox::from_id_salt("anisotropy_axis")
+            .selected_text(match model.anisotropy_axis {
+                0 => "X",
+                1 => "Y",
+                _ => "Z",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut model.anisotropy_axis, 0, "X");
+                ui.selectable_value(&mut model.anisotropy_axis, 1, "Y");
+                ui.selectable_value(&mut model.anisotropy_axis, 2, "Z");
+            });
+        ui.add(egui::Slider::new(&mut model.anisotropy_strength, 0.0..=1.0).text("strength"));
         ui.separator();
         ui.label("Physics");
         ui.add(egui::Slider::new(&mut model.compliance, 0.0..=1000.0).text("spring compliance α̃").logarithmic(true));
@@ -299,11 +386,13 @@ fn update(app: &App, model: &mut Model) {
         ui.label("R — Randomize params & reset");
         ui.label("T — Reset mesh (keep params)");
         ui.label("S — Save screenshot");
+        ui.label("E — Export mesh as STL");
         ui.label("M — Toggle render mode");
         ui.label("W — Toggle wireframe");
         ui.label("Drag — Rotate camera");
         ui.label("Scroll — Zoom");
     });
+    model.egui_owns_pointer = ctx.wants_pointer_input() || ctx.is_pointer_over_area();
     drop(egui_ctx);
 
     if kernel_changed {
@@ -388,6 +477,18 @@ fn update(app: &App, model: &mut Model) {
         (ox, oy, oz, nbx, nby, nbz)
     };
 
+    // Grow-at-dot drives the state field with a heat equation rather than the
+    // Lenia ring kernel. It reuses the Chebyshev pass purely to compute the
+    // 1-ring neighbour average W(state): order 2 with coeffs (c0=0, c1=1) gives
+    // result = W(state), which the growth shader reads as the diffusion term.
+    let (eff_cheb_order, eff_cheb_coeffs) = if model.growth_mode == GrowthMode::GrowAtDot {
+        let mut c = [0.0f32; 20];
+        c[1] = 1.0;
+        (2usize, c)
+    } else {
+        (model.cheb_order, model.cheb_coeffs)
+    };
+
     let gpu_params = GpuSimParams {
         num_vertices: mesh.next_vertex as u32,
         num_half_edges: mesh.next_half_edge as u32,
@@ -406,7 +507,7 @@ fn update(app: &App, model: &mut Model) {
         num_bins_z,
         growth_mu: model.growth_mu,
         growth_sigma: model.growth_sigma,
-        cheb_order: model.cheb_order as u32,
+        cheb_order: eff_cheb_order as u32,
         state_dt: model.state_dt,
         damping: model.damping,
         growth_rate: model.growth_rate,
@@ -419,6 +520,10 @@ fn update(app: &App, model: &mut Model) {
         // free vertices from sagging below that plane.
         floor_enabled: if model.start_shape == StartShape::Hemisphere { 1.0 } else { 0.0 },
         floor_z: 0.0,
+        anisotropy_axis: model.anisotropy_axis,
+        anisotropy_strength: model.anisotropy_strength,
+        dot_diffusion: model.dot_diffusion,
+        dot_decay: model.dot_decay,
     };
 
     // GPU dispatch: physics + state evolution
@@ -433,8 +538,8 @@ fn update(app: &App, model: &mut Model) {
             gpu,
             &model.mesh,
             &gpu_params,
-            model.cheb_order,
-            &model.cheb_coeffs,
+            eff_cheb_order,
+            &eff_cheb_coeffs,
         );
     }
 
@@ -447,7 +552,7 @@ fn update(app: &App, model: &mut Model) {
     // bbox — get_bin_info clamps out-of-range vertices into edge cells — so a
     // grid that lags up to 10 frames stays correct, just slightly coarser at
     // the boundary during fast growth.
-    if needs_topology_ops || model.frame <= 1 {
+    if needs_topology_ops {
         let window = app.window(model.window);
         let device = window.device();
         let gpu = model.gpu.as_ref().unwrap();
@@ -464,7 +569,7 @@ fn update(app: &App, model: &mut Model) {
             model.cached_scale = 8.0 / max_radius.max(1.0);
         }
     }
-    if needs_topology_ops || model.frame <= 1 {
+    if needs_topology_ops {
         let window = app.window(model.window);
         let device = window.device();
         let queue = window.queue();
@@ -524,10 +629,45 @@ fn update(app: &App, model: &mut Model) {
     }
 }
 
+// Read the current vertex positions back from the GPU and write a binary STL
+// next to the executable. The readback ensures we export the grown shape, not
+// the stale CPU-side seed positions.
+fn export_mesh_stl(app: &App, model: &mut Model) {
+    let window = app.window(model.window);
+    let device = window.device();
+    let queue = window.queue();
+    let Some(gpu) = model.gpu.as_mut() else {
+        eprintln!("STL export: GPU not initialized yet");
+        return;
+    };
+    // Heap-only clone to avoid a large stack allocation from Arc::make_mut.
+    let mesh: &mut HalfEdgeMesh = match Arc::get_mut(&mut model.mesh) {
+        Some(m) => m,
+        None => {
+            model.mesh = Arc::from(model.mesh.clone_boxed());
+            Arc::get_mut(&mut model.mesh).unwrap()
+        }
+    };
+    readback_from_gpu(&device, &queue, gpu, mesh);
+
+    let path = std::path::PathBuf::from(format!(
+        "{}_frame{}.stl",
+        app.exe_name().unwrap_or_else(|_| "growth".to_string()),
+        model.frame
+    ));
+    match mesh.export_stl(&path) {
+        Ok(n) => println!("STL export: wrote {} triangles to {}", n, path.display()),
+        Err(e) => eprintln!("STL export failed: {e}"),
+    }
+}
+
 fn key_pressed(app: &App, model: &mut Model, key: KeyCode) {
     if key == KeyCode::KeyS {
         app.window(model.window)
             .save_screenshot(app.exe_name().unwrap() + ".png");
+    }
+    if key == KeyCode::KeyE {
+        export_mesh_stl(app, model);
     }
     if key == KeyCode::KeyM {
         model.render_mode = (model.render_mode + 1) % 2;
@@ -563,7 +703,7 @@ fn key_pressed(app: &App, model: &mut Model, key: KeyCode) {
 }
 
 fn mouse_pressed(_app: &App, model: &mut Model, button: MouseButton) {
-    if button == MouseButton::Left {
+    if button == MouseButton::Left && !model.egui_owns_pointer {
         model.dragging = true;
     }
 }

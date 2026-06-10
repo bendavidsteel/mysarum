@@ -26,7 +26,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     let centered = vec3<f32>(
         (pos.x - uniforms.center.x) * uniforms.center.w,
         (pos.y - uniforms.center.y) * uniforms.center.w,
-        pos.z * uniforms.center.w,
+        (pos.z - uniforms.center.z) * uniforms.center.w,
     );
 
     var out: VertexOutput;

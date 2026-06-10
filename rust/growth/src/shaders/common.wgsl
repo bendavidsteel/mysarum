@@ -27,7 +27,8 @@ struct SimParams {
     // (springs → bending → collision) don't overshoot each other. ~0.5-0.8 is safe.
     relaxation: f32,
     // State rule: 0 = Lenia cellular automata, 1 = phototropism
-    // (state = vertex normal · overhead light direction).
+    // (state = vertex normal · overhead light direction), 2 = grow-at-dot
+    // (heat-equation diffusion of a growth potential from fixed source vertices).
     growth_mode: u32,
     // Per-frame seed mixed into the growth RNG (see growth.wgsl).
     frame_seed: u32,
@@ -35,6 +36,18 @@ struct SimParams {
     // z == floor_z (used by the hemisphere's flat bottom cap).
     floor_enabled: f32,
     floor_z: f32,
+    // Anisotropic growth: preferred axis (0 = X, 1 = Y, 2 = Z) and how strongly
+    // it is favoured. At strength 0 growth is isotropic (every edge grows
+    // equally); at strength 1 edges parallel to the axis grow fully and edges
+    // perpendicular to it not at all. See the differential growth in growth.wgsl.
+    anisotropy_axis: u32,
+    anisotropy_strength: f32,
+    // Grow-at-dot heat equation: g += dot_diffusion * laplacian(g) - dot_decay * g
+    // (direct per-step rates). dot_diffusion sets how fast the potential spreads;
+    // dot_decay sets the falloff radius ~sqrt(dot_diffusion / dot_decay) edges
+    // (larger decay = sharper/smaller growth dot; decay 0 fills the whole mesh).
+    dot_diffusion: f32,
+    dot_decay: f32,
 }
 
 const EPSILON: f32 = 1e-6;

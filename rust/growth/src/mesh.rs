@@ -21,10 +21,14 @@ pub(crate) struct HalfEdgeMesh {
     pub(crate) vertex_half_edge: [i32; MAX_VERTICES],
     pub(crate) vertex_pos: [Vec3; MAX_VERTICES],
     pub(crate) vertex_state: [f32; MAX_VERTICES],
-    pub(crate) vertex_u: [f32; MAX_VERTICES],
     // Pinned vertices are excluded from physics (positions never move) and
     // from intrinsic edge growth. Uploaded to the GPU as vertex_pos.w == 0.0.
     pub(crate) vertex_pinned: [bool; MAX_VERTICES],
+    // Grow-at-dot mode: 1.0 marks a fixed "source" vertex whose growth potential
+    // (vertex_state) is held at 1.0 every frame; the potential diffuses outward
+    // via a heat equation. New vertices from splits default to 0.0 (no natural
+    // growth), so the growth region stays anchored to the original dot.
+    pub(crate) vertex_source: [f32; MAX_VERTICES],
 
     // Half-edge arrays
     pub(crate) half_edge_idx: [i32; MAX_HALF_EDGES],
@@ -222,107 +226,6 @@ impl HalfEdgeMesh {
         }
     }
 
-    // ── Add external triangle at boundary edge a→b ─────────────────────────
-
-    pub(crate) fn add_external_triangle(&mut self, vertex_a: usize, vertex_b: usize) -> bool {
-        let half_edge_ab = match self.get_vertex_half_edge(vertex_a, vertex_b) {
-            Some(he) => he,
-            None => return false,
-        };
-        // must be a boundary half-edge (face == -1)
-        if self.half_edge_face[half_edge_ab] != -1 {
-            return false;
-        }
-
-        let new_face = match self.alloc_face() {
-            Some(f) => f,
-            None => return false,
-        };
-        let vertex_c = match self.alloc_vertex() {
-            Some(v) => v,
-            None => return false,
-        };
-        let half_edge_bc = match self.alloc_half_edge() {
-            Some(h) => h,
-            None => return false,
-        };
-        let half_edge_ca = match self.alloc_half_edge() {
-            Some(h) => h,
-            None => return false,
-        };
-        let half_edge_cb = match self.alloc_half_edge() {
-            Some(h) => h,
-            None => return false,
-        };
-        let half_edge_ac = match self.alloc_half_edge() {
-            Some(h) => h,
-            None => return false,
-        };
-
-        // New vertex at midpoint with z-perturbation to allow 3D buckling
-        let mut new_pos = (self.vertex_pos[vertex_a] + self.vertex_pos[vertex_b]) * 0.5;
-        let edge_len = (self.vertex_pos[vertex_b] - self.vertex_pos[vertex_a]).length();
-        new_pos.z += (random_f32() - 0.5) * edge_len * 0.05;
-        self.vertex_pos[vertex_c] = new_pos;
-        self.vertex_state[vertex_c] = (self.vertex_state[vertex_a] + self.vertex_state[vertex_b]) * 0.5;
-        self.vertex_pinned[vertex_c] = self.vertex_pinned[vertex_a] && self.vertex_pinned[vertex_b];
-        self.vertex_half_edge[vertex_c] = half_edge_ca as i32;
-
-        // Face
-        self.face_half_edge[new_face] = half_edge_ab as i32;
-
-        // Existing connectivity
-        let half_edge_b_next = self.half_edge_next[half_edge_ab] as usize;
-        let half_edge_a_prev = self.half_edge_prev[half_edge_ab] as usize;
-
-        // half_edge_ab now belongs to the new face
-        self.half_edge_face[half_edge_ab] = new_face as i32;
-
-        // Set half-edge faces
-        self.half_edge_face[half_edge_bc] = new_face as i32;
-        self.half_edge_face[half_edge_ca] = new_face as i32;
-        self.half_edge_face[half_edge_cb] = -1;
-        self.half_edge_face[half_edge_ac] = -1;
-
-        // Destinations
-        self.half_edge_dest[half_edge_bc] = vertex_c as i32;
-        self.half_edge_dest[half_edge_ca] = vertex_a as i32;
-        self.half_edge_dest[half_edge_cb] = vertex_b as i32;
-        self.half_edge_dest[half_edge_ac] = vertex_c as i32;
-
-        // Twins
-        self.half_edge_twin[half_edge_bc] = half_edge_cb as i32;
-        self.half_edge_twin[half_edge_cb] = half_edge_bc as i32;
-        self.half_edge_twin[half_edge_ca] = half_edge_ac as i32;
-        self.half_edge_twin[half_edge_ac] = half_edge_ca as i32;
-
-        // Next pointers
-        self.half_edge_next[half_edge_ab] = half_edge_bc as i32;
-        self.half_edge_next[half_edge_bc] = half_edge_ca as i32;
-        self.half_edge_next[half_edge_ca] = half_edge_ab as i32;
-        self.half_edge_next[half_edge_cb] = half_edge_b_next as i32;
-        self.half_edge_next[half_edge_ac] = half_edge_cb as i32;
-        self.half_edge_next[half_edge_a_prev] = half_edge_ac as i32;
-
-        // Prev pointers
-        self.half_edge_prev[half_edge_ab] = half_edge_ca as i32;
-        self.half_edge_prev[half_edge_bc] = half_edge_ab as i32;
-        self.half_edge_prev[half_edge_ca] = half_edge_bc as i32;
-        self.half_edge_prev[half_edge_cb] = half_edge_ac as i32;
-        self.half_edge_prev[half_edge_ac] = half_edge_a_prev as i32;
-        self.half_edge_prev[half_edge_b_next] = half_edge_cb as i32;
-
-        // Intrinsic lengths: edge AB unchanged, new edges BC/CA use extrinsic distances
-        let l_bc = (self.vertex_pos[vertex_b] - self.vertex_pos[vertex_c]).length();
-        let l_ca = (self.vertex_pos[vertex_c] - self.vertex_pos[vertex_a]).length();
-        self.half_edge_intrinsic_len[half_edge_bc] = l_bc;
-        self.half_edge_intrinsic_len[half_edge_cb] = l_bc;
-        self.half_edge_intrinsic_len[half_edge_ca] = l_ca;
-        self.half_edge_intrinsic_len[half_edge_ac] = l_ca;
-
-        true
-    }
-
     // ── Add internal edge triangle (edge a→b internal, twin on boundary) ───
 
     pub(crate) fn add_internal_edge_triangle(&mut self, vertex_a: usize, vertex_b: usize) -> bool {
@@ -392,6 +295,9 @@ impl HalfEdgeMesh {
         self.vertex_pos[vertex_d] = new_pos;
         self.vertex_state[vertex_d] = (self.vertex_state[vertex_a] + self.vertex_state[vertex_b]) * 0.5;
         self.vertex_pinned[vertex_d] = self.vertex_pinned[vertex_a] && self.vertex_pinned[vertex_b];
+        // Grow-at-dot: source only if both endpoints are sources (AND).
+        self.vertex_source[vertex_d] =
+            if self.vertex_source[vertex_a] > 0.5 && self.vertex_source[vertex_b] > 0.5 { 1.0 } else { 0.0 };
         self.vertex_half_edge[vertex_d] = half_edge_db as i32;
 
         // Faces
@@ -551,6 +457,9 @@ impl HalfEdgeMesh {
         self.vertex_pos[vertex_e] = new_pos;
         self.vertex_state[vertex_e] = (self.vertex_state[vertex_a] + self.vertex_state[vertex_b]) * 0.5;
         self.vertex_pinned[vertex_e] = self.vertex_pinned[vertex_a] && self.vertex_pinned[vertex_b];
+        // Grow-at-dot: source only if both endpoints are sources (AND).
+        self.vertex_source[vertex_e] =
+            if self.vertex_source[vertex_a] > 0.5 && self.vertex_source[vertex_b] > 0.5 { 1.0 } else { 0.0 };
         self.vertex_half_edge[vertex_e] = half_edge_eb as i32;
 
         // Faces (must update repurposed faces too, not just new ones)
@@ -824,6 +733,83 @@ impl HalfEdgeMesh {
             }
         }
     }
+
+    // ── Binary STL export ──────────────────────────────────────────────────
+    //
+    // Writes every active triangle to a binary STL file using the current 3D
+    // embedding (`vertex_pos`). Triangle winding mirrors `rebuild_render_indices`
+    // (dest of the face's three half-edges, CCW), and per-face normals are
+    // computed from the geometry so the orientation matches the winding.
+    //
+    // NOTE: the grown mesh is an open surface (a 2-manifold with boundary), so
+    // the exported STL is NOT watertight. To 3D print it, give it thickness
+    // (e.g. Blender's Solidify modifier) or slice it in vase mode. Coordinates
+    // are raw simulation units — scale to physical size in the slicer.
+    pub(crate) fn export_stl(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        use std::io::Write;
+
+        // Collect active triangles as (v0, v1, v2) vertex indices.
+        let mut tris: Vec<[usize; 3]> = Vec::new();
+        for f in 0..self.next_face {
+            if self.face_idx[f] < 0 {
+                continue;
+            }
+            let he0 = self.face_half_edge[f];
+            if he0 < 0 {
+                continue;
+            }
+            let he0 = he0 as usize;
+            let he1 = self.half_edge_next[he0];
+            if he1 < 0 {
+                continue;
+            }
+            let he1 = he1 as usize;
+            let he2 = self.half_edge_next[he1];
+            if he2 < 0 {
+                continue;
+            }
+            let he2 = he2 as usize;
+
+            let v0 = self.half_edge_dest[he0];
+            let v1 = self.half_edge_dest[he1];
+            let v2 = self.half_edge_dest[he2];
+            if v0 < 0 || v1 < 0 || v2 < 0 {
+                continue;
+            }
+            let (v0, v1, v2) = (v0 as usize, v1 as usize, v2 as usize);
+            if self.vertex_idx[v0] < 0 || self.vertex_idx[v1] < 0 || self.vertex_idx[v2] < 0 {
+                continue;
+            }
+            tris.push([v0, v1, v2]);
+        }
+
+        // Binary STL: 80-byte header + u32 triangle count + 50 bytes per triangle.
+        let mut buf: Vec<u8> = Vec::with_capacity(84 + tris.len() * 50);
+        buf.extend_from_slice(&[0u8; 80]); // header (must not begin with "solid")
+        buf.extend_from_slice(&(tris.len() as u32).to_le_bytes());
+
+        let write_vec3 = |buf: &mut Vec<u8>, v: Vec3| {
+            buf.extend_from_slice(&v.x.to_le_bytes());
+            buf.extend_from_slice(&v.y.to_le_bytes());
+            buf.extend_from_slice(&v.z.to_le_bytes());
+        };
+
+        for [v0, v1, v2] in &tris {
+            let p0 = self.vertex_pos[*v0];
+            let p1 = self.vertex_pos[*v1];
+            let p2 = self.vertex_pos[*v2];
+            let normal = (p1 - p0).cross(p2 - p0).normalize_or_zero();
+            write_vec3(&mut buf, normal);
+            write_vec3(&mut buf, p0);
+            write_vec3(&mut buf, p1);
+            write_vec3(&mut buf, p2);
+            buf.extend_from_slice(&0u16.to_le_bytes()); // attribute byte count
+        }
+
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(&buf)?;
+        Ok(tris.len())
+    }
 }
 
 // ── Intrinsic geometry helpers ─────────────────────────────────────────────────
@@ -878,12 +864,6 @@ fn intrinsic_flip_length(lab: f32, lca: f32, lbc: f32, lad: f32, ldb: f32) -> f3
     let diffx = cx - dx;
     let diffy = cy - dy;
     (diffx * diffx + diffy * diffy).sqrt()
-}
-
-// ── Helper: intrinsic edge length for a half-edge ─────────────────────────────
-
-fn intrinsic_len(mesh: &HalfEdgeMesh, he: usize) -> f32 {
-    mesh.half_edge_intrinsic_len[he]
 }
 
 // ── Helper: is this half-edge the longest (intrinsic) in its face? ────────────

@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use bytemuck::{Pod, Zeroable};
 use nannou::prelude::*;
 
@@ -58,6 +60,15 @@ pub(crate) struct GpuSimParams {
     // z >= floor_z (used by the hemisphere's flat bottom cap).
     pub(crate) floor_enabled: f32,
     pub(crate) floor_z: f32,
+    // Anisotropic growth: preferred axis (0 = X, 1 = Y, 2 = Z) and how strongly
+    // it is favoured (0 = isotropic, 1 = grow only along the axis). The growth
+    // shader scales each edge's growth by its alignment with this axis.
+    pub(crate) anisotropy_axis: u32,
+    pub(crate) anisotropy_strength: f32,
+    // Grow-at-dot heat equation: how fast the growth potential diffuses out from
+    // source vertices, and how fast it decays (sets the falloff radius of the dot).
+    pub(crate) dot_diffusion: f32,
+    pub(crate) dot_decay: f32,
 }
 
 #[repr(C)]
@@ -91,7 +102,8 @@ pub(crate) struct GpuCompute {
 
     // State evolution buffers
     pub(crate) vertex_state_buf: wgpu::Buffer,
-    vertex_u_buf: wgpu::Buffer,
+    // Grow-at-dot source flags (1.0 = fixed growth source, 0.0 = passive)
+    vertex_source_buf: wgpu::Buffer,
 
     // Intrinsic edge length buffer (per half-edge)
     he_intrinsic_len_buf: wgpu::Buffer,
@@ -99,7 +111,6 @@ pub(crate) struct GpuCompute {
     cheb_b_buf: wgpu::Buffer,
     cheb_c_buf: wgpu::Buffer,
     cheb_result_buf: wgpu::Buffer,
-    cheb_coeff_buf: wgpu::Buffer,  // single f32 uniform
     cheb_c0_buf: wgpu::Buffer,    // uniform for init
     cheb_c1_buf: wgpu::Buffer,    // uniform for init
 
@@ -175,10 +186,16 @@ pub(crate) struct GpuCompute {
     // Pre-created chebyshev coefficient buffers (one per possible order)
     cheb_coeff_bufs: Vec<wgpu::Buffer>,
 
-    // Reusable staging buffers
-    pos_staging: Vec<[f32; 4]>,
-    he_staging: Vec<[i32; 4]>,
-    index_staging: Vec<u32>,
+    // Reusable CPU staging buffers, behind Arc so cloning GpuCompute (the whole
+    // Model is cloned into the Bevy render world every frame) shares them
+    // instead of deep-copying ~4MB of Vecs. Only update() touches them.
+    staging: Arc<Mutex<StagingBuffers>>,
+}
+
+pub(crate) struct StagingBuffers {
+    pos: Vec<[f32; 4]>,
+    he: Vec<[i32; 4]>,
+    index: Vec<u32>,
 }
 
 pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> GpuCompute {
@@ -225,8 +242,8 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
     let he_intrinsic_len_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("he_intrinsic_len"), size: (MAX_HALF_EDGES * 4) as u64, usage: storage_rw, mapped_at_creation: false,
     });
-    let vertex_u_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("vertex_u"), size: state_buf_size, usage: storage_rw, mapped_at_creation: false,
+    let vertex_source_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vertex_source"), size: state_buf_size, usage: storage_r, mapped_at_creation: false,
     });
     let cheb_a_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("cheb_a"), size: state_buf_size, usage: storage_rw, mapped_at_creation: false,
@@ -239,9 +256,6 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
     });
     let cheb_result_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("cheb_result"), size: state_buf_size, usage: storage_rw, mapped_at_creation: false,
-    });
-    let cheb_coeff_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("cheb_coeff"), size: 4, usage: uniform, mapped_at_creation: false,
     });
     let cheb_c0_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("cheb_c0"), size: 4, usage: uniform, mapped_at_creation: false,
@@ -445,15 +459,15 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
         .uniform_buffer(cs, false)  // coeff
         .build(device);
 
-    // growth: group0=state(RW)+u(RW)+result(R)+pos(R)+intrinsic_len(RW)+he_packed(R)+vertex_he(R), group1=params(U)
+    // growth: group0=state(RW)+result(R)+pos(R)+intrinsic_len(RW)+he_packed(R)+vertex_he(R)+source(R), group1=params(U)
     let growth_data_layout = wgpu::BindGroupLayoutBuilder::new()
         .storage_buffer(cs, false, false)  // vertex_state
-        .storage_buffer(cs, false, false)  // vertex_u
         .storage_buffer(cs, false, true)   // result
         .storage_buffer(cs, false, true)   // vertex_pos (active check)
         .storage_buffer(cs, false, false)  // he_intrinsic_len
         .storage_buffer(cs, false, true)   // he_packed
         .storage_buffer(cs, false, true)   // vertex_he
+        .storage_buffer(cs, false, true)   // vertex_source
         .build(device);
 
     // bbox: group0=pos(R)+bbox_atomic(RW), group1=params(U)
@@ -711,12 +725,12 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
     // growth bind groups
     let growth_data_bg = wgpu::BindGroupBuilder::new()
         .buffer_bytes(&vertex_state_buf, 0, None)
-        .buffer_bytes(&vertex_u_buf, 0, None)
         .buffer_bytes(&cheb_result_buf, 0, None)
         .buffer_bytes(&vertex_pos_buf, 0, None)
         .buffer_bytes(&he_intrinsic_len_buf, 0, None)
         .buffer_bytes(&he_packed_buf, 0, None)
         .buffer_bytes(&vertex_he_buf, 0, None)
+        .buffer_bytes(&vertex_source_buf, 0, None)
         .build(device, &growth_data_layout);
     let growth_params_bg = wgpu::BindGroupBuilder::new()
         .buffer_bytes(&sim_params_buf, 0, None)
@@ -735,10 +749,10 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
         vertex_pos_buf, vertex_force_buf,
         bin_size_buf, bin_offset_buf, bin_offset_tmp_buf, sorted_idx_buf,
         he_packed_buf, vertex_he_buf,
-        vertex_state_buf, vertex_u_buf,
+        vertex_state_buf, vertex_source_buf,
         he_intrinsic_len_buf,
         cheb_a_buf, cheb_b_buf, cheb_c_buf, cheb_result_buf,
-        cheb_coeff_buf, cheb_c0_buf, cheb_c1_buf,
+        cheb_c0_buf, cheb_c1_buf,
         sim_params_buf,
         pos_readback_buf, state_readback_buf, intrinsic_len_readback_buf,
         bbox_atomic_buf, bbox_readback_buf,
@@ -765,13 +779,17 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
         topology_dirty: true,
         prefix_sum_step_bufs,
         cheb_coeff_bufs,
-        pos_staging: vec![[0.0f32; 4]; MAX_VERTICES],
-        he_staging: vec![[0i32; 4]; MAX_HALF_EDGES],
-        index_staging: Vec::with_capacity(MAX_FACES * 3),
+        staging: Arc::new(Mutex::new(StagingBuffers {
+            pos: vec![[0.0f32; 4]; MAX_VERTICES],
+            he: vec![[0i32; 4]; MAX_HALF_EDGES],
+            index: Vec::with_capacity(MAX_FACES * 3),
+        })),
     }
 }
 
-pub(crate) fn upload_mesh_to_gpu(queue: &wgpu::Queue, gpu: &mut GpuCompute, mesh: &HalfEdgeMesh) {
+pub(crate) fn upload_mesh_to_gpu(queue: &wgpu::Queue, gpu: &GpuCompute, mesh: &HalfEdgeMesh) {
+    let mut staging = gpu.staging.lock().unwrap();
+
     // Upload vertex positions (vec4: xyz + flag in w) — reuse staging buffer.
     // w encodes vertex status: 1.0 = active, 0.0 = pinned (active but immovable,
     // skipped by physics and growth), -1.0 = inactive.
@@ -784,29 +802,31 @@ pub(crate) fn upload_mesh_to_gpu(queue: &wgpu::Queue, gpu: &mut GpuCompute, mesh
         } else {
             1.0
         };
-        gpu.pos_staging[v] = [mesh.vertex_pos[v].x, mesh.vertex_pos[v].y, mesh.vertex_pos[v].z, active];
+        staging.pos[v] = [mesh.vertex_pos[v].x, mesh.vertex_pos[v].y, mesh.vertex_pos[v].z, active];
     }
     // Zero out remaining entries up to MAX_VERTICES is unnecessary — GPU uses num_vertices param
-    queue.write_buffer(&gpu.vertex_pos_buf, 0, bytemuck::cast_slice(&gpu.pos_staging[..n]));
+    queue.write_buffer(&gpu.vertex_pos_buf, 0, bytemuck::cast_slice(&staging.pos[..n]));
 
     // Upload vertex states (only active range)
     queue.write_buffer(&gpu.vertex_state_buf, 0, bytemuck::cast_slice(&mesh.vertex_state[..n]));
+
+    // Upload grow-at-dot source flags (only active range)
+    queue.write_buffer(&gpu.vertex_source_buf, 0, bytemuck::cast_slice(&mesh.vertex_source[..n]));
 
     // Upload intrinsic edge lengths (per half-edge)
     let nhe = mesh.next_half_edge;
     queue.write_buffer(&gpu.he_intrinsic_len_buf, 0, bytemuck::cast_slice(&mesh.half_edge_intrinsic_len[..nhe]));
 
     // Upload packed half-edge topology (vec4<i32>: dest, twin, next, face) — reuse staging buffer
-    let nhe = mesh.next_half_edge;
     for he in 0..nhe {
-        gpu.he_staging[he] = [
+        staging.he[he] = [
             mesh.half_edge_dest[he],
             mesh.half_edge_twin[he],
             mesh.half_edge_next[he],
             mesh.half_edge_face[he],
         ];
     }
-    queue.write_buffer(&gpu.he_packed_buf, 0, bytemuck::cast_slice(&gpu.he_staging[..nhe]));
+    queue.write_buffer(&gpu.he_packed_buf, 0, bytemuck::cast_slice(&staging.he[..nhe]));
 
     // Upload vertex half-edge indices (only active range)
     queue.write_buffer(&gpu.vertex_he_buf, 0, bytemuck::cast_slice(&mesh.vertex_half_edge[..n]));
@@ -899,7 +919,8 @@ pub(crate) fn readback_from_gpu(device: &wgpu::Device, queue: &wgpu::Queue, gpu:
 }
 
 pub(crate) fn rebuild_render_indices(queue: &wgpu::Queue, gpu: &mut GpuCompute, mesh: &HalfEdgeMesh) {
-    gpu.index_staging.clear();
+    let mut staging = gpu.staging.lock().unwrap();
+    staging.index.clear();
     for f in 0..mesh.next_face {
         if mesh.face_idx[f] < 0 { continue; }
         let he0 = mesh.face_half_edge[f];
@@ -922,12 +943,12 @@ pub(crate) fn rebuild_render_indices(queue: &wgpu::Queue, gpu: &mut GpuCompute, 
         {
             continue;
         }
-        gpu.index_staging.push(v0 as u32);
-        gpu.index_staging.push(v1 as u32);
-        gpu.index_staging.push(v2 as u32);
+        staging.index.push(v0 as u32);
+        staging.index.push(v1 as u32);
+        staging.index.push(v2 as u32);
     }
-    gpu.num_render_tris = (gpu.index_staging.len() / 3) as u32;
-    queue.write_buffer(&gpu.render_index_buf, 0, bytemuck::cast_slice(&gpu.index_staging));
+    gpu.num_render_tris = (staging.index.len() / 3) as u32;
+    queue.write_buffer(&gpu.render_index_buf, 0, bytemuck::cast_slice(&staging.index));
 }
 
 pub(crate) fn update_render_uniforms(

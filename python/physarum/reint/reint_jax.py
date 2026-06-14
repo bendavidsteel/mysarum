@@ -819,6 +819,8 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                         volume_fill_min=0.05, volume_fill_max=0.35,
                         edt_median_min=1.5, edt_reward_tau=2.5,
                         sa_reward_tau=0.25,
+                        edt_thin_floor=2.0, thin_free=0.18,
+                        thin_penalty_scale=0.12, thin_frac_max=0.30,
                         top_clear_voxels=1,
                         bottom_fill_min=0.1, bottom_fill_max=0.8,
                         cylinder_penalty_scale=0.003,
@@ -839,6 +841,8 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
       • volume_fill ∈ (volume_fill_min, volume_fill_max) — neither specks nor a
         near-solid block (volume_fill = occupied voxels / total grid voxels);
       • edt_median > edt_median_min — typical wall thick enough to print;
+      • thin_frac ≤ thin_frac_max — not mostly fragile sub-floor material
+        (thin_frac = share of voxels with half-thickness < edt_thin_floor);
       • the top `top_clear_voxels` z-slices and all four side walls are empty,
         so the object touches no ceiling or wall of the print volume;
       • the bottom face (z=0) footprint fraction ∈ (bottom_fill_min,
@@ -846,8 +850,11 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
     Array axis 0 is z (spawn base at z=0); axes 1,2 are the walls. Among
     printable rows the "best" maximizes fitness = tanh(sa_to_vol /
     sa_reward_tau) × cyl_mult × overhang_mult × tanh(edt_median /
-    edt_reward_tau) — diminishing-returns rewards for veininess and thickness
-    (both saturate, so maxing either out doesn't dominate); overhang_mult
+    edt_reward_tau) × thin_mult — diminishing-returns rewards for veininess and
+    thickness (both saturate, so maxing either out doesn't dominate); thin_mult
+    = exp(-(thin_frac - thin_free) / thin_penalty_scale) softly punishes shapes
+    whose surface area comes from fragile sub-floor material (slender spikes),
+    redirecting the veininess reward toward thick lobes/ridges; overhang_mult
     softly punishes
     self-support violations beyond overhang_free (45° cone); cyl_mult =
     exp(-penalty / cylinder_penalty_scale) softly punishes mass
@@ -897,6 +904,7 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                              bottom_frac=0.0, outside_frac=0.0, cyl_mult=1.0,
                              overhang_frac=0.0, overhang_mult=1.0,
                              edt_reward=0.0, sa_reward=0.0,
+                             thin_frac=0.0, thin_mult=1.0,
                              edt_min=0.0, edt_q01=0.0, edt_median=0.0,
                              opening_ratio=0.0, surface_area=0,
                              sa_to_vol=0.0, fitness=0.0, printable=False))
@@ -951,14 +959,27 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
         # to a point, but maxing it out (thin spiky shapes) isn't more
         # desirable, so saturate it with tanh.
         sa_reward = float(np.tanh(sa_to_vol / sa_reward_tau))
-        # Veininess × thickness rewards, scaled by the cylinder and overhang
-        # penalties. opening_ratio, volume_fill, and the edt_median floor are
-        # gates, not fitness terms.
-        fitness = sa_reward * cyl_mult * overhang_mult * edt_reward
+        # Thin-feature penalty: sa_to_vol alone is maximised by a crown of
+        # slender spikes (high surface per volume). Those spikes survive the
+        # min-feature opening (radius ~2-3 voxels, not sub-feature) so the
+        # opening gate misses them; what separates them from chunky lobes is the
+        # share of material below a printable half-thickness floor. thin_frac =
+        # fraction of voxels with EDT < edt_thin_floor (≈ feature < 2·floor·voxel
+        # mm thick). Penalise the excess past a small free allowance (every
+        # surface has a thin shell) so the search earns sa_to_vol via thick
+        # ridges/lobes rather than needles.
+        thin_frac = float((edt_in < edt_thin_floor).sum()) / vol
+        thin_mult = float(np.exp(-max(0.0, thin_frac - thin_free)
+                                 / thin_penalty_scale))
+        # Veininess × thickness rewards, scaled by the cylinder, overhang, and
+        # thin-feature penalties. opening_ratio, volume_fill, the edt_median
+        # floor, and thin_frac_max are gates, not fitness terms.
+        fitness = sa_reward * cyl_mult * overhang_mult * edt_reward * thin_mult
 
         printable = (opening_ratio >= opening_ratio_min
                      and volume_fill_min < volume_fill < volume_fill_max
                      and edt_med > edt_median_min
+                     and thin_frac <= thin_frac_max
                      and top_filled == 0
                      and wall_filled == 0
                      and bottom_fill_min < bottom_frac < bottom_fill_max)
@@ -975,6 +996,7 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                          overhang_mult=overhang_mult,
                          edt_reward=edt_reward,
                          sa_reward=sa_reward,
+                         thin_frac=thin_frac, thin_mult=thin_mult,
                          edt_min=edt_min, edt_q01=edt_q01, edt_median=edt_med,
                          opening_ratio=opening_ratio,
                          surface_area=surface_area,
@@ -1101,7 +1123,7 @@ def _bd_cell(bd, archive_shape, bd_ranges):
 _INFO_KEYS = ("sa_to_vol", "opening_ratio", "volume_fill", "edt_median",
               "bottom_frac", "top_filled", "wall_filled", "outside_frac",
               "cyl_mult", "overhang_frac", "overhang_mult", "edt_reward",
-              "sa_reward")
+              "sa_reward", "thin_frac", "thin_mult")
 
 
 def _candidate_from_trail(trail, r_min_voxels, step):
@@ -1226,21 +1248,11 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
     gif_screen = max(384, int(cfg.render_size) * 2)   # 4× the previous 96 px
     gif_n_steps = max(256, int(cfg.n_steps) * 2)       # 4× the previous 64
     for cell, e in archive.items():
-        d = dict(cell_edt=cell[0], cell_fill=cell[1],
-                 sa_to_vol=e["info"]["sa_to_vol"],
-                 opening_ratio=e["info"]["opening_ratio"],
-                 volume_fill=e["info"]["volume_fill"],
-                 edt_median=e["info"]["edt_median"],
-                 bottom_frac=e["info"]["bottom_frac"],
-                 top_filled=e["info"]["top_filled"],
-                 wall_filled=e["info"]["wall_filled"],
-                 outside_frac=e["info"]["outside_frac"],
-                 cyl_mult=e["info"]["cyl_mult"],
-                 overhang_frac=e["info"]["overhang_frac"],
-                 overhang_mult=e["info"]["overhang_mult"],
-                 edt_reward=e["info"]["edt_reward"],
-                 sa_reward=e["info"]["sa_reward"],
-                 fitness=e["fitness"], eval_idx=e["eval_idx"], step=e["step"])
+        d = dict(cell_edt=cell[0], cell_fill=cell[1])
+        # Log every printability metric the candidate carries, so the CSV stays
+        # in sync with _INFO_KEYS automatically (no hardcoded column list).
+        d.update({k: e["info"][k] for k in _INFO_KEYS})
+        d.update(fitness=e["fitness"], eval_idx=e["eval_idx"], step=e["step"])
         for f in PARAM_FIELDS:
             d[f] = getattr(e["params"], f)
         rows.append(d)
@@ -1386,6 +1398,10 @@ def run_3d(cfg: DictConfig, params: PhysarumParams, out_dir: Path):
             edt_median_min=float(pcfg.edt_median_min),
             edt_reward_tau=float(pcfg.edt_reward_tau),
             sa_reward_tau=float(pcfg.sa_reward_tau),
+            edt_thin_floor=float(pcfg.edt_thin_floor),
+            thin_free=float(pcfg.thin_free),
+            thin_penalty_scale=float(pcfg.thin_penalty_scale),
+            thin_frac_max=float(pcfg.thin_frac_max),
             top_clear_voxels=int(pcfg.top_clear_voxels),
             bottom_fill_min=float(pcfg.bottom_fill_min),
             bottom_fill_max=float(pcfg.bottom_fill_max),

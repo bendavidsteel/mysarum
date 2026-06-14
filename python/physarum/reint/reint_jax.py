@@ -188,31 +188,47 @@ def position_grid_3d(D, H, W):
     return jnp.stack([X, Y, Z], axis=-1)
 
 
-def _wrap_pad_2d(arr, halo=2):
-    return jnp.pad(arr, ((halo, halo), (halo, halo), (0, 0)), mode="wrap")
+# Non-periodic halo: pad with zeros instead of wrapping. The halo cells then
+# carry zero mass, so they contribute nothing to the SPH pressure sum — the
+# domain is a closed box, not a torus. (Mass that advects off a face is not
+# lost: reintegrate_* reflects it back via an edge-cell catchment extension.)
+def _pad_2d(arr, halo=2):
+    return jnp.pad(arr, ((halo, halo), (halo, halo), (0, 0)), mode="constant")
 
 
-def _wrap_pad_3d(arr, halo=2):
+def _pad_3d(arr, halo=2):
     return jnp.pad(arr,
                    ((halo, halo), (halo, halo), (halo, halo), (0, 0)),
-                   mode="wrap")
+                   mode="constant")
 
 
-def bilinear_sample(field, pos):
-    """Sample a (H,W,C) field at fractional (x,y) positions, periodic."""
+def bilinear_sample(field, pos, mode="wrap"):
+    """Sample a (H,W,C) field at fractional (x,y) positions.
+    mode='wrap' (periodic) or 'clamp' (zeros outside the domain)."""
     H, W = field.shape[:2]
-    x = jnp.mod(pos[..., 0], W)
-    y = jnp.mod(pos[..., 1], H)
+    x = pos[..., 0]; y = pos[..., 1]
+    if mode == "wrap":
+        x = jnp.mod(x, W); y = jnp.mod(y, H)
+        outside_mask = None
+    else:
+        outside_mask = ((x >= 0) & (x <= W - 1)
+                        & (y >= 0) & (y <= H - 1)).astype(field.dtype)
+        x = jnp.clip(x, 0.0, W - 1); y = jnp.clip(y, 0.0, H - 1)
     x0 = jnp.floor(x).astype(jnp.int32)
     y0 = jnp.floor(y).astype(jnp.int32)
-    x1 = (x0 + 1) % W
-    y1 = (y0 + 1) % H
+    if mode == "wrap":
+        x1 = (x0 + 1) % W; y1 = (y0 + 1) % H
+    else:
+        x1 = jnp.minimum(x0 + 1, W - 1); y1 = jnp.minimum(y0 + 1, H - 1)
     fx = (x - jnp.floor(x))[..., None]
     fy = (y - jnp.floor(y))[..., None]
     f00 = field[y0, x0]; f01 = field[y0, x1]
     f10 = field[y1, x0]; f11 = field[y1, x1]
-    return (1 - fx) * (1 - fy) * f00 + fx * (1 - fy) * f01 \
-         + (1 - fx) * fy * f10 + fx * fy * f11
+    out = (1 - fx) * (1 - fy) * f00 + fx * (1 - fy) * f01 \
+        + (1 - fx) * fy * f10 + fx * fy * f11
+    if outside_mask is not None:
+        out = out * outside_mask[..., None]
+    return out
 
 
 def trilinear_sample(field, pos, mode="wrap"):
@@ -324,11 +340,10 @@ def reintegrate_2d(state: State2D) -> State2D:
     X, V, M = state
     H, W = X.shape[:2]
     pos = position_grid_2d(H, W)
-    R = jnp.array([W, H], dtype=jnp.float32)
 
-    Xp = _wrap_pad_2d(X)
-    Vp = _wrap_pad_2d(V)
-    Mp = _wrap_pad_2d(M)
+    Xp = _pad_2d(X)
+    Vp = _pad_2d(V)
+    Mp = _pad_2d(M)
 
     M_acc = jnp.zeros((H, W), dtype=jnp.float32)
     X_acc = jnp.zeros((H, W, 2), dtype=jnp.float32)
@@ -336,17 +351,28 @@ def reintegrate_2d(state: State2D) -> State2D:
     half_p = DIF * 0.5
     inv_K2 = 1.0 / (DIF * DIF)
 
+    # Reflective (rebound) boundary: a cell on a domain face extends its
+    # catchment one cell-width past that face, folding back the mass whose
+    # advected distribution box would otherwise spill out and be lost (method of
+    # images). Total mass is conserved exactly while half_p < 1 (DIF/2 = 0.65),
+    # since only the adjacent image layer is ever reachable. lo/hi_ext are
+    # per-axis flags (1.0 on the low / high face, else 0.0) — loop-invariant.
+    R_minus1 = jnp.array([W - 1, H - 1], dtype=jnp.float32)
+    lo_ext = (pos == 0.0).astype(jnp.float32)
+    hi_ext = (pos == R_minus1).astype(jnp.float32)
+
     for dy in range(5):
         for dx in range(5):
             Xn = Xp[dy:dy+H, dx:dx+W]
             Vn = Vp[dy:dy+H, dx:dx+W]
             Mn = Mp[dy:dy+H, dx:dx+W]
 
+            # Non-periodic: direct displacement, no minimal-image wrap. Halo
+            # cells carry zero mass so they drop out of the gather.
             rel = (Xn + Vn * DT) - pos
-            rel = rel - jnp.round(rel / R) * R
 
-            inter_lo = jnp.maximum(-0.5, rel - half_p)
-            inter_hi = jnp.minimum(0.5, rel + half_p)
+            inter_lo = jnp.maximum(-0.5 - lo_ext, rel - half_p)
+            inter_hi = jnp.minimum(0.5 + hi_ext, rel + half_p)
             size = jnp.maximum(inter_hi - inter_lo, 0.0)
             center_rel = 0.5 * (inter_lo + inter_hi)
             frac = size[..., 0] * size[..., 1] * inv_K2
@@ -378,16 +404,15 @@ def simulate_2d(state: State2D, params: PhysarumParams) -> State2D:
     ra = param_value(params.ra_base, params.ra_power, params.ra_scale, sv)
     md = param_value(params.md_base, params.md_power, params.md_scale, sv)
 
-    Xp = _wrap_pad_2d(X)
-    Mp = _wrap_pad_2d(M)
+    Xp = _pad_2d(X)
+    Mp = _pad_2d(M)
 
     F = jnp.zeros((H, W, 2), dtype=jnp.float32)
     for dy in range(5):
         for dx_i in range(5):
             Xn = Xp[dy:dy+H, dx_i:dx_i+W]
             Mn = Mp[dy:dy+H, dx_i:dx_i+W]
-            dxv = Xn - X
-            dxv = dxv - jnp.round(dxv / R) * R
+            dxv = Xn - X   # no minimal-image wrap (non-periodic)
             Gw = jnp.exp(-jnp.sum(dxv * dxv, axis=-1))
             avgP = 0.5 * Mn[..., 0] * (Pf(M) + Pf(Mn))
             F = F - 0.5 * (Gw * avgP)[..., None] * dxv
@@ -404,8 +429,8 @@ def simulate_2d(state: State2D, params: PhysarumParams) -> State2D:
                         jnp.sin(ang - jnp.pi / 2)], axis=-1)
     sense_origin = X + perp_r * params.sensor_offset_right
     trail = M[..., 1:2]
-    sd_l = bilinear_sample(trail, sense_origin + dl)[..., 0]
-    sd_r = bilinear_sample(trail, sense_origin + dr)[..., 0]
+    sd_l = bilinear_sample(trail, sense_origin + dl, mode="clamp")[..., 0]
+    sd_r = bilinear_sample(trail, sense_origin + dr, mode="clamp")[..., 0]
     F = F + ra[..., None] * (perp_l * sd_l[..., None] + perp_r * sd_r[..., None])
 
     F = F - GRAVITY * M[..., 0:1] * jnp.array([0.0, 1.0])
@@ -483,14 +508,23 @@ def reintegrate_3d(state: State3D) -> State3D:
     X, V, M = state
     D, H, W = X.shape[:3]
     pos = position_grid_3d(D, H, W)
-    R = jnp.array([W, H, D], dtype=jnp.float32)
 
-    Xp = _wrap_pad_3d(X)
-    Vp = _wrap_pad_3d(V)
-    Mp = _wrap_pad_3d(M)
+    Xp = _pad_3d(X)
+    Vp = _pad_3d(V)
+    Mp = _pad_3d(M)
 
     half_p = DIF * 0.5
     inv_K3 = 1.0 / (DIF * DIF * DIF)
+
+    # Reflective (rebound) boundary: a cell on a domain face extends its
+    # catchment one cell-width past that face, folding back the mass whose
+    # advected distribution box would otherwise spill out and be lost (method of
+    # images). Total mass is conserved exactly while half_p < 1 (DIF/2 = 0.65),
+    # since only the adjacent image layer is ever reachable. lo/hi_ext are
+    # per-axis flags (1.0 on the low / high face, else 0.0) — loop-invariant.
+    R_minus1 = jnp.array([W - 1, H - 1, D - 1], dtype=jnp.float32)
+    lo_ext = (pos == 0.0).astype(jnp.float32)
+    hi_ext = (pos == R_minus1).astype(jnp.float32)
 
     # Outer dz wrapped in fori_loop to bound peak memory.
     def dz_body(dz_idx, acc):
@@ -504,11 +538,11 @@ def reintegrate_3d(state: State3D) -> State3D:
                 Vn = Vpd[:, dy:dy + H, dx:dx + W]
                 Mn = Mpd[:, dy:dy + H, dx:dx + W]
 
+                # Non-periodic: direct displacement, no minimal-image wrap.
                 rel = (Xn + Vn * DT) - pos
-                rel = rel - jnp.round(rel / R) * R
 
-                inter_lo = jnp.maximum(-0.5, rel - half_p)
-                inter_hi = jnp.minimum(0.5, rel + half_p)
+                inter_lo = jnp.maximum(-0.5 - lo_ext, rel - half_p)
+                inter_hi = jnp.minimum(0.5 + hi_ext, rel + half_p)
                 size = jnp.maximum(inter_hi - inter_lo, 0.0)
                 center_rel = 0.5 * (inter_lo + inter_hi)
                 frac = size[..., 0] * size[..., 1] * size[..., 2] * inv_K3
@@ -546,8 +580,8 @@ def simulate_3d(state: State3D, params: PhysarumParams) -> State3D:
     ra = param_value(params.ra_base, params.ra_power, params.ra_scale, sv)
     md = param_value(params.md_base, params.md_power, params.md_scale, sv)
 
-    Xp = _wrap_pad_3d(X)
-    Mp = _wrap_pad_3d(M)
+    Xp = _pad_3d(X)
+    Mp = _pad_3d(M)
 
     def dz_body(dz_idx, F):
         Xpd = jax.lax.dynamic_slice_in_dim(Xp, dz_idx, D, axis=0)
@@ -556,8 +590,7 @@ def simulate_3d(state: State3D, params: PhysarumParams) -> State3D:
             for dx in range(5):
                 Xn = Xpd[:, dy:dy + H, dx:dx + W]
                 Mn = Mpd[:, dy:dy + H, dx:dx + W]
-                dxv = Xn - X
-                dxv = dxv - jnp.round(dxv / R) * R
+                dxv = Xn - X   # no minimal-image wrap (non-periodic)
                 Gw = jnp.exp(-jnp.sum(dxv * dxv, axis=-1))
                 avgP = 0.5 * Mn[..., 0] * (Pf(M) + Pf(Mn))
                 F = F - 0.5 * (Gw * avgP)[..., None] * dxv
@@ -578,10 +611,10 @@ def simulate_3d(state: State3D, params: PhysarumParams) -> State3D:
     dir_U = (fwd_part + up_b * sa_s) * sd_e
     dir_D = (fwd_part - up_b * sa_s) * sd_e
     trail = M[..., 1:2]
-    sR = trilinear_sample(trail, sense_origin + dir_R)[..., 0]
-    sL = trilinear_sample(trail, sense_origin + dir_L)[..., 0]
-    sU = trilinear_sample(trail, sense_origin + dir_U)[..., 0]
-    sDn = trilinear_sample(trail, sense_origin + dir_D)[..., 0]
+    sR = trilinear_sample(trail, sense_origin + dir_R, mode="clamp")[..., 0]
+    sL = trilinear_sample(trail, sense_origin + dir_L, mode="clamp")[..., 0]
+    sU = trilinear_sample(trail, sense_origin + dir_U, mode="clamp")[..., 0]
+    sDn = trilinear_sample(trail, sense_origin + dir_D, mode="clamp")[..., 0]
     F = F + ra[..., None] * (right_b * (sR - sL)[..., None]
                              + up_b * (sU - sDn)[..., None])
 

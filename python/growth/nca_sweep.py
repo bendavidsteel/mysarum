@@ -166,6 +166,7 @@ CONFIG_DEFAULTS = dict(
     mlp_seed=101, shape="disc", seed_pattern="boundary",
     mlp_layers=2, hidden_dims=32, state_dims=8,
     mlp_scale=0.5, state_dt=0.07, growth_rate=5.0,
+    relaxation=0.7,
     growth_mode="nca",
     rings=4, sphere_lat=6, sphere_lon=10, sphere_radius_mult=2.0,
     hemi_lat=4, hemi_lon=10, hemi_radius_mult=1.5,
@@ -180,6 +181,8 @@ CONFIG_DEFAULTS = dict(
     resource_decay=0.02,
     ground_source_value=1.0,
     ground_z=0.0,
+    anisotropy_dir=[0.0, 0.0, 1.0],
+    anisotropy_strength=0.0,
 )
 
 
@@ -227,10 +230,12 @@ def run_one(cfg, frames, substeps, resolution, max_edge_len, max_splits, rendere
     )
     light_dir = jnp.array(list(cfg["light_dir"]), dtype=jnp.float32)
     light_pos = _resolve_light_pos(cfg["light_pos"], resolution)
+    anisotropy_dir = jnp.array(list(cfg["anisotropy_dir"]), dtype=jnp.float32)
     params = g.default_params(
         max_edge_len=max_edge_len,
         growth_rate=cfg["growth_rate"],
         state_dt=cfg["state_dt"],
+        relaxation=float(cfg["relaxation"]),
         vertex_state_mlp_params=mlp_params,
         light_dir=light_dir,
         light_pos=light_pos,
@@ -243,6 +248,8 @@ def run_one(cfg, frames, substeps, resolution, max_edge_len, max_splits, rendere
         resource_decay=float(cfg["resource_decay"]),
         ground_z=float(cfg["ground_z"]),
         ground_source_value=float(cfg["ground_source_value"]),
+        anisotropy_dir=anisotropy_dir,
+        anisotropy_strength=float(cfg["anisotropy_strength"]),
     )
     state = _build_initial(cfg, params, resolution)
     key, sk = jax.random.split(key)

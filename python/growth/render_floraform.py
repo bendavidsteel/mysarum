@@ -86,6 +86,13 @@ def parse_args():
     p.add_argument("--hidden-dims", type=int, default=32)
     p.add_argument("--mlp-layers", type=int, default=2)
 
+    # Anisotropic growth (orthogonal to growth mode; strength 0 = isotropic)
+    p.add_argument("--anisotropy-dir", type=float, nargs=3,
+                   metavar=("X", "Y", "Z"), default=[0.0, 0.0, 1.0],
+                   help="Preferred-growth axis (arbitrary vec3, normalized internally)")
+    p.add_argument("--anisotropy-strength", type=float, default=0.0,
+                   help="0 = isotropic, 1 = grow only along --anisotropy-dir")
+
     # Rendering
     p.add_argument("--resolution", type=int, default=1024, help="Image resolution")
     p.add_argument("-o", "--output", type=str, default="floraform_render.png")
@@ -144,6 +151,8 @@ def main():
         growth_mu=args.growth_mu,
         growth_sigma=args.growth_sigma,
         vertex_state_mlp_params=mlp_params,
+        anisotropy_dir=jnp.array(args.anisotropy_dir, dtype=jnp.float32),
+        anisotropy_strength=args.anisotropy_strength,
     )
 
     if args.shape == "disc":

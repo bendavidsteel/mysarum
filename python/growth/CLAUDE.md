@@ -25,6 +25,15 @@ ground_z`). Boundary half-edges around the equator are detected by topology
 `project_ground`. Gravity is a constant `-z` force per vertex in
 `compute_external_forces`, magnitude `params.gravity_strength`.
 
+**Anisotropic growth** is orthogonal to `growth_mode` — `_anisotropy_factor`
+scales every half-edge's length gain by `mix(1, |cos θ|, anisotropy_strength)`,
+where θ is the angle between the edge's 3D direction and `params.anisotropy_dir`.
+`anisotropy_strength=0` is exactly isotropic (factor 1.0 everywhere, no behaviour
+change); 1.0 grows only along the axis. Unlike the Rust port's three cardinal-axis
+choices, `anisotropy_dir` is a free vec3 (normalized internally), so oblique /
+diagonal preferred directions are possible. Applied inside all three
+`grow_intrinsic_lengths*` functions. See `conf/sweep/anisotropic.yaml`.
+
 ## Run
 
 Always use the base conda env: `conda run -n base python <script>`.
@@ -37,6 +46,7 @@ conda run -n base python nca_sweep.py sweep=phototropic
 conda run -n base python nca_sweep.py sweep=bipolar
 conda run -n base python nca_sweep.py sweep=stratified
 conda run -n base python nca_sweep.py sweep=original
+conda run -n base python nca_sweep.py sweep=anisotropic
 
 # Compare against a previous sweep's features.npz:
 conda run -n base python nca_sweep.py sweep=phototropic \
@@ -77,6 +87,40 @@ basin; `nca_bipolar` was the basin-break).
   is a fallback z-threshold pin used only by callers that don't pass the
   topology-based mask; the runtime path in `batched_physics_step` uses the
   topology `get_on_boundary` mask instead and ignores this field.
+
+## Fold smoothness — growth speed, NOT bending compliance
+
+Mesh smoothness is governed by **how fast the surface grows relative to how
+fast XPBD relaxes it**, not by the bending constraint. Differential growth
+injects excess area; XPBD absorbs it by buckling. Inject slowly → the mesh
+stays near mechanical equilibrium → smooth folds. Inject fast → it buckles
+into sharp creases before the solver catches up. The lever is
+`growth_rate × state_dt` (growth per substep):
+
+- Quasi-static (smooth, ~22° mean dihedral): `growth_rate≈1.5, state_dt≈0.04`.
+  Used by `anisotropic*.yaml`. Mirrors the Rust port's `0.3 / 0.02`.
+- Fast (sharp, ~58°): `growth_rate=6.0, state_dt=0.08`. The old phototropic
+  sweep tuned these up to reach big meshes in fewer frames — at the cost of
+  sharp buckling. Smooth growth needs ~2.5× more frames for the same size,
+  and the 20-iteration solver roughly doubles per-frame cost, so budget a
+  smooth 4500-vert config at ~15 min (a full 112-config sweep ≈ a day, not 6h).
+
+Things that do **not** smooth the folds (measured): bending compliance
+(invariant ~57°, and below ~1e-4 it overshoots *sharper*), Laplacian smoothing
+(`stiffness`), tessellation (`max_edge_len`), more XPBD iterations alone.
+
+Two solver params (ported from Rust) make the XPBD relaxation effective:
+- `MeshParams.relaxation` (default 0.7): SOR under-relaxation on every spring +
+  bending correction. <1 damps the full-Jacobi overshoot; 1.0 = old un-damped
+  behaviour (why stiff bending used to oscillate into *worse* sharpness).
+- `XPBD_ITERATIONS` (now 20, was 10): more relaxation passes per substep.
+
+Bending α̃ is `bending_compliance / dt²` here vs the Rust port's direct α̃; the
+Python default `0.001` (dt 0.02) and Rust's `2.5` are the same effective value.
+
+The `JAXNvdiffrastRenderer` auto-fits an orthographic camera to the live mesh
+bbox each render (fills ~85% of frame), so grown meshes stay framed regardless
+of size — the old fixed `[0,width]×[0,height]` window clipped them to close-ups.
 
 ## Files
 

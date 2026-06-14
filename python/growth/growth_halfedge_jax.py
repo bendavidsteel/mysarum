@@ -65,6 +65,10 @@ MeshParams = collections.namedtuple('MeshParams', [
     'spring_len',
     'compliance',
     'bending_compliance',
+    # SOR under-relaxation applied to spring + bending corrections each Jacobi
+    # iteration (matches the Rust port). <1 damps overshoot from the full
+    # Jacobi step; 1.0 = no damping (old Python behaviour, prone to buckling).
+    'relaxation',
     'repulsion_dist',
     'repulsion_strength',
     'bulge_strength',
@@ -99,6 +103,14 @@ MeshParams = collections.namedtuple('MeshParams', [
     'ground_z',
     'ground_source_value',
     'ground_pin_strength',
+    # Anisotropic growth (applies across all growth modes; strength 0 = off)
+    #   anisotropy_dir    arbitrary preferred-growth axis (need not be unit;
+    #                     normalized internally). Unlike the Rust version's
+    #                     three cardinal-axis choices, this is a free vec3.
+    #   anisotropy_strength  in [0, 1]: 0 = isotropic, 1 = grow only along the
+    #                     axis (edge growth scaled by |cos| of edge vs axis).
+    'anisotropy_dir',
+    'anisotropy_strength',
 ])
 
 
@@ -107,6 +119,7 @@ def default_params(**overrides):
         spring_len=30.0,
         compliance=0.0,
         bending_compliance=0.001,
+        relaxation=0.7,
         repulsion_dist=80.0,
         repulsion_strength=4.0,
         bulge_strength=5.0,
@@ -134,6 +147,8 @@ def default_params(**overrides):
         ground_z=0.0,
         ground_source_value=1.0,
         ground_pin_strength=0.15,
+        anisotropy_dir=jnp.array([0.0, 0.0, 1.0], dtype=jnp.float32),
+        anisotropy_strength=0.0,
     )
     defaults.update(overrides)
     return MeshParams(**defaults)
@@ -1241,8 +1256,10 @@ def project_springs(pos, topo, rest, params):
     correction = jnp.zeros_like(pos).at[he_src].add(edge_corr)
     degree = jnp.maximum(topo.degree_raw, 1.0)
 
+    # SOR under-relaxation: scale the averaged Jacobi correction so chained
+    # passes don't overshoot the rest configuration (see params.relaxation).
     active = topo.active[:, None].astype(jnp.float32)
-    return pos + (correction / degree[:, None]) * active
+    return pos + params.relaxation * (correction / degree[:, None]) * active
 
 
 @jax.jit
@@ -1320,8 +1337,10 @@ def project_bending(pos, topo, params):
     max_corr = params.spring_len * 0.1
     avg_corr = jnp.where(corr_mag > max_corr, avg_corr * max_corr / corr_mag, avg_corr)
 
+    # SOR under-relaxation (matches Rust); damps the overshoot that otherwise
+    # made stiff bending oscillate into sharper folds rather than flatten them.
     active = topo.active[:, None].astype(jnp.float32)
-    return pos + avg_corr * active
+    return pos + params.relaxation * avg_corr * active
 
 
 @jax.jit
@@ -1602,6 +1621,23 @@ def project_ground(pos, on_b, params):
 
 # ── Intrinsic Length Growth ──────────────────────────────────────────────────
 
+def _anisotropy_factor(state, safe_dest, he_src, params):
+    """Per-half-edge growth multiplier from edge alignment with the preferred
+    axis `params.anisotropy_dir` (an arbitrary vec3, normalized here).
+
+    Mirrors the Rust growth.wgsl `mix(1, |dot|, strength)`: |cos| treats the
+    two edge orientations symmetrically, and strength ramps from isotropic
+    (1.0 everywhere, strength 0) to axis-only (|cos|, strength 1). The caller
+    passes the same `safe_dest`/`he_src` it already gathered so we don't redo
+    the twin/dest clipping.
+    """
+    edge = state.vertex_pos[safe_dest] - state.vertex_pos[he_src]
+    elen = jnp.linalg.norm(edge, axis=1, keepdims=True)
+    axis = params.anisotropy_dir / (jnp.linalg.norm(params.anisotropy_dir) + EPSILON)
+    align = jnp.abs((edge / (elen + EPSILON)) @ axis)
+    return 1.0 + params.anisotropy_strength * (align - 1.0)
+
+
 @jax.jit
 def grow_intrinsic_lengths(state, params, key):
     """Grow intrinsic edge lengths based on source vertex state channel 0.
@@ -1620,7 +1656,8 @@ def grow_intrinsic_lengths(state, params, key):
     noise_per_vertex = 0.5 + jax.random.uniform(key, (MAX_VERTICES,))
     noise = noise_per_vertex[he_src]
 
-    delta = grow * noise * params.state_dt * params.growth_rate
+    aniso = _anisotropy_factor(state, safe_dest, he_src, params)
+    delta = grow * noise * params.state_dt * params.growth_rate * aniso
     delta = jnp.where(he_valid, delta, 0.0)
 
     new_intrinsic = state.half_edge_intrinsic_len + delta
@@ -1646,7 +1683,8 @@ def grow_intrinsic_lengths_phototropic(state, params, key):
     noise_per_vertex = 0.5 + jax.random.uniform(key, (MAX_VERTICES,))
     noise = noise_per_vertex[he_src]
 
-    delta = grow * noise * params.state_dt * params.growth_rate
+    aniso = _anisotropy_factor(state, safe_dest, he_src, params)
+    delta = grow * noise * params.state_dt * params.growth_rate * aniso
     delta = jnp.where(he_valid, delta, 0.0)
 
     new_intrinsic = state.half_edge_intrinsic_len + delta
@@ -1672,7 +1710,8 @@ def grow_intrinsic_lengths_bipolar(state, params, key):
     noise_per_vertex = 0.5 + jax.random.uniform(key, (MAX_VERTICES,))
     noise = noise_per_vertex[he_src]
 
-    delta = grow * noise * params.state_dt * params.growth_rate
+    aniso = _anisotropy_factor(state, safe_dest, he_src, params)
+    delta = grow * noise * params.state_dt * params.growth_rate * aniso
     delta = jnp.where(he_valid, delta, 0.0)
 
     new_intrinsic = state.half_edge_intrinsic_len + delta
@@ -1684,7 +1723,7 @@ def grow_intrinsic_lengths_bipolar(state, params, key):
 
 # ── Combined XPBD Physics Step ──────────────────────────────────────────────
 
-XPBD_ITERATIONS = 10  # static for JIT compatibility
+XPBD_ITERATIONS = 20  # static for JIT compatibility (matches the Rust port)
 
 
 @functools.partial(jax.jit, static_argnums=(4, 5))
@@ -1985,10 +2024,28 @@ class JAXNvdiffrastRenderer:
         n = int(n_active)
         faces = faces[:n].contiguous()
 
+        # Auto-fit the (orthographic) camera to the mesh bounding box so the
+        # form fills the frame regardless of how far it has grown — the fixed
+        # [0,width]x[0,height] world window used to clip large meshes to an
+        # extreme close-up. Frame over the vertices actually referenced by the
+        # live faces; fall back to the fixed window for a degenerate mesh.
+        if n > 0:
+            used = faces.flatten().unique()
+            used_v = verts[used]
+            vmin = used_v.min(dim=0).values
+            vmax = used_v.max(dim=0).values
+            center = 0.5 * (vmin + vmax)
+            extent = (vmax - vmin).max()
+            scale = 1.7 / (extent + 1e-6)  # 1.7 = 0.85 * 2 -> fill ~85%
+            cx, cy, cz = center[0], center[1], center[2]
+        else:
+            cx, cy, cz = self.center_x, self.center_y, 0.0
+            scale = self.proj_scale
+
         verts_clip = verts.clone()
-        verts_clip[:, 0] = (verts[:, 0] - self.center_x) * self.proj_scale
-        verts_clip[:, 1] = (verts[:, 1] - self.center_y) * self.proj_scale
-        verts_clip[:, 2] = verts[:, 2] * self.proj_scale
+        verts_clip[:, 0] = (verts[:, 0] - cx) * scale
+        verts_clip[:, 1] = (verts[:, 1] - cy) * scale
+        verts_clip[:, 2] = (verts[:, 2] - cz) * scale
         verts_homo = torch.cat([verts_clip, torch.ones_like(verts_clip[:, :1])], dim=-1)
         verts_homo = verts_homo.unsqueeze(0).contiguous()
 

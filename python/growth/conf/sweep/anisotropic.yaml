@@ -1,0 +1,52 @@
+# Anisotropic edge growth: each edge's growth is scaled by how well its 3D
+# direction aligns with a preferred axis `anisotropy_dir`. Unlike the Rust
+# version's three cardinal-axis choices, the axis here is a free vec3, so the
+# sweep can probe oblique / diagonal growth directions.
+#
+#   anisotropy_strength  0 = isotropic, 1 = grow only along the axis
+#   anisotropy_dir       arbitrary direction (normalized internally)
+#
+# Built on the phototropic hemisphere base so growth is light-driven and the
+# anisotropy reshapes how that growth elongates the tissue.
+
+name: anisotropic
+
+_common: &common
+  growth_mode: phototropic
+  shape: hemisphere
+  state_dims: 3
+  seed_pattern: apex
+  light_dir: [0.0, 0.0, 1.0]
+  # Quasi-static growth: slow enough that XPBD keeps the surface near
+  # mechanical equilibrium, giving smooth folds (cf. the Rust port). Fast
+  # growth (6.0 / 0.08) buckles violently into sharp creases.
+  growth_rate: 1.5
+  state_dt: 0.04
+
+configs:
+  # ── A: isotropic baseline + sweep strength along vertical axis ──────────
+  - {<<: *common, mlp_seed: 11, anisotropy_dir: [0.0, 0.0, 1.0], anisotropy_strength: 0.0}
+  - {<<: *common, mlp_seed: 11, anisotropy_dir: [0.0, 0.0, 1.0], anisotropy_strength: 0.4}
+  - {<<: *common, mlp_seed: 11, anisotropy_dir: [0.0, 0.0, 1.0], anisotropy_strength: 0.8}
+  - {<<: *common, mlp_seed: 11, anisotropy_dir: [0.0, 0.0, 1.0], anisotropy_strength: 1.0}
+
+  # ── B: horizontal axes (flat, spreading growth) ─────────────────────────
+  - {<<: *common, mlp_seed: 23, anisotropy_dir: [1.0, 0.0, 0.0], anisotropy_strength: 0.7}
+  - {<<: *common, mlp_seed: 23, anisotropy_dir: [0.0, 1.0, 0.0], anisotropy_strength: 0.7}
+
+  # ── C: oblique / diagonal axes (the "flexible vector" payoff) ───────────
+  - {<<: *common, mlp_seed: 31, anisotropy_dir: [1.0, 1.0, 0.0], anisotropy_strength: 0.7}
+  - {<<: *common, mlp_seed: 31, anisotropy_dir: [1.0, 0.0, 1.0], anisotropy_strength: 0.7}
+  - {<<: *common, mlp_seed: 31, anisotropy_dir: [1.0, 1.0, 1.0], anisotropy_strength: 0.7}
+  - {<<: *common, mlp_seed: 31, anisotropy_dir: [0.5, -0.5, 0.7], anisotropy_strength: 0.7}
+  - {<<: *common, mlp_seed: 31, anisotropy_dir: [-0.7, 0.3, 0.6], anisotropy_strength: 0.7}
+
+  # ── D: strong oblique anisotropy at different strengths ─────────────────
+  - {<<: *common, mlp_seed: 47, anisotropy_dir: [1.0, 0.0, 0.5], anisotropy_strength: 0.5}
+  - {<<: *common, mlp_seed: 47, anisotropy_dir: [1.0, 0.0, 0.5], anisotropy_strength: 0.9}
+  - {<<: *common, mlp_seed: 47, anisotropy_dir: [0.0, 1.0, 0.5], anisotropy_strength: 0.9}
+
+  # ── E: anisotropy axis vs light direction interplay ─────────────────────
+  - {<<: *common, mlp_seed: 53, light_dir: [1.0, 0.0, 0.6], anisotropy_dir: [0.0, 0.0, 1.0], anisotropy_strength: 0.8}
+  - {<<: *common, mlp_seed: 53, light_dir: [1.0, 0.0, 0.6], anisotropy_dir: [1.0, 0.0, 0.0], anisotropy_strength: 0.8}
+  - {<<: *common, mlp_seed: 53, light_dir: [0.7, 0.7, 0.2], anisotropy_dir: [0.7, 0.7, 0.0], anisotropy_strength: 0.8}

@@ -33,9 +33,11 @@ printability:
   edt_reward_tau: 2.5      # tanh scale for the diminishing thickness reward
   sa_reward_tau: 0.25      # tanh scale for the diminishing veininess reward
   edt_thin_floor: 2.0      # half-thickness floor (voxels); <2.0 ≈ <1.6mm feature
-  thin_free: 0.18          # thin-material fraction forgiven (every surface shell)
-  thin_penalty_scale: 0.12 # smaller = harsher penalty on fragile spiky material
-  thin_frac_max: 0.30      # backstop gate: reject if >30% of mass is sub-floor
+  rod_thr: 0.5             # Frangi tubeness above this counts a voxel as rod-like
+  rod_sigmas: [2.0, 3.0, 4.0]   # multi-scale Hessian scales for rod detection
+  spike_free: 0.09         # fragile thin-rod fraction forgiven (≈coral/dome level)
+  spike_penalty_scale: 0.06     # smaller = harsher penalty on free-standing spikes
+  spike_frac_max: 0.15     # backstop gate: reject if >15% is fragile thin rod
   top_clear_voxels: 1      # top N z-slices must be empty (clear of ceiling)
   bottom_fill_min: 0.1     # base footprint must cover >10% of the bottom face
   bottom_fill_max: 0.8     # ...and <80% (a real base, not a full slab)

@@ -813,14 +813,54 @@ def _largest_cc_gpu(mask, struct26):
     return labels == int(cp.argmax(counts))
 
 
+def _frangi_rodness(mask, sigmas=(2.0, 3.0, 4.0), alpha=0.5, beta=0.5):
+    """Per-masked-voxel 'rodness' in [0,1] via the Frangi (1998) Hessian-
+    eigenvalue filter: high for tube/rod-like structure, low for plate/sheet and
+    blob. Used to tell fragile free-standing spikes (rods) from connected veiny
+    ridges (plates) — the rod/plate distinction from bone microarchitecture.
+
+    Eigenvalues are ordered by magnitude |l1| ≤ |l2| ≤ |l3|; for a bright-on-dark
+    structure (the smoothed mask) the structure directions have negative
+    eigenvalues. Ra = |l2|/|l3| separates plate (~0) from tube (~1); Rb =
+    |l1|/sqrt|l2·l3| suppresses blobs (~1). Multi-scale (gamma-normalised), max
+    response over scales. Returned array is aligned to mask[mask] (C order), so
+    it lines up with edt[mask] for downstream thin-AND-rod masking.
+    """
+    field = mask.astype(cp.float32)
+    idx = mask
+    rod = cp.zeros(int(idx.sum()), dtype=cp.float32)
+    for s in sigmas:
+        g = lambda order: (s * s) * cndi.gaussian_filter(field, s, order=order)
+        Hxx, Hyy, Hzz = g((2, 0, 0)), g((0, 2, 0)), g((0, 0, 2))
+        Hxy, Hxz, Hyz = g((1, 1, 0)), g((1, 0, 1)), g((0, 1, 1))
+        n = int(idx.sum())
+        H = cp.empty((n, 3, 3), dtype=cp.float32)
+        H[:, 0, 0] = Hxx[idx]; H[:, 1, 1] = Hyy[idx]; H[:, 2, 2] = Hzz[idx]
+        H[:, 0, 1] = H[:, 1, 0] = Hxy[idx]
+        H[:, 0, 2] = H[:, 2, 0] = Hxz[idx]
+        H[:, 1, 2] = H[:, 2, 1] = Hyz[idx]
+        ev = cp.linalg.eigvalsh(H)
+        ev = cp.take_along_axis(ev, cp.argsort(cp.abs(ev), axis=1), axis=1)
+        l1, l2, l3 = ev[:, 0], ev[:, 1], ev[:, 2]
+        Ra = cp.abs(l2) / (cp.abs(l3) + 1e-10)
+        Rb = cp.abs(l1) / (cp.sqrt(cp.abs(l2 * l3)) + 1e-10)
+        tube = ((1 - cp.exp(-Ra * Ra / (2 * alpha * alpha)))
+                * cp.exp(-Rb * Rb / (2 * beta * beta)))
+        tube = cp.where((l2 < 0) & (l3 < 0), tube, 0.0)
+        rod = cp.maximum(rod, tube)
+    return rod
+
+
 def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                         n_thresholds=12,
                         opening_ratio_min=0.5,
                         volume_fill_min=0.05, volume_fill_max=0.35,
                         edt_median_min=1.5, edt_reward_tau=2.5,
                         sa_reward_tau=0.25,
-                        edt_thin_floor=2.0, thin_free=0.18,
-                        thin_penalty_scale=0.12, thin_frac_max=0.30,
+                        edt_thin_floor=2.0, rod_thr=0.5,
+                        rod_sigmas=(2.0, 3.0, 4.0),
+                        spike_free=0.09, spike_penalty_scale=0.06,
+                        spike_frac_max=0.15,
                         top_clear_voxels=1,
                         bottom_fill_min=0.1, bottom_fill_max=0.8,
                         cylinder_penalty_scale=0.003,
@@ -841,8 +881,8 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
       • volume_fill ∈ (volume_fill_min, volume_fill_max) — neither specks nor a
         near-solid block (volume_fill = occupied voxels / total grid voxels);
       • edt_median > edt_median_min — typical wall thick enough to print;
-      • thin_frac ≤ thin_frac_max — not mostly fragile sub-floor material
-        (thin_frac = share of voxels with half-thickness < edt_thin_floor);
+      • spike_frac ≤ spike_frac_max — not too much fragile free-standing thin-rod
+        material (spike_frac = share of voxels that are both thin and rod-like);
       • the top `top_clear_voxels` z-slices and all four side walls are empty,
         so the object touches no ceiling or wall of the print volume;
       • the bottom face (z=0) footprint fraction ∈ (bottom_fill_min,
@@ -850,11 +890,11 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
     Array axis 0 is z (spawn base at z=0); axes 1,2 are the walls. Among
     printable rows the "best" maximizes fitness = tanh(sa_to_vol /
     sa_reward_tau) × cyl_mult × overhang_mult × tanh(edt_median /
-    edt_reward_tau) × thin_mult — diminishing-returns rewards for veininess and
-    thickness (both saturate, so maxing either out doesn't dominate); thin_mult
-    = exp(-(thin_frac - thin_free) / thin_penalty_scale) softly punishes shapes
-    whose surface area comes from fragile sub-floor material (slender spikes),
-    redirecting the veininess reward toward thick lobes/ridges; overhang_mult
+    edt_reward_tau) × spike_mult — diminishing-returns rewards for veininess and
+    thickness (both saturate, so maxing either out doesn't dominate); spike_mult
+    = exp(-(spike_frac - spike_free) / spike_penalty_scale) softly punishes
+    fragile free-standing thin rods (thin AND rod-like material) while leaving
+    connected veiny ridges and thick lobes alone; overhang_mult
     softly punishes
     self-support violations beyond overhang_free (45° cone); cyl_mult =
     exp(-penalty / cylinder_penalty_scale) softly punishes mass
@@ -904,7 +944,7 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                              bottom_frac=0.0, outside_frac=0.0, cyl_mult=1.0,
                              overhang_frac=0.0, overhang_mult=1.0,
                              edt_reward=0.0, sa_reward=0.0,
-                             thin_frac=0.0, thin_mult=1.0,
+                             thin_frac=0.0, spike_frac=0.0, spike_mult=1.0,
                              edt_min=0.0, edt_q01=0.0, edt_median=0.0,
                              opening_ratio=0.0, surface_area=0,
                              sa_to_vol=0.0, fitness=0.0, printable=False))
@@ -959,30 +999,41 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
         # to a point, but maxing it out (thin spiky shapes) isn't more
         # desirable, so saturate it with tanh.
         sa_reward = float(np.tanh(sa_to_vol / sa_reward_tau))
-        # Thin-feature penalty: sa_to_vol alone is maximised by a crown of
-        # slender spikes (high surface per volume). Those spikes survive the
-        # min-feature opening (radius ~2-3 voxels, not sub-feature) so the
-        # opening gate misses them; what separates them from chunky lobes is the
-        # share of material below a printable half-thickness floor. thin_frac =
-        # fraction of voxels with EDT < edt_thin_floor (≈ feature < 2·floor·voxel
-        # mm thick). Penalise the excess past a small free allowance (every
-        # surface has a thin shell) so the search earns sa_to_vol via thick
-        # ridges/lobes rather than needles.
+        # Share of material below the printable half-thickness floor — logged
+        # for context. NB: thin_frac alone cannot separate fragile spikes from
+        # desirable connected ridges (both ≈0.34); the spike_frac metric below
+        # does. (Frangi rod/plate; see _frangi_rodness.)
         thin_frac = float((edt_in < edt_thin_floor).sum()) / vol
-        thin_mult = float(np.exp(-max(0.0, thin_frac - thin_free)
-                                 / thin_penalty_scale))
-        # Veininess × thickness rewards, scaled by the cylinder, overhang, and
-        # thin-feature penalties. opening_ratio, volume_fill, the edt_median
-        # floor, and thin_frac_max are gates, not fitness terms.
-        fitness = sa_reward * cyl_mult * overhang_mult * edt_reward * thin_mult
 
-        printable = (opening_ratio >= opening_ratio_min
-                     and volume_fill_min < volume_fill < volume_fill_max
-                     and edt_med > edt_median_min
-                     and thin_frac <= thin_frac_max
-                     and top_filled == 0
-                     and wall_filled == 0
-                     and bottom_fill_min < bottom_frac < bottom_fill_max)
+        # Cheap gates first (everything except the expensive fragility metric).
+        gate_ok = (opening_ratio >= opening_ratio_min
+                   and volume_fill_min < volume_fill < volume_fill_max
+                   and edt_med > edt_median_min
+                   and top_filled == 0
+                   and wall_filled == 0
+                   and bottom_fill_min < bottom_frac < bottom_fill_max)
+
+        # Fragile-spike penalty: spike_frac = share of material that is BOTH thin
+        # (edt < edt_thin_floor) AND rod-like (Frangi tubeness > rod_thr) — i.e.
+        # an unsupported thin wire, the print-fragile case that 3D-printing
+        # design rules flag separately from walls. Connected plate-like ridges
+        # (thin but 2D) and thick blobs both score low, so this suppresses
+        # needles without flattening organic veininess. The Frangi pass is
+        # costly, so only run it for masks that already clear the cheap gates.
+        if gate_ok:
+            rod = _frangi_rodness(mask, sigmas=tuple(rod_sigmas))
+            thin_v = edt_in < edt_thin_floor
+            spike_frac = float((thin_v & (rod > rod_thr)).sum()) / vol
+        else:
+            spike_frac = 0.0
+        spike_mult = float(np.exp(-max(0.0, spike_frac - spike_free)
+                                  / spike_penalty_scale))
+        # Veininess × thickness rewards, scaled by the cylinder, overhang, and
+        # fragile-spike penalties. opening_ratio, volume_fill, the edt_median
+        # floor, and spike_frac_max are gates, not fitness terms.
+        fitness = sa_reward * cyl_mult * overhang_mult * edt_reward * spike_mult
+
+        printable = gate_ok and spike_frac <= spike_frac_max
         rows.append(dict(threshold=float(t),
                          kept_fraction=kept_fraction,
                          volume=vol,
@@ -996,7 +1047,8 @@ def printability_report(trail, r_min_voxels=2.0, thresholds=None,
                          overhang_mult=overhang_mult,
                          edt_reward=edt_reward,
                          sa_reward=sa_reward,
-                         thin_frac=thin_frac, thin_mult=thin_mult,
+                         thin_frac=thin_frac,
+                         spike_frac=spike_frac, spike_mult=spike_mult,
                          edt_min=edt_min, edt_q01=edt_q01, edt_median=edt_med,
                          opening_ratio=opening_ratio,
                          surface_area=surface_area,
@@ -1123,7 +1175,7 @@ def _bd_cell(bd, archive_shape, bd_ranges):
 _INFO_KEYS = ("sa_to_vol", "opening_ratio", "volume_fill", "edt_median",
               "bottom_frac", "top_filled", "wall_filled", "outside_frac",
               "cyl_mult", "overhang_frac", "overhang_mult", "edt_reward",
-              "sa_reward", "thin_frac", "thin_mult")
+              "sa_reward", "thin_frac", "spike_frac", "spike_mult")
 
 
 def _candidate_from_trail(trail, r_min_voxels, step):
@@ -1399,9 +1451,11 @@ def run_3d(cfg: DictConfig, params: PhysarumParams, out_dir: Path):
             edt_reward_tau=float(pcfg.edt_reward_tau),
             sa_reward_tau=float(pcfg.sa_reward_tau),
             edt_thin_floor=float(pcfg.edt_thin_floor),
-            thin_free=float(pcfg.thin_free),
-            thin_penalty_scale=float(pcfg.thin_penalty_scale),
-            thin_frac_max=float(pcfg.thin_frac_max),
+            rod_thr=float(pcfg.rod_thr),
+            rod_sigmas=tuple(pcfg.rod_sigmas),
+            spike_free=float(pcfg.spike_free),
+            spike_penalty_scale=float(pcfg.spike_penalty_scale),
+            spike_frac_max=float(pcfg.spike_frac_max),
             top_clear_voxels=int(pcfg.top_clear_voxels),
             bottom_fill_min=float(pcfg.bottom_fill_min),
             bottom_fill_max=float(pcfg.bottom_fill_max),

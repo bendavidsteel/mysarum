@@ -1295,10 +1295,10 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
 
     # Persist final archive: per-cell .npy + .stl + a rotating solid-render gif
     # for every printable survivor, plus a single archive.csv with all params.
+    # Data first (CSV + .npy + .stl, no GPU render), so a later rendering OOM
+    # can never cost us the archive. Renders happen in a second, guarded pass.
     rows = []
-    n_gif = 0
-    gif_screen = max(384, int(cfg.render_size) * 2)   # 4× the previous 96 px
-    gif_n_steps = max(256, int(cfg.n_steps) * 2)       # 4× the previous 64
+    survivors = []   # (stem, mask) for cells that have a printable mask
     for cell, e in archive.items():
         d = dict(cell_edt=cell[0], cell_fill=cell[1])
         # Log every printability metric the candidate carries, so the CSV stays
@@ -1314,18 +1314,33 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
             np.save(arch_dir / f"{stem}.npy", e["mask"])
             export_stl(e["mask"], arch_dir / f"{stem}.stl",
                        voxel_size_mm=float(cfg.printability.voxel_size_mm))
-            # Render exactly what gets printed: the binary mask (optimal
-            # threshold, largest connected component) as a fully opaque solid,
-            # so thin density regions don't read as wispy.
-            mask_jax = jnp.asarray(e["mask"], dtype=jnp.float32)
-            M_jax = jnp.stack([mask_jax, mask_jax], axis=-1)
-            D_, H_, W_ = M_jax.shape[:3]
-            # render walks state.X/V shapes but only samples state.M;
-            # pass dummy X/V of the right shape so the JIT cache reuses.
-            dummy = jnp.zeros((D_, H_, W_, 3), dtype=jnp.float32)
-            state = State3D(dummy, dummy, M_jax)
+            survivors.append((stem, e["mask"]))
+
+    df = pl.DataFrame(rows).sort("fitness", descending=True)
+    df.write_csv(out_dir / "mapelites_archive.csv")
+
+    # Render pass. Free the search's cupy allocations first — on the 4 GB card
+    # the cupy pool (kept from the printability sweep) and the JAX ray-march
+    # renderer otherwise collide and OOM. Each gif is guarded so one failed
+    # render skips that cell's gif rather than discarding the whole archive.
+    cp.get_default_memory_pool().free_all_blocks()
+    n_gif = 0
+    gif_screen = max(384, int(cfg.render_size) * 2)   # 4× the previous 96 px
+    gif_n_steps = max(256, int(cfg.n_steps) * 2)       # 4× the previous 64
+    n_views = 48
+    for stem, mask in survivors:
+        # Render exactly what gets printed: the binary mask (optimal threshold,
+        # largest connected component) as a fully opaque solid, so thin density
+        # regions don't read as wispy.
+        mask_jax = jnp.asarray(mask, dtype=jnp.float32)
+        M_jax = jnp.stack([mask_jax, mask_jax], axis=-1)
+        D_, H_, W_ = M_jax.shape[:3]
+        # render walks state.X/V shapes but only samples state.M;
+        # pass dummy X/V of the right shape so the JIT cache reuses.
+        dummy = jnp.zeros((D_, H_, W_, 3), dtype=jnp.float32)
+        state = State3D(dummy, dummy, M_jax)
+        try:
             gif_frames = []
-            n_views = 48
             for v in range(n_views):
                 theta, phi = orbit_view(v, n_views, phi_amp=1.0)
                 img = np.asarray(render_rm_jit(state,
@@ -1338,9 +1353,9 @@ def map_elites_run(cfg: DictConfig, out_dir: Path):
             iio.imwrite(arch_dir / f"{stem}.gif", gif_frames,
                         duration=110, loop=0)
             n_gif += 1
-
-    df = pl.DataFrame(rows).sort("fitness", descending=True)
-    df.write_csv(out_dir / "mapelites_archive.csv")
+        except Exception as ex:   # keep the .npy/.stl, skip just this gif
+            print(f"  warn: gif render failed for {stem} ({ex}); "
+                  f".npy/.stl kept")
     print(f"\nfilled {len(archive)} / {math.prod(archive_shape)} cells "
           f"in {time.perf_counter() - t0:.1f}s — "
           f"wrote {out_dir / 'mapelites_archive.csv'} and "

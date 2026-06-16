@@ -13,6 +13,7 @@ Combines:
 
 import collections
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -26,7 +27,13 @@ import nvdiffrast.torch as dr
 # ── Constants ────────────────────────────────────────────────────────────────
 
 EPSILON = 1e-6
-MAX_VERTICES = 12000
+# JIT-static array size. Per-frame cost scales with this, NOT the active
+# vertex count (every kernel runs over the full padded arrays), so sizing it
+# just above a sweep's real peak vertex count is the single biggest speed
+# lever. Override per run with GROWTH_MAX_VERTICES (e.g. 5000 for a sweep that
+# tops out ~3700 verts ≈ 2.4x faster than the 12000 default). Keep 12000 for
+# open-ended runs on the 4 GB box.
+MAX_VERTICES = int(os.environ.get("GROWTH_MAX_VERTICES", "12000"))
 MAX_HALF_EDGES = MAX_VERTICES * 6
 MAX_FACES = MAX_VERTICES * 2
 MAX_CHEB_ORDER = 16
@@ -388,11 +395,15 @@ def make_circle(width, height, params, n_rings=3, segments_inner=6,
 
 def make_hemisphere(width, height, params, n_lat=4, n_lon=10,
                     radius_multiplier=2.0, state_dims=1, key=None,
-                    ground_z=0.0):
-    """UV hemisphere dome with open equatorial boundary on z=ground_z.
+                    ground_z=0.0, closed=False):
+    """UV hemisphere dome on z=ground_z.
 
     Top pole + (n_lat - 1) intermediate latitude rings + equator ring (last,
-    on the ground). No bottom cap — the equator forms an open boundary loop.
+    on the ground). With `closed=False` the equator is an open boundary loop
+    (the rim is pinned by callers); with `closed=True` a flat disc cap fans
+    the equator ring to a centre vertex so the surface is watertight (a closed
+    half-ball, flat side on the ground) — there is then no boundary, so the
+    base is anchored by the ground-plane clamp + gravity rather than a pin.
     """
     cx, cy = width / 2, height / 2
     radius = float(params.spring_len) * radius_multiplier
@@ -424,6 +435,44 @@ def make_hemisphere(width, height, params, n_lat=4, n_lon=10,
             v_br = vidx(lat_idx + 1, lon_idx + 1)
             faces.append([v_tl, v_bl, v_tr])
             faces.append([v_tr, v_bl, v_br])
+
+    if closed:
+        # Flat bottom disc closing the equator. Built as concentric rings of
+        # n_lon segments at decreasing radius (radial spacing ~ spring_len, like
+        # the dome's latitude rings), sharing the equator ring as its outer ring
+        # and fanning to a centre vertex — so cap edges are ~spring_len rather
+        # than the radius-long slivers a single centre fan would make. Wound
+        # opposite the dome so the cap's outward normal points down (-z).
+        n_cap = max(1, int(round(radius / float(params.spring_len))))
+        cap_ring_starts = []  # first vertex index of each interior cap ring
+        for cap_idx in range(1, n_cap):
+            ring_radius = radius * (1.0 - cap_idx / n_cap)
+            cap_ring_starts.append(len(positions))
+            for lon_idx in range(n_lon):
+                phi = 2 * np.pi * lon_idx / n_lon
+                positions.append([cx + ring_radius * np.cos(phi),
+                                  cy + ring_radius * np.sin(phi), ground_z])
+        center_idx = len(positions)
+        positions.append([cx, cy, ground_z])
+
+        def cap_vidx(cap_ring, lon):
+            if cap_ring == 0:                 # outer ring == dome equator
+                return vidx(n_lat - 1, lon)
+            if cap_ring == n_cap:             # innermost == centre vertex
+                return center_idx
+            return cap_ring_starts[cap_ring - 1] + (lon % n_lon)
+
+        for cap_idx in range(n_cap - 1):      # stitch ring cap_idx -> cap_idx+1
+            for lon_idx in range(n_lon):
+                v_tl = cap_vidx(cap_idx, lon_idx)
+                v_tr = cap_vidx(cap_idx, lon_idx + 1)
+                v_bl = cap_vidx(cap_idx + 1, lon_idx)
+                v_br = cap_vidx(cap_idx + 1, lon_idx + 1)
+                faces.append([v_tl, v_tr, v_bl])
+                faces.append([v_tr, v_br, v_bl])
+        for lon_idx in range(n_lon):          # innermost ring -> centre
+            faces.append([cap_vidx(n_cap - 1, lon_idx),
+                          cap_vidx(n_cap - 1, lon_idx + 1), center_idx])
 
     return build_mesh_from_faces(
         np.array(positions), np.array(faces),
@@ -1608,14 +1657,24 @@ def boundary_source(state, channel, value, ground_z, band):
     return state._replace(vertex_state=state.vertex_state.at[:, channel].set(new))
 
 
-def project_ground(pos, on_b, params):
-    """Snap boundary vertices to z=ground_z and prevent any vertex from going
-    below it. `on_b` is the topology-derived boundary mask (get_on_boundary),
-    precomputed once per substep since topology is fixed across XPBD iterations.
+def project_ground(pos, on_b, params, base_pos=None):
+    """Pin boundary vertices and keep every vertex above the ground plane.
+    `on_b` is the topology-derived boundary mask (get_on_boundary), precomputed
+    once per substep since topology is fixed across XPBD iterations.
+
+    Two pinning modes:
+    - `base_pos is None` (default, open-rim shapes like discs): snap only the
+      boundary's z to `ground_z`; x/y slide freely so the rim can ruffle/expand.
+    - `base_pos` given (hemisphere's fixed bottom circle): restore boundary
+      vertices to their stored x/y/z so the base circle is fully immovable,
+      matching the Rust port's pinned bottom cap (which fixes all three axes,
+      not just z).
     """
-    z = pos[:, 2]
-    z = jnp.where(on_b, params.ground_z, z)
-    z = jnp.maximum(z, params.ground_z)
+    if base_pos is not None:
+        pos = jnp.where(on_b[:, None], base_pos, pos)
+    else:
+        pos = pos.at[:, 2].set(jnp.where(on_b, params.ground_z, pos[:, 2]))
+    z = jnp.maximum(pos[:, 2], params.ground_z)
     return pos.at[:, 2].set(z)
 
 
@@ -1639,11 +1698,15 @@ def _anisotropy_factor(state, safe_dest, he_src, params):
 
 
 @jax.jit
-def grow_intrinsic_lengths(state, params, key):
+def grow_intrinsic_lengths(state, params, key, no_grow_v=None):
     """Grow intrinsic edge lengths based on source vertex state channel 0.
 
     Channel 0 is interpreted as a growth signal in [0, 1] (Lenia) or via
     sigmoid (NCA). Caller is responsible for any pre-clamping/saturation.
+
+    `no_grow_v` (optional bool mask over vertices): half-edges whose source
+    vertex is set never grow — used to freeze the hemisphere's pinned base
+    circle, mirroring the Rust port's pinned vertices skipping growth.
     """
     he_valid = state.half_edge_idx != -1
     safe_twin = jnp.clip(state.half_edge_twin, 0)
@@ -1659,6 +1722,8 @@ def grow_intrinsic_lengths(state, params, key):
     aniso = _anisotropy_factor(state, safe_dest, he_src, params)
     delta = grow * noise * params.state_dt * params.growth_rate * aniso
     delta = jnp.where(he_valid, delta, 0.0)
+    if no_grow_v is not None:
+        delta = jnp.where(no_grow_v[he_src], 0.0, delta)
 
     new_intrinsic = state.half_edge_intrinsic_len + delta
     new_intrinsic = jnp.minimum(new_intrinsic, params.spring_len * 3.0)
@@ -1666,11 +1731,13 @@ def grow_intrinsic_lengths(state, params, key):
 
 
 @jax.jit
-def grow_intrinsic_lengths_phototropic(state, params, key):
+def grow_intrinsic_lengths_phototropic(state, params, key, no_grow_v=None):
     """Growth driven by ch0 (tissue) in [0, 1], no threshold.
 
     grow = tissue^1.5 (concave-down in [0,1], slow start, fast finish).
     Always positive: light-driven growth never shrinks, mirroring biology.
+
+    `no_grow_v`: see grow_intrinsic_lengths (freezes pinned base vertices).
     """
     he_valid = state.half_edge_idx != -1
     safe_twin = jnp.clip(state.half_edge_twin, 0)
@@ -1686,18 +1753,22 @@ def grow_intrinsic_lengths_phototropic(state, params, key):
     aniso = _anisotropy_factor(state, safe_dest, he_src, params)
     delta = grow * noise * params.state_dt * params.growth_rate * aniso
     delta = jnp.where(he_valid, delta, 0.0)
+    if no_grow_v is not None:
+        delta = jnp.where(no_grow_v[he_src], 0.0, delta)
 
     new_intrinsic = state.half_edge_intrinsic_len + delta
     new_intrinsic = jnp.minimum(new_intrinsic, params.spring_len * 3.0)
     return state._replace(half_edge_intrinsic_len=new_intrinsic)
 
 
-def grow_intrinsic_lengths_bipolar(state, params, key):
+def grow_intrinsic_lengths_bipolar(state, params, key, no_grow_v=None):
     """Bipolar growth: ch0 in [-1, 1] drives signed length change. Negative
     regions shrink; positive regions grow. Allows folds / buckling that the
     one-sided variant cannot reach.
 
     Lengths clamped to [0.3, 3.0] * spring_len to prevent degenerate edges.
+
+    `no_grow_v`: see grow_intrinsic_lengths (freezes pinned base vertices).
     """
     he_valid = state.half_edge_idx != -1
     safe_twin = jnp.clip(state.half_edge_twin, 0)
@@ -1713,6 +1784,8 @@ def grow_intrinsic_lengths_bipolar(state, params, key):
     aniso = _anisotropy_factor(state, safe_dest, he_src, params)
     delta = grow * noise * params.state_dt * params.growth_rate * aniso
     delta = jnp.where(he_valid, delta, 0.0)
+    if no_grow_v is not None:
+        delta = jnp.where(no_grow_v[he_src], 0.0, delta)
 
     new_intrinsic = state.half_edge_intrinsic_len + delta
     new_intrinsic = jnp.clip(
@@ -1726,11 +1799,22 @@ def grow_intrinsic_lengths_bipolar(state, params, key):
 XPBD_ITERATIONS = 20  # static for JIT compatibility (matches the Rust port)
 
 
-@functools.partial(jax.jit, static_argnums=(4, 5))
-def batched_physics_step(state, params, cheb_coeffs, key, n_substeps, growth_mode):
+@functools.partial(jax.jit, static_argnums=(4, 5, 6, 7))
+def batched_physics_step(state, params, cheb_coeffs, key, n_substeps,
+                         growth_mode, fix_boundary=False, pin_ground_cap=False):
     """Run n_substeps of XPBD + CA in a single JIT call.
 
     growth_mode: "lenia" or "nca" (static argument, controls trace).
+    fix_boundary (static): when True (open-rim hemisphere), the topological
+    boundary loop is the fixed bottom circle — its vertices are fully pinned in
+    x/y/z to their position at the start of this call and never grow, matching
+    the Rust port's pinned rim. When False (open-rim discs), only z is snapped
+    to the ground plane so the rim can ruffle freely.
+    pin_ground_cap (static): when True (closed hemisphere, which has no
+    boundary), the pinned set is the whole flat bottom cap — every active vertex
+    within `ground_pin_strength · spring_len` of the ground plane. Like Rust's
+    pinned bottom cap, those vertices are frozen in x/y/z and their edges never
+    grow/subdivide, so the closing circle and disc stay flat and static.
     """
 
     # Topology is constant across substeps (the scan carry holds only
@@ -1738,9 +1822,20 @@ def batched_physics_step(state, params, cheb_coeffs, key, n_substeps, growth_mod
     # boundary mask and the shared topology bundle are computed once here
     # rather than inside every substep / XPBD iteration.
     neighbor_list = build_neighbor_list(state)
-    on_b = get_on_boundary(state)
     topo = build_xpbd_topo(state)
     active_v = topo.active
+
+    # The pinned-vertex mask: the topological boundary (open rim) or the whole
+    # ground-plane cap (closed hemisphere). Pinned vertices are frozen to their
+    # current x/y/z (base_pos) and their outgoing edges never grow (no_grow_v).
+    if pin_ground_cap:
+        cap_band = params.ground_pin_strength * params.spring_len
+        on_b = active_v & (state.vertex_pos[:, 2] <= params.ground_z + cap_band)
+    else:
+        on_b = get_on_boundary(state)
+    pin = fix_boundary or pin_ground_cap
+    base_pos = state.vertex_pos if pin else None
+    no_grow_v = on_b if pin else None
 
     def substep(carry, _):
         pos, vertex_state, he_intrinsic, key = carry
@@ -1774,14 +1869,14 @@ def batched_physics_step(state, params, cheb_coeffs, key, n_substeps, growth_mod
 
         pos, _ = jax.lax.scan(xpbd_iter, pos, None, length=XPBD_ITERATIONS)
 
-        pos = project_ground(pos, on_b, params)
+        pos = project_ground(pos, on_b, params, base_pos)
         st = st._replace(vertex_pos=pos)
 
         key, subkey = jax.random.split(key)
 
         if growth_mode == 'lenia':
             st = chebyshev_ca_step(st, cheb_coeffs, params)
-            st = grow_intrinsic_lengths(st, params, subkey)
+            st = grow_intrinsic_lengths(st, params, subkey, no_grow_v)
         elif growth_mode == 'nca':
             st = nca_update(st, params)
             vs = st.vertex_state
@@ -1790,7 +1885,7 @@ def batched_physics_step(state, params, cheb_coeffs, key, n_substeps, growth_mod
             ch_rest = jnp.clip(vs[:, 1:], -5.0, 5.0)
             vs = jnp.concatenate([ch0[:, None], ch_rest], axis=1)
             st = st._replace(vertex_state=vs)
-            st = grow_intrinsic_lengths(st, params, subkey)
+            st = grow_intrinsic_lengths(st, params, subkey, no_grow_v)
         elif growth_mode == 'nca_bipolar':
             st = nca_update(st, params)
             vs = st.vertex_state
@@ -1799,7 +1894,7 @@ def batched_physics_step(state, params, cheb_coeffs, key, n_substeps, growth_mod
             ch_rest = jnp.clip(vs[:, 1:], -5.0, 5.0)
             vs = jnp.concatenate([ch0[:, None], ch_rest], axis=1)
             st = st._replace(vertex_state=vs)
-            st = grow_intrinsic_lengths_bipolar(st, params, subkey)
+            st = grow_intrinsic_lengths_bipolar(st, params, subkey, no_grow_v)
         elif growth_mode == 'phototropic':
             active_f = (state.vertex_idx != -1).astype(jnp.float32)
 
@@ -1841,7 +1936,7 @@ def batched_physics_step(state, params, cheb_coeffs, key, n_substeps, growth_mod
                 vertex_state=st.vertex_state.at[:, 0].set(tissue_next),
             )
 
-            st = grow_intrinsic_lengths_phototropic(st, params, subkey)
+            st = grow_intrinsic_lengths_phototropic(st, params, subkey, no_grow_v)
         else:
             raise ValueError(f"Unknown growth_mode: {growth_mode}")
 
@@ -2011,7 +2106,20 @@ class JAXNvdiffrastRenderer:
         self.ambient = 0.25
         self.diffuse = 0.75
 
-    def render(self, state):
+    def render(self, state, rot=None, flip_z=True):
+        """Render the mesh to an (H, W, 3) uint8 image.
+
+        `rot` (optional 3x3): a rotation applied to the centered geometry
+        before the orthographic projection, so callers can orbit the camera
+        (see `turntable_rot` / `render_turntable_gif`). The default view looks
+        down +z (top-down); pass a turntable rotation for a readable 3/4 view.
+        Framing uses the rotation-invariant bounding sphere so the form does
+        not zoom in/out as it spins.
+
+        `flip_z` (default True): negate the world z axis before projecting, so
+        the grown dome reads the way we want on screen (apex pointing up). This
+        only affects rendering — the simulation/export geometry is untouched.
+        """
         verts_j, faces_j, n_active = extract_mesh_for_nvdiffrast(state)
         normals_j = compute_vertex_normals_jax(verts_j, faces_j)
         colors_j = compute_vertex_colors_jax(state)
@@ -2024,28 +2132,34 @@ class JAXNvdiffrastRenderer:
         n = int(n_active)
         faces = faces[:n].contiguous()
 
-        # Auto-fit the (orthographic) camera to the mesh bounding box so the
-        # form fills the frame regardless of how far it has grown — the fixed
-        # [0,width]x[0,height] world window used to clip large meshes to an
-        # extreme close-up. Frame over the vertices actually referenced by the
-        # live faces; fall back to the fixed window for a degenerate mesh.
+        # Auto-fit the orthographic camera to the live mesh: center on the
+        # bounding-box midpoint, scale by the bounding-sphere radius (which is
+        # rotation invariant, so an orbiting turntable keeps a steady framing).
         if n > 0:
             used = faces.flatten().unique()
             used_v = verts[used]
-            vmin = used_v.min(dim=0).values
-            vmax = used_v.max(dim=0).values
-            center = 0.5 * (vmin + vmax)
-            extent = (vmax - vmin).max()
-            scale = 1.7 / (extent + 1e-6)  # 1.7 = 0.85 * 2 -> fill ~85%
-            cx, cy, cz = center[0], center[1], center[2]
+            center = 0.5 * (used_v.min(dim=0).values + used_v.max(dim=0).values)
+            radius = (used_v - center).norm(dim=1).max()
+            scale = 1.7 / (2.0 * radius + 1e-6)  # fill ~85% of the frame
         else:
-            cx, cy, cz = self.center_x, self.center_y, 0.0
+            center = torch.tensor([self.center_x, self.center_y, 0.0],
+                                  device=self.device)
             scale = self.proj_scale
 
-        verts_clip = verts.clone()
-        verts_clip[:, 0] = (verts[:, 0] - cx) * scale
-        verts_clip[:, 1] = (verts[:, 1] - cy) * scale
-        verts_clip[:, 2] = (verts[:, 2] - cz) * scale
+        centered = verts - center
+        if flip_z:
+            # Reflect through the ground plane (negate world z). For a spinning
+            # turntable this reads as "flipped upside down"; the doubled faces
+            # keep both sides lit so the reflected winding is invisible.
+            flip = torch.tensor([1.0, 1.0, -1.0], device=self.device,
+                                 dtype=verts.dtype)
+            centered = centered * flip
+            normals = normals * flip
+        if rot is not None:
+            R = torch.as_tensor(rot, device=self.device, dtype=verts.dtype)
+            centered = centered @ R.T
+            normals = normals @ R.T
+        verts_clip = centered * scale
         verts_homo = torch.cat([verts_clip, torch.ones_like(verts_clip[:, :1])], dim=-1)
         verts_homo = verts_homo.unsqueeze(0).contiguous()
 
@@ -2063,7 +2177,11 @@ class JAXNvdiffrastRenderer:
 
             ni = normals_interp / (torch.norm(normals_interp, dim=-1, keepdim=True) + 1e-8)
             light_dir = self.light_dir.view(1, 1, 1, 3)
-            ndotl = torch.clamp(torch.sum(ni * light_dir, dim=-1, keepdim=True), 0, 1)
+            # Two-sided diffuse (|n·l|): the mesh is closed and we orbit all the
+            # way under it, so back-facing surfaces (e.g. the downward-facing
+            # bottom cap) must still be lit — otherwise the flat base renders
+            # black against the background and reads as a hole.
+            ndotl = torch.abs(torch.sum(ni * light_dir, dim=-1, keepdim=True))
             mesh_color = colors_interp * (self.ambient + self.diffuse * ndotl)
             mesh_color = dr.antialias(mesh_color, rast_out, verts_homo, faces_double)
 
@@ -2074,6 +2192,99 @@ class JAXNvdiffrastRenderer:
             color = (color[0] * 255).clamp(0, 255).to(torch.uint8)
 
         return color.cpu().numpy()
+
+
+def turntable_rot(azimuth, elevation=0.35):
+    """3x3 rotation for an orthographic turntable camera orbiting +z-up.
+
+    `azimuth` spins about the world z (growth) axis; `elevation` (radians)
+    tilts the camera above the horizon (default ~20°). The returned matrix
+    maps world coordinates into view space where +x=screen-right,
+    +y=screen-up, +z=toward-camera, so the hemisphere's z axis reads as
+    "up" on screen instead of the default top-down view.
+    """
+    ca, sa = np.cos(azimuth), np.sin(azimuth)
+    ce, se = np.cos(elevation), np.sin(elevation)
+    # Camera direction (center -> camera): orbit in azimuth, lifted by el.
+    cam = np.array([ce * ca, ce * sa, se], dtype=np.float32)
+    world_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    right = np.cross(world_up, cam)
+    right /= np.linalg.norm(right) + 1e-8
+    up = np.cross(cam, right)
+    return np.stack([right, up, cam], axis=0).astype(np.float32)
+
+
+def render_turntable_gif(renderer, state, path, n_frames=48, elevation=0.0,
+                         elev_amp=0.9, duration=80, loop=0):
+    """Render `state` as a rotating turntable GIF (one full revolution).
+
+    The camera elevation oscillates sinusoidally over the revolution
+    (`elevation` midline ± `elev_amp` radians, one full cycle so it loops
+    seamlessly): it rises to look down on the top, then dips below the horizon
+    to look up at the underside, so a single GIF shows both faces of the mesh.
+    Set `elev_amp=0` for a classic fixed-elevation turntable.
+    """
+    import imageio.v3 as iio
+    frames = [
+        renderer.render(
+            state,
+            rot=turntable_rot(
+                2 * np.pi * i / n_frames,
+                elevation + elev_amp * np.sin(2 * np.pi * i / n_frames),
+            ),
+        )
+        for i in range(n_frames)
+    ]
+    iio.imwrite(path, frames, duration=duration, loop=loop)
+    return path
+
+
+def save_mesh_ply(state, path, include_colors=True):
+    """Export the live mesh (active faces only, re-indexed) to a binary PLY.
+
+    Vertex colors come from channel 0..2 of the per-vertex state (the same
+    mapping the renderer uses). Writes binary little-endian PLY directly so
+    there is no third-party mesh-IO dependency. Returns (n_verts, n_faces).
+    """
+    verts_j, faces_j, n_active = extract_mesh_for_nvdiffrast(state)
+    n_active = int(n_active)
+    faces_np = np.asarray(faces_j)[:n_active]
+    used = np.unique(faces_np)
+    remap = -np.ones(int(verts_j.shape[0]), np.int64)
+    remap[used] = np.arange(len(used))
+    verts = np.asarray(verts_j)[used].astype('<f4')
+    faces = remap[faces_np].astype('<i4')
+    nv, nf = len(verts), len(faces)
+
+    header = [b"ply", b"format binary_little_endian 1.0",
+              b"element vertex %d" % nv,
+              b"property float x", b"property float y", b"property float z"]
+    if include_colors:
+        header += [b"property uchar red", b"property uchar green",
+                   b"property uchar blue"]
+    header += [b"element face %d" % nf,
+               b"property list uchar int vertex_indices", b"end_header"]
+
+    # Interleave per-vertex records as a structured array.
+    if include_colors:
+        colors_j = compute_vertex_colors_jax(state)
+        vc = (np.asarray(colors_j)[used] * 255).clip(0, 255).astype(np.uint8)
+        vrec = np.empty(nv, dtype=[('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+                                   ('r', 'u1'), ('g', 'u1'), ('b', 'u1')])
+        vrec['x'], vrec['y'], vrec['z'] = verts[:, 0], verts[:, 1], verts[:, 2]
+        vrec['r'], vrec['g'], vrec['b'] = vc[:, 0], vc[:, 1], vc[:, 2]
+    else:
+        vrec = verts
+
+    frec = np.empty(nf, dtype=[('n', 'u1'), ('v', '<i4', 3)])
+    frec['n'] = 3
+    frec['v'] = faces
+
+    with open(path, 'wb') as f:
+        f.write(b"\n".join(header) + b"\n")
+        f.write(vrec.tobytes())
+        f.write(frec.tobytes())
+    return nv, nf
 
 
 def enforce_boundary(state):

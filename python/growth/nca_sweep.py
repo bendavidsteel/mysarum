@@ -46,7 +46,8 @@ log = logging.getLogger("nca-sweep")
 
 _jit_physics_step = jax.jit(
     g.batched_physics_step,
-    static_argnames=("n_substeps", "growth_mode"),
+    static_argnames=("n_substeps", "growth_mode", "fix_boundary",
+                     "pin_ground_cap"),
 )
 
 
@@ -169,7 +170,7 @@ CONFIG_DEFAULTS = dict(
     relaxation=0.7,
     growth_mode="nca",
     rings=4, sphere_lat=6, sphere_lon=10, sphere_radius_mult=2.0,
-    hemi_lat=4, hemi_lon=10, hemi_radius_mult=1.5,
+    hemi_lat=4, hemi_lon=10, hemi_radius_mult=1.5, hemi_closed=False,
     light_dir=[0.0, 0.0, 1.0],
     light_pos=[400.0, 400.0, 1500.0],
     light_decay_dist=1e6,
@@ -201,6 +202,7 @@ def _build_initial(cfg, params, resolution):
             radius_multiplier=cfg["hemi_radius_mult"],
             state_dims=cfg["state_dims"],
             ground_z=cfg["ground_z"],
+            closed=cfg["hemi_closed"],
         )
     return g.make_sphere(
         width=resolution, height=resolution, params=params,
@@ -262,10 +264,19 @@ def run_one(cfg, frames, substeps, resolution, max_edge_len, max_splits, rendere
     n_iters = frames // substeps
     nv = int(jnp.sum(_active(state)))
     growth = [nv]
+    # The hemisphere sits on the ground with a fixed base (fully pinned, no
+    # growth); open-rim shapes (disc) keep a moving boundary. A closed
+    # hemisphere has no boundary, so its whole flat bottom cap is pinned by
+    # the ground-plane mask instead of the topological rim.
+    is_hemi = cfg["shape"] == "hemisphere"
+    closed_hemi = is_hemi and cfg["hemi_closed"]
+    fix_boundary = is_hemi and not closed_hemi
+    pin_ground_cap = closed_hemi
     t0 = time.time()
     for _ in range(n_iters):
         state, key = _jit_physics_step(
             state, params, cheb_coeffs, key, substeps, cfg["growth_mode"],
+            fix_boundary=fix_boundary, pin_ground_cap=pin_ground_cap,
         )
         state, key, nv = g.split_long_edges(state, params, key, max_splits=max_splits)
         state = g.refine_mesh(state)
@@ -275,7 +286,10 @@ def run_one(cfg, frames, substeps, resolution, max_edge_len, max_splits, rendere
     elapsed = time.time() - t0
     has_nan = bool(jnp.any(jnp.isnan(state.vertex_pos)))
 
-    img = renderer.render(state) if not has_nan else None
+    # 3/4 turntable view, not the default top-down (which looks straight into
+    # the open hemisphere — a ring with a dark hole).
+    img = renderer.render(state, rot=g.turntable_rot(0.6, 0.35)) \
+        if not has_nan else None
     descriptors = None
     if not has_nan and int(nv) > 30:
         verts_j, faces_j, n_active = g.extract_mesh_for_nvdiffrast(state)
@@ -292,7 +306,7 @@ def run_one(cfg, frames, substeps, resolution, max_edge_len, max_splits, rendere
             log.warning("descriptor failure: %s", e)
 
     return dict(
-        cfg=cfg, image=img, descriptors=descriptors,
+        cfg=cfg, image=img, descriptors=descriptors, state=state,
         growth_curve=growth, elapsed=elapsed, has_nan=has_nan,
         n_verts=int(nv), ok=(not has_nan and descriptors is not None),
     )
@@ -348,6 +362,10 @@ def main(cfg: DictConfig):
     os.makedirs(out_dir, exist_ok=True)
     img_dir = os.path.join(out_dir, "imgs")
     os.makedirs(img_dir, exist_ok=True)
+    mesh_dir = os.path.join(out_dir, "meshes")
+    os.makedirs(mesh_dir, exist_ok=True)
+    gif_dir = os.path.join(out_dir, "gifs")
+    os.makedirs(gif_dir, exist_ok=True)
 
     with open(os.path.join(out_dir, "resolved_config.yaml"), "w") as f:
         OmegaConf.save(cfg, f, resolve=True)
@@ -386,10 +404,21 @@ def main(cfg: DictConfig):
 
         img_path = os.path.join(img_dir, f"{tag}.png")
         Image.fromarray(r["image"]).save(img_path)
+
+        mesh_path = gif_path = None
+        if cfg.get("save_meshes", True):
+            mesh_path = os.path.join(mesh_dir, f"{tag}.ply")
+            g.save_mesh_ply(r["state"], mesh_path)
+        if cfg.get("make_gifs", True):
+            gif_path = os.path.join(gif_dir, f"{tag}.gif")
+            g.render_turntable_gif(renderer, r["state"], gif_path,
+                                   n_frames=cfg.get("gif_frames", 36))
+
         features.append(r["descriptors"]["features"])
         tags.append(tag)
         index.append({
             **entry, "tag": tag, "img": img_path,
+            "mesh": mesh_path, "gif": gif_path,
             "n_verts": r["n_verts"], "elapsed": r["elapsed"],
             "growth_curve": r["growth_curve"],
         })

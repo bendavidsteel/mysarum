@@ -1,0 +1,68 @@
+# 3D-printable shapes: start from a LARGE hemisphere and grow only modestly,
+# so the final mesh is ~2/3 larger than the initial dome (not ~15-20x as in the
+# default sweeps). A wide, already-finely-tessellated base + limited growth gives
+# squat, ruffled coral domes that print well (broad footprint, no tall spindly
+# overhangs).
+#
+# Sizing (calibrated empirically, seed 11 isotropic, growth_rate=1.5/state_dt=0.04):
+#   hemi_radius_mult=12  -> radius=spring_len*12=360, base diameter=720,
+#                          initial max-extent 720, ~1426 verts (24 edges/radius).
+#   n_lat/n_lon chosen so initial edges ~ spring_len (n_lon~6.3R, n_lat~1.6R).
+#   Growth curve: ratio(final/initial max-extent) hits ~1.67 at frames=810
+#   (~2400 verts, max-extent ~1209). It keeps climbing after that (2.0x @ ~1100
+#   frames, 2.46x @ 2000), so frames is the lever for the target ratio.
+#
+# RUN WITH (frames tuned for the ~2/3-larger target; small vert budget):
+#   GROWTH_MAX_VERTICES=4000 conda run -n base python nca_sweep.py \
+#       sweep=printable frames=810 resolution=384
+#
+# Dynamics are center-invariant (gravity is z-only, directional light w/ ~no
+# falloff, ground pin is z-only), so render resolution can stay 384 even though
+# the dome is centered at resolution/2 and extends into negative x/y.
+
+name: printable
+
+_common: &common
+  growth_mode: phototropic
+  shape: hemisphere
+  state_dims: 3
+  seed_pattern: apex
+  light_dir: [0.0, 0.0, 1.0]
+  # Quasi-static (smooth folds, cf. Rust port); fast growth buckles into creases.
+  growth_rate: 1.5
+  state_dt: 0.04
+  # Large starting dome (see header). Edge length ~ spring_len at these counts.
+  hemi_radius_mult: 12.0
+  hemi_lat: 19
+  hemi_lon: 75
+  # Watertight closed half-ball (dome + flat disc cap on the ground). No open
+  # rim, so the base is anchored by the ground-plane clamp + gravity, not a pin.
+  hemi_closed: true
+
+configs:
+  # ── A: isotropic baseline + sweep strength along vertical axis ──────────
+  - {<<: *common, mlp_seed: 11, anisotropy_dir: [0.0, 0.0, 1.0], anisotropy_strength: 0.0}
+  - {<<: *common, mlp_seed: 11, anisotropy_dir: [0.0, 0.0, 1.0], anisotropy_strength: 0.4}
+  - {<<: *common, mlp_seed: 11, anisotropy_dir: [0.0, 0.0, 1.0], anisotropy_strength: 0.8}
+  - {<<: *common, mlp_seed: 11, anisotropy_dir: [0.0, 0.0, 1.0], anisotropy_strength: 1.0}
+
+  # ── B: horizontal axes (flat, spreading growth) ─────────────────────────
+  - {<<: *common, mlp_seed: 23, anisotropy_dir: [1.0, 0.0, 0.0], anisotropy_strength: 0.7}
+  - {<<: *common, mlp_seed: 23, anisotropy_dir: [0.0, 1.0, 0.0], anisotropy_strength: 0.7}
+
+  # ── C: oblique / diagonal axes (the "flexible vector" payoff) ───────────
+  - {<<: *common, mlp_seed: 31, anisotropy_dir: [1.0, 1.0, 0.0], anisotropy_strength: 0.7}
+  - {<<: *common, mlp_seed: 31, anisotropy_dir: [1.0, 0.0, 1.0], anisotropy_strength: 0.7}
+  - {<<: *common, mlp_seed: 31, anisotropy_dir: [1.0, 1.0, 1.0], anisotropy_strength: 0.7}
+  - {<<: *common, mlp_seed: 31, anisotropy_dir: [0.5, -0.5, 0.7], anisotropy_strength: 0.7}
+  - {<<: *common, mlp_seed: 31, anisotropy_dir: [-0.7, 0.3, 0.6], anisotropy_strength: 0.7}
+
+  # ── D: strong oblique anisotropy at different strengths ─────────────────
+  - {<<: *common, mlp_seed: 47, anisotropy_dir: [1.0, 0.0, 0.5], anisotropy_strength: 0.5}
+  - {<<: *common, mlp_seed: 47, anisotropy_dir: [1.0, 0.0, 0.5], anisotropy_strength: 0.9}
+  - {<<: *common, mlp_seed: 47, anisotropy_dir: [0.0, 1.0, 0.5], anisotropy_strength: 0.9}
+
+  # ── E: anisotropy axis vs light direction interplay ─────────────────────
+  - {<<: *common, mlp_seed: 53, light_dir: [1.0, 0.0, 0.6], anisotropy_dir: [0.0, 0.0, 1.0], anisotropy_strength: 0.8}
+  - {<<: *common, mlp_seed: 53, light_dir: [1.0, 0.0, 0.6], anisotropy_dir: [1.0, 0.0, 0.0], anisotropy_strength: 0.8}
+  - {<<: *common, mlp_seed: 53, light_dir: [0.7, 0.7, 0.2], anisotropy_dir: [0.7, 0.7, 0.0], anisotropy_strength: 0.8}

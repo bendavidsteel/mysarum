@@ -30,7 +30,8 @@ import growth_halfedge_jax as g
 # scan and the lenia/nca branch trace once.
 _jit_physics_step = jax.jit(
     g.batched_physics_step,
-    static_argnames=("n_substeps", "growth_mode"),
+    static_argnames=("n_substeps", "growth_mode", "fix_boundary",
+                     "pin_ground_cap"),
 )
 
 logging.basicConfig(

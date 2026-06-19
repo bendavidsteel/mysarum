@@ -5,33 +5,26 @@
 @group(0) @binding(0) var<storage, read_write> vertex_pos: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> sorted_idx: array<u32>;
 @group(0) @binding(2) var<storage, read> bin_offset: array<u32>;
-@group(0) @binding(3) var<storage, read> he_packed: array<vec4<i32>>;
-@group(0) @binding(4) var<storage, read> vertex_he: array<i32>;
+// Per-vertex 1-ring neighbour list, NEIGHBORS_K slots each, -1 terminated.
+// Precomputed on the CPU on topology frames (see upload_mesh_to_gpu).
+@group(0) @binding(3) var<storage, read> vertex_neighbors: array<i32>;
 @group(1) @binding(0) var<uniform> params: SimParams;
 
+// MUST match VERTEX_NEIGHBORS_MAX in gpu.rs.
+const NEIGHBORS_K: u32 = 20u;
+
 // Check if vertex j is a mesh neighbor of vertex i (connected by an edge).
-// Skip collision for direct mesh neighbors — springs handle those.
+// Skip collision for direct mesh neighbors — springs handle those. A fixed
+// contiguous scan of the precomputed list replaces the old half-edge fan walk:
+// no global-memory pointer chase, no warp divergence. The list is at most
+// valence-long (it ends at the -1 sentinel), so the common non-neighbor case
+// — distant folds touching during buckling — pays only ~valence cheap reads.
 fn is_mesh_neighbor(i: u32, j: u32) -> bool {
-    let start_he = vertex_he[i];
-    if start_he < 0 { return false; }
-
-    let start_dest = he_packed[start_he].x;
-    var he = start_he;
-    var first = true;
-
-    for (var iter = 0u; iter < 20u; iter += 1u) {
-        let data = he_packed[he];
-        let dest = data.x;
-        let twin = data.y;
-
-        if dest == i32(j) { return true; }
-
-        if twin < 0 { break; }
-        let twin_next = he_packed[twin].z;
-        if twin_next < 0 { break; }
-        he = twin_next;
-        if he_packed[he].x == start_dest && !first { break; }
-        first = false;
+    let base = i * NEIGHBORS_K;
+    for (var s = 0u; s < NEIGHBORS_K; s += 1u) {
+        let nb = vertex_neighbors[base + s];
+        if nb < 0 { return false; }
+        if nb == i32(j) { return true; }
     }
     return false;
 }

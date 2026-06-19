@@ -3295,6 +3295,7 @@ dependencies = [
  "nannou",
  "nannou_audio",
  "pollster",
+ "wgpu",
 ]
 
 [[package]]

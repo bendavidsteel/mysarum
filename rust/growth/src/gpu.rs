@@ -8,6 +8,14 @@ use crate::mesh::{HalfEdgeMesh, MAX_VERTICES, MAX_HALF_EDGES, MAX_FACES};
 const MAX_BINS_PER_DIM: u32 = 64;
 pub(crate) const WORKGROUP_SIZE: u32 = 64;
 
+// Per-vertex 1-ring neighbour list width for the collision shader's mesh-
+// neighbour test. The list is precomputed on the CPU on topology frames so
+// the shader does a fixed contiguous lookup instead of a divergent half-edge
+// fan walk through global memory. MUST match NEIGHBORS_K in
+// shaders/project_collision.wgsl. 20 matches the old in-shader walk's iteration
+// cap, so the exclusion set is identical — only the cost changes.
+pub(crate) const VERTEX_NEIGHBORS_MAX: usize = 20;
+
 // Shader sources (loaded at compile time, common prepended)
 const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
 const FILL_BINS_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/fill_bins.wgsl"));
@@ -69,6 +77,14 @@ pub(crate) struct GpuSimParams {
     // source vertices, and how fast it decays (sets the falloff radius of the dot).
     pub(crate) dot_diffusion: f32,
     pub(crate) dot_decay: f32,
+    // Inner exclusion hemisphere (hemisphere start only): when inner_radius > 0,
+    // physics keeps every vertex outside a sphere of this radius centred at the
+    // origin, carving a dome cavity under the base cap for hardware. 0 disables.
+    // The three pads keep the uniform struct 16-byte aligned for WGSL.
+    pub(crate) inner_radius: f32,
+    pub(crate) _pad0: f32,
+    pub(crate) _pad1: f32,
+    pub(crate) _pad2: f32,
 }
 
 #[repr(C)]
@@ -99,6 +115,9 @@ pub(crate) struct GpuCompute {
     // Topology buffers (packed: vec4<i32> = dest, twin, next, face)
     he_packed_buf: wgpu::Buffer,
     vertex_he_buf: wgpu::Buffer,
+    // Per-vertex 1-ring neighbour list (VERTEX_NEIGHBORS_MAX i32 per vertex,
+    // -1 sentinel terminates), rebuilt on topology frames for the collision pass.
+    vertex_neighbors_buf: wgpu::Buffer,
 
     // State evolution buffers
     pub(crate) vertex_state_buf: wgpu::Buffer,
@@ -195,6 +214,7 @@ pub(crate) struct GpuCompute {
 pub(crate) struct StagingBuffers {
     pos: Vec<[f32; 4]>,
     he: Vec<[i32; 4]>,
+    neighbors: Vec<i32>,
     index: Vec<u32>,
 }
 
@@ -235,6 +255,11 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
     });
     let vertex_he_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("vertex_he"), size: idx_buf_size, usage: storage_r, mapped_at_creation: false,
+    });
+    let vertex_neighbors_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vertex_neighbors"),
+        size: (MAX_VERTICES * VERTEX_NEIGHBORS_MAX * 4) as u64,
+        usage: storage_r, mapped_at_creation: false,
     });
     let vertex_state_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("vertex_state"), size: state_buf_size, usage: storage_rw, mapped_at_creation: false,
@@ -419,13 +444,12 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
         .storage_buffer(cs, false, true)   // vertex_he (R)
         .build(device);
 
-    // project_collision: group0=pos(RW)+sorted(R)+offset(R)+he_packed(R)+vertex_he(R), group1=params(U)
+    // project_collision: group0=pos(RW)+sorted(R)+offset(R)+vertex_neighbors(R), group1=params(U)
     let project_collision_data_layout = wgpu::BindGroupLayoutBuilder::new()
         .storage_buffer(cs, false, false)  // vertex_pos (RW)
         .storage_buffer(cs, false, true)   // sorted_idx (R)
         .storage_buffer(cs, false, true)   // bin_offset (R)
-        .storage_buffer(cs, false, true)   // he_packed (R)
-        .storage_buffer(cs, false, true)   // vertex_he (R)
+        .storage_buffer(cs, false, true)   // vertex_neighbors (R)
         .build(device);
 
     // chebyshev_init: group0=state(R)+t_a(RW)+t_b(RW)+result(RW)+he_packed(R)+vertex_he(R)
@@ -661,8 +685,7 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
         .buffer_bytes(&vertex_pos_buf, 0, None)
         .buffer_bytes(&sorted_idx_buf, 0, None)
         .buffer_bytes(&bin_offset_buf, 0, None)
-        .buffer_bytes(&he_packed_buf, 0, None)
-        .buffer_bytes(&vertex_he_buf, 0, None)
+        .buffer_bytes(&vertex_neighbors_buf, 0, None)
         .build(device, &project_collision_data_layout);
     let project_collision_params_bg = wgpu::BindGroupBuilder::new()
         .buffer_bytes(&sim_params_buf, 0, None)
@@ -748,7 +771,7 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
     GpuCompute {
         vertex_pos_buf, vertex_force_buf,
         bin_size_buf, bin_offset_buf, bin_offset_tmp_buf, sorted_idx_buf,
-        he_packed_buf, vertex_he_buf,
+        he_packed_buf, vertex_he_buf, vertex_neighbors_buf,
         vertex_state_buf, vertex_source_buf,
         he_intrinsic_len_buf,
         cheb_a_buf, cheb_b_buf, cheb_c_buf, cheb_result_buf,
@@ -782,6 +805,7 @@ pub(crate) fn create_gpu_compute(device: &wgpu::Device, queue: &wgpu::Queue) -> 
         staging: Arc::new(Mutex::new(StagingBuffers {
             pos: vec![[0.0f32; 4]; MAX_VERTICES],
             he: vec![[0i32; 4]; MAX_HALF_EDGES],
+            neighbors: vec![-1i32; MAX_VERTICES * VERTEX_NEIGHBORS_MAX],
             index: Vec::with_capacity(MAX_FACES * 3),
         })),
     }
@@ -830,6 +854,40 @@ pub(crate) fn upload_mesh_to_gpu(queue: &wgpu::Queue, gpu: &GpuCompute, mesh: &H
 
     // Upload vertex half-edge indices (only active range)
     queue.write_buffer(&gpu.vertex_he_buf, 0, bytemuck::cast_slice(&mesh.vertex_half_edge[..n]));
+
+    // Build per-vertex 1-ring neighbour lists for the collision pass. This is
+    // the same fan walk the collision shader used to do per candidate pair
+    // (get_vertex_half_edge's traversal); doing it once here on the CPU lets
+    // the shader replace a divergent global-memory pointer chase with a fixed
+    // contiguous lookup. -1 terminates each vertex's list.
+    let k = VERTEX_NEIGHBORS_MAX;
+    for v in 0..n {
+        let base = v * k;
+        for s in 0..k { staging.neighbors[base + s] = -1; }
+        if mesh.vertex_idx[v] < 0 { continue; }
+        let start_he = mesh.vertex_half_edge[v];
+        if start_he < 0 { continue; }
+        let start = start_he as usize;
+        let mut he = start;
+        let mut first = true;
+        let mut count = 0usize;
+        loop {
+            let dest = mesh.half_edge_dest[he];
+            if dest >= 0 {
+                staging.neighbors[base + count] = dest;
+                count += 1;
+                if count >= k { break; }
+            }
+            let twin = mesh.half_edge_twin[he];
+            if twin < 0 { break; }
+            let next = mesh.half_edge_next[twin as usize];
+            if next < 0 { break; }
+            he = next as usize;
+            if he == start && !first { break; }
+            first = false;
+        }
+    }
+    queue.write_buffer(&gpu.vertex_neighbors_buf, 0, bytemuck::cast_slice(&staging.neighbors[..n * k]));
 }
 
 fn sortable_to_float(s: u32) -> f32 {
@@ -978,6 +1036,77 @@ pub(crate) fn update_render_uniforms(
     queue.write_buffer(&gpu.render_uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 }
 
+/// GPU timestamp profiler for attributing per-frame cost to pass groups.
+/// Only used by the headless benchmark — the live app passes `None` and the
+/// timestamp machinery (which needs the TIMESTAMP_QUERY device feature) is
+/// never touched. Marks are written between compute passes on the encoder;
+/// the delta between consecutive marks is one group's GPU time.
+pub(crate) struct StepProfiler {
+    qs: wgpu::QuerySet,
+    resolve_buf: wgpu::Buffer,
+    readback_buf: wgpu::Buffer,
+    period_ns: f32,
+    next: u32,
+    labels: Vec<&'static str>,
+}
+
+impl StepProfiler {
+    pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue, capacity: u32) -> Self {
+        let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("step_profiler_qs"),
+            ty: wgpu::QueryType::Timestamp,
+            count: capacity,
+        });
+        let resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("step_profiler_resolve"),
+            size: (capacity * 8) as u64,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("step_profiler_readback"),
+            size: (capacity * 8) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self { qs, resolve_buf, readback_buf, period_ns: queue.get_timestamp_period(), next: 0, labels: Vec::new() }
+    }
+
+    fn mark(&mut self, encoder: &mut wgpu::CommandEncoder, label: &'static str) {
+        encoder.write_timestamp(&self.qs, self.next);
+        self.labels.push(label);
+        self.next += 1;
+    }
+
+    fn finish(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.resolve_query_set(&self.qs, 0..self.next, &self.resolve_buf, 0);
+        encoder.copy_buffer_to_buffer(&self.resolve_buf, 0, &self.readback_buf, 0, (self.next * 8) as u64);
+    }
+
+    /// Read back the marks and return (segment_label, milliseconds) deltas
+    /// between consecutive marks. Call after the frame's submit + device.poll.
+    pub(crate) fn read_segments_ms(&mut self, device: &wgpu::Device) -> Vec<(&'static str, f64)> {
+        let count = self.next as usize;
+        let slice = self.readback_buf.slice(..(count * 8) as u64);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::Wait).unwrap();
+        let ticks: Vec<u64> = {
+            let data = slice.get_mapped_range();
+            bytemuck::cast_slice::<u8, u64>(&data)[..count].to_vec()
+        };
+        self.readback_buf.unmap();
+        let out = (1..count)
+            .map(|i| {
+                let dt = ticks[i].saturating_sub(ticks[i - 1]) as f64 * self.period_ns as f64 / 1.0e6;
+                (self.labels[i], dt)
+            })
+            .collect();
+        self.next = 0;
+        self.labels.clear();
+        out
+    }
+}
+
 pub(crate) fn gpu_dispatch_frame(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -986,6 +1115,7 @@ pub(crate) fn gpu_dispatch_frame(
     params: &GpuSimParams,
     cheb_order: usize,
     cheb_coeffs: &[f32; 20],
+    mut profiler: Option<&mut StepProfiler>,
 ) {
     let n = params.num_vertices;
     let num_bins_total = params.num_bins_x * params.num_bins_y * params.num_bins_z + 1;
@@ -1002,6 +1132,8 @@ pub(crate) fn gpu_dispatch_frame(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("compute_encoder"),
     });
+
+    if let Some(p) = profiler.as_deref_mut() { p.mark(&mut encoder, "start"); }
 
     // ── Spatial hash (5 passes) ─────────────────────────────────────────
 
@@ -1070,6 +1202,8 @@ pub(crate) fn gpu_dispatch_frame(
         pass.dispatch_workgroups(dispatch_count(n), 1, 1);
     }
 
+    if let Some(p) = profiler.as_deref_mut() { p.mark(&mut encoder, "spatial_hash"); }
+
     // ── Forces ──────────────────────────────────────────────────────────
 
     // Clear force buffer (repulsion is now handled as XPBD collision constraint)
@@ -1097,6 +1231,8 @@ pub(crate) fn gpu_dispatch_frame(
         pass.dispatch_workgroups(dispatch_count(n), 1, 1);
     }
 
+    if let Some(p) = profiler.as_deref_mut() { p.mark(&mut encoder, "forces"); }
+
     // XPBD constraint projection (Jacobi, N iterations): springs + bending + collision
     let xpbd_iters = params.xpbd_iterations.max(1);
     for i in 0..xpbd_iters {
@@ -1118,18 +1254,22 @@ pub(crate) fn gpu_dispatch_frame(
             pass.set_bind_group(1, &gpu.project_bending_params_bg, &[]);
             pass.dispatch_workgroups(dispatch_count(n), 1, 1);
         }
+        if let Some(p) = profiler.as_deref_mut() { p.mark(&mut encoder, "xpbd_springs+bending"); }
         // Collision is the most expensive pass (per-candidate is_mesh_neighbor
         // walk × spatial-hash neighborhood). Topology is fixed within a frame,
         // so running it every other iteration — always including the last, so
         // it has the final say on penetrations — roughly halves its cost.
         if i % 2 == 1 || i == xpbd_iters - 1 {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("project_collision"), timestamp_writes: None,
-            });
-            pass.set_pipeline(&gpu.project_collision_pipeline);
-            pass.set_bind_group(0, &gpu.project_collision_data_bg, &[]);
-            pass.set_bind_group(1, &gpu.project_collision_params_bg, &[]);
-            pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("project_collision"), timestamp_writes: None,
+                });
+                pass.set_pipeline(&gpu.project_collision_pipeline);
+                pass.set_bind_group(0, &gpu.project_collision_data_bg, &[]);
+                pass.set_bind_group(1, &gpu.project_collision_params_bg, &[]);
+                pass.dispatch_workgroups(dispatch_count(n), 1, 1);
+            }
+            if let Some(p) = profiler.as_deref_mut() { p.mark(&mut encoder, "xpbd_collision"); }
         }
     }
 
@@ -1169,6 +1309,8 @@ pub(crate) fn gpu_dispatch_frame(
         }
     }
 
+    if let Some(p) = profiler.as_deref_mut() { p.mark(&mut encoder, "chebyshev"); }
+
     // Growth function
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1179,6 +1321,8 @@ pub(crate) fn gpu_dispatch_frame(
         pass.set_bind_group(1, &gpu.growth_params_bg, &[]);
         pass.dispatch_workgroups(dispatch_count(n), 1, 1);
     }
+
+    if let Some(p) = profiler.as_deref_mut() { p.mark(&mut encoder, "growth"); }
 
     // ── Bounding box reduction (for next frame's spatial hash) ───────────
 
@@ -1203,6 +1347,11 @@ pub(crate) fn gpu_dispatch_frame(
 
     // Copy bbox atomics to readback staging buffer
     encoder.copy_buffer_to_buffer(&gpu.bbox_atomic_buf, 0, &gpu.bbox_readback_buf, 0, 24);
+
+    if let Some(p) = profiler.as_deref_mut() {
+        p.mark(&mut encoder, "bbox");
+        p.finish(&mut encoder);
+    }
 
     queue.submit(Some(encoder.finish()));
 }

@@ -4,6 +4,7 @@ mod mesh;
 mod mesh_builders;
 mod gpu;
 mod render;
+mod bench;
 
 use std::sync::{Arc, Mutex};
 
@@ -143,6 +144,10 @@ struct Model {
     dot_diffusion: f32,
     dot_decay: f32,
     dot_seed_radius: f32,
+    // Hemisphere start only: radius of the exclusion hemisphere carved out of the
+    // base (centred at the origin). Keeps a dome cavity clear for hardware reached
+    // through a hole in the bottom cap. 0 disables. See apply_floor in common.wgsl.
+    inner_hemisphere_radius: f32,
 }
 
 fn recompute_cheb_coeffs(model: &mut Model) {
@@ -196,6 +201,10 @@ fn randomize_params(model: &mut Model) {
 // ── App ────────────────────────────────────────────────────────────────────────
 
 fn main() {
+    if std::env::var("GROWTH_BENCH").is_ok() {
+        bench::run();
+        return;
+    }
     nannou::app(model)
         .update(update)
         .render(render::render)
@@ -259,6 +268,9 @@ fn model(app: &App) -> Model {
         dot_diffusion: 0.8,
         dot_decay: 0.02,
         dot_seed_radius: 45.0,
+        // Default to half the initial dome radius (spring_len * N_RINGS * 2/PI ≈ 458),
+        // giving a roomy base cavity out of the box for hemisphere prints.
+        inner_hemisphere_radius: 230.0,
     };
     randomize_params(&mut m);
     m.mesh = Arc::from(build_seeded_mesh(&m));
@@ -295,6 +307,10 @@ fn update(app: &App, model: &mut Model) {
             if model.ico_nu != prev_nu {
                 shape_changed = true;
             }
+        }
+        if model.start_shape == StartShape::Hemisphere {
+            // Exclusion hemisphere carved out of the base for hardware (0 = off).
+            ui.add(egui::Slider::new(&mut model.inner_hemisphere_radius, 0.0..=600.0).text("inner cavity radius"));
         }
         if model.start_shape != prev_shape {
             shape_changed = true;
@@ -524,6 +540,11 @@ fn update(app: &App, model: &mut Model) {
         anisotropy_strength: model.anisotropy_strength,
         dot_diffusion: model.dot_diffusion,
         dot_decay: model.dot_decay,
+        // Inner cavity only applies to the hemisphere's flat-capped dome.
+        inner_radius: if model.start_shape == StartShape::Hemisphere { model.inner_hemisphere_radius } else { 0.0 },
+        _pad0: 0.0,
+        _pad1: 0.0,
+        _pad2: 0.0,
     };
 
     // GPU dispatch: physics + state evolution
@@ -540,6 +561,7 @@ fn update(app: &App, model: &mut Model) {
             &gpu_params,
             eff_cheb_order,
             &eff_cheb_coeffs,
+            None,
         );
     }
 

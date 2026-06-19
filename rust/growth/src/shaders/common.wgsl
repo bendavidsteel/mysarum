@@ -48,16 +48,41 @@ struct SimParams {
     // (larger decay = sharper/smaller growth dot; decay 0 fills the whole mesh).
     dot_diffusion: f32,
     dot_decay: f32,
+    // Inner exclusion hemisphere (hemisphere start only): when inner_radius > 0,
+    // no vertex may enter a sphere of this radius centred at the origin (the same
+    // centre as the dome). Combined with the floor at z == floor_z this carves a
+    // dome-shaped cavity in the base — space for hardware reached through a hole
+    // cut in the bottom cap. 0 disables.
+    inner_radius: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 const EPSILON: f32 = 1e-6;
 
-// Clamp a position above the ground plane (no-op when the floor is disabled).
+// Keep a position out of the simulation's solid boundaries: above the ground
+// plane, then outside the inner exclusion hemisphere. Both are no-ops when
+// disabled. The floor runs first so the radial push can never drive z below
+// floor_z (scaling a z >= 0 point by a positive factor keeps z >= 0).
+//
+// The radial push is skipped for vertices sitting on the floor (z == floor_z):
+// those are the flat base cap, and pushing them outward in-plane would collapse
+// the inner disc onto a ring. Leaving them flat preserves a clean base to cut a
+// hardware access hole through, while everything lifted above the base is held
+// out of the dome-shaped cavity.
 fn apply_floor(p: vec3<f32>, params: SimParams) -> vec3<f32> {
+    var q = p;
     if params.floor_enabled > 0.5 {
-        return vec3<f32>(p.x, p.y, max(p.z, params.floor_z));
+        q.z = max(q.z, params.floor_z);
     }
-    return p;
+    if params.inner_radius > 0.0 && q.z > params.floor_z {
+        let r = length(q);
+        if r > EPSILON && r < params.inner_radius {
+            q = q * (params.inner_radius / r);
+        }
+    }
+    return q;
 }
 
 struct BinInfo {

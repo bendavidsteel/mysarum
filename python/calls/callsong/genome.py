@@ -42,6 +42,15 @@ PARAM_SPEC: list[tuple[str, float, float, float]] = [
     # ── output shaping ──────────────────────────────────────────────────────
     ("drive",          0.5,      6.0,      2.0),   # tanh saturation drive
     ("noise_gain",     0.0,      0.3,     0.02),   # aspiration noise into source
+    # ── fast amplitude modulation (pulse trains: frogs, buzzes, clicks) ─────
+    ("am_rate",        0.0,    300.0,     30.0),   # pulse/AM rate (Hz)
+    ("am_depth",       0.0,      1.0,      0.0),   # 0 = off (un-modulated)
+    ("am_shape",       1.0,      8.0,      2.0),   # 1 = sine AM, high = sharp clicks
+    # ── second sound source (bilateral syrinx / two-voice) ──────────────────
+    ("mix2",           0.0,      1.0,      0.0),   # 0 = single oscillator only
+    ("gamma2",     8_000.0, 60_000.0, 24_000.0),   # source-2 time constant
+    ("dalpha2",       -0.1,      0.1,      0.0),   # source-2 pressure offset
+    ("dbeta2",        -0.2,      0.2,      0.0),   # source-2 tension offset
 ]
 
 NAMES = [s[0] for s in PARAM_SPEC]

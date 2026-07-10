@@ -27,7 +27,8 @@ import jax.numpy as jnp
 
 # Genome index layout — must match callsong.genome.PARAM_SPEC.
 (I_GAMMA, I_KCUB, I_KSQ, I_KSQY, I_KXY, I_KVDP, I_TRMS, I_R,
- I_F1, I_Q1, I_G1, I_F2, I_Q2, I_G2, I_DRIVE, I_NOISE) = range(16)
+ I_F1, I_Q1, I_G1, I_F2, I_Q2, I_G2, I_DRIVE, I_NOISE,
+ I_AMRATE, I_AMDEPTH, I_AMSHAPE, I_MIX2, I_GAMMA2, I_DALPHA2, I_DBETA2) = range(23)
 
 TRACHEA_MS_MAX = 4.0  # buffer headroom; matches genome.PARAM_SPEC upper bound
 
@@ -65,6 +66,15 @@ def make_renderer(sr: float, oversample: int, n_samples: int):
         noise_gain = phys[I_NOISE]
         drive = phys[I_DRIVE]
 
+        # Second sound source (bilateral syrinx). It shares the nonlinear gains
+        # but has its own time constant and a pressure/tension offset on the
+        # gesture, so it sings an independent pitch/contour. mix2 -> 0 collapses
+        # the instrument back to a single oscillator.
+        gamma2 = phys[I_GAMMA2]
+        g2_2 = gamma2 * gamma2
+        mix2 = phys[I_MIX2]
+        dalpha2, dbeta2 = phys[I_DALPHA2], phys[I_DBETA2]
+
         # Trachea delay in oversampled slots (invariant to oversample).
         delay = jnp.clip(jnp.round(phys[I_TRMS] * 1e-3 * sr_os).astype(jnp.int32),
                          1, L - 1)
@@ -77,31 +87,35 @@ def make_renderer(sr: float, oversample: int, n_samples: int):
         g1, g2f = phys[I_G1], phys[I_G2]
 
         y_clamp = Y_CLAMP_FACTOR * gamma
+        y_clamp2 = Y_CLAMP_FACTOR * gamma2
 
-        def deriv(x, y, a, b):
+        def deriv(x, y, a, b, g, gg):
             dx = y
-            dy = (g2 * (-a - b * x - k_cub * x**3 + k_sq * x**2)
-                  + gamma * (-k_sqy * x**2 * y - k_xy * x * y
-                             + k_vdp * (1.0 - x**2) * y))
+            dy = (gg * (-a - b * x - k_cub * x**3 + k_sq * x**2)
+                  + g * (-k_sqy * x**2 * y - k_xy * x * y
+                         + k_vdp * (1.0 - x**2) * y))
             return dx, dy
 
+        def rk4(x, y, a, b, g, gg, yc):
+            k1x, k1y = deriv(x, y, a, b, g, gg)
+            k2x, k2y = deriv(x + 0.5 * dt * k1x, y + 0.5 * dt * k1y, a, b, g, gg)
+            k3x, k3y = deriv(x + 0.5 * dt * k2x, y + 0.5 * dt * k2y, a, b, g, gg)
+            k4x, k4y = deriv(x + dt * k3x, y + dt * k3y, a, b, g, gg)
+            x = x + dt / 6.0 * (k1x + 2 * k2x + 2 * k3x + k4x)
+            y = y + dt / 6.0 * (k1y + 2 * k2y + 2 * k3y + k4y)
+            return jnp.clip(x, -X_CLAMP, X_CLAMP), jnp.clip(y, -yc, yc)
+
         def frame_step(carry, inp):
-            x, y, buf, pos, lo1, ba1, lo2, ba2 = carry
+            x, y, x2, y2, buf, pos, lo1, ba1, lo2, ba2 = carry
             a, b, nz = inp
             acc = 0.0
             for _ in range(oversample):
-                # 1. Labial oscillator — classic RK4 (stable on the imaginary axis).
-                k1x, k1y = deriv(x, y, a, b)
-                k2x, k2y = deriv(x + 0.5 * dt * k1x, y + 0.5 * dt * k1y, a, b)
-                k3x, k3y = deriv(x + 0.5 * dt * k2x, y + 0.5 * dt * k2y, a, b)
-                k4x, k4y = deriv(x + dt * k3x, y + dt * k3y, a, b)
-                x = x + dt / 6.0 * (k1x + 2 * k2x + 2 * k3x + k4x)
-                y = y + dt / 6.0 * (k1y + 2 * k2y + 2 * k3y + k4y)
-                x = jnp.clip(x, -X_CLAMP, X_CLAMP)
-                y = jnp.clip(y, -y_clamp, y_clamp)
+                # 1. Labial oscillators — classic RK4 (stable on the imaginary axis).
+                x, y = rk4(x, y, a, b, gamma, g2, y_clamp)
+                x2, y2 = rk4(x2, y2, a + dalpha2, b + dbeta2, gamma2, g2_2, y_clamp2)
 
-                # source + aspiration noise
-                src = x + noise_gain * nz
+                # combined source (two labia into one trachea) + aspiration noise
+                src = x + mix2 * x2 + noise_gain * nz
 
                 # 2. Trachea reflection comb: Pi = src - r*Pi(t-T).
                 read_pos = (pos - delay) % L
@@ -122,14 +136,18 @@ def make_renderer(sr: float, oversample: int, n_samples: int):
 
             # 4. Average the oversampled output and soft-clip.
             out = jnp.tanh(drive * acc / oversample)
-            return (x, y, buf, pos, lo1, ba1, lo2, ba2), out
+            return (x, y, x2, y2, buf, pos, lo1, ba1, lo2, ba2), out
 
-        init = (jnp.float32(0.01), jnp.float32(0.0),
-                jnp.zeros(L, jnp.float32), jnp.int32(0),
-                jnp.float32(0.0), jnp.float32(0.0),
-                jnp.float32(0.0), jnp.float32(0.0))
-        _, wave = jax.lax.scan(frame_step, init,
-                               (alpha, beta, noise))
+        z = jnp.float32(0.0)
+        init = (jnp.float32(0.01), z, jnp.float32(0.01), z,
+                jnp.zeros(L, jnp.float32), jnp.int32(0), z, z, z, z)
+        _, wave = jax.lax.scan(frame_step, init, (alpha, beta, noise))
+
+        # 5. Fast amplitude modulation (pulse trains) — a pointwise output gate.
+        t = jnp.arange(n_samples, dtype=jnp.float32) / sr
+        pulse = (0.5 - 0.5 * jnp.cos(2.0 * jnp.pi * phys[I_AMRATE] * t)) ** phys[I_AMSHAPE]
+        am_env = (1.0 - phys[I_AMDEPTH]) + phys[I_AMDEPTH] * pulse
+        wave = wave * am_env
 
         # Per-call peak normalisation (leave true silence near zero so it stays
         # low-fitness rather than being amplified into noise).

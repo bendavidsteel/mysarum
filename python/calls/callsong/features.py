@@ -38,22 +38,19 @@ def compute(wave: np.ndarray, sr: int, weights: dict | None = None) -> tuple[flo
 
     S = np.abs(librosa.stft(w, n_fft=_N_FFT, hop_length=_HOP)) + 1e-9
 
-    # Spectral flatness in [0,1]: ~1 white noise, ~0 tonal.
+    # Descriptive features (logged, not scored) — kept for inspection now that
+    # fitness is pure quality-diversity.
     flat = float(np.mean(librosa.feature.spectral_flatness(S=S)))
-    tonal = 1.0 - flat
-
-    # Spectral contrast (dB) averaged over sub-bands and time -> structure.
     contrast = float(np.mean(librosa.feature.spectral_contrast(S=S, sr=sr)))
-    contrast_n = float(np.clip(contrast / 30.0, 0.0, 1.0))
-
-    # Spectral flux: mean positive frame-to-frame change of the normalised
-    # magnitude spectrum -> dynamism (onsets, jumps, period doubling).
     Sn = S / (np.sum(S, axis=0, keepdims=True) + 1e-9)
-    flux = np.maximum(np.diff(Sn, axis=1), 0.0).sum(axis=0)
-    flux_n = float(np.clip(np.mean(flux) * 20.0, 0.0, 1.0))
+    flux = float(np.mean(np.maximum(np.diff(Sn, axis=1), 0.0).sum(axis=0)))
 
-    fitness = audible * tonal * (w_contrast * contrast_n + w_flux * flux_n)
+    # Pure QD: fitness is audibility only. Diversity is carried entirely by the
+    # BirdNET-PCA descriptor, so cells fill with whatever timbre lands there
+    # (no tonal bias homogenising the archive toward songbird sounds).
+    fitness = audible
 
-    feats = dict(rms=rms, audible=audible, flatness=flat, tonal=tonal,
-                 contrast=contrast_n, flux=flux_n, fitness=fitness)
+    feats = dict(rms=rms, audible=audible, flatness=flat, tonal=1.0 - flat,
+                 contrast=float(np.clip(contrast / 30.0, 0, 1)),
+                 flux=float(np.clip(flux * 20.0, 0, 1)), fitness=fitness)
     return float(fitness), feats

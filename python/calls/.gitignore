@@ -1,0 +1,8 @@
+.venv/
+outputs/
+_smoke/
+_demo/
+_xc_cache/
+__pycache__/
+*.pyc
+*.egg-info/

@@ -1,0 +1,45 @@
+defaults:
+  - _self_
+
+seed: 0
+
+# ── audio / render ──────────────────────────────────────────────────────────
+sr: 48000          # BirdNET expects 48 kHz
+duration: 3.0      # seconds (one BirdNET segment)
+oversample: 6      # ODE + filter substeps per audio frame (anti-aliasing)
+
+# ── gestures (fixed probing bank) ─────────────────────────────────────────────
+n_gestures: 6      # total (alpha, beta) paths swept through each instrument
+gesture_ctrl: 5    # control points per random spline
+gesture_sine: 2    # of the n_gestures, how many are sinusoidal trill/warble probes
+
+# Precomputed BirdNET-PCA descriptor projector (from scripts/fit_projector.py,
+# e.g. fit on Xeno-canto recordings). If null, PCA is fit on the bootstrap
+# random population instead.
+projector_path: null
+
+# ── MAP-Elites ────────────────────────────────────────────────────────────────
+archive_resolution: 24    # cells per PCA axis (24 x 24 grid)
+bootstrap: 96             # random instruments used to fit PCA + seed archive
+generations: 120
+offspring: 16             # instruments proposed per generation
+render_chunk: 128         # max (instrument x gesture) pairs per vmap (4 GB cap)
+mutation_sigma: 0.12
+crossover_prob: 0.3       # fraction of offspring formed by crossover of 2 elites
+
+# ── fitness weights ────────────────────────────────────────────────────────────
+fitness:
+  contrast: 1.0
+  flux: 1.0
+  rms_floor: 1.0e-3
+  rms_ref: 0.1
+
+# ── logging / outputs ──────────────────────────────────────────────────────────
+log_every: 10
+save_top_k: 16     # best calls dumped as wav + spectrogram montage at the end
+
+hydra:
+  job:
+    chdir: true          # run inside the output dir so all artefacts land there
+  run:
+    dir: outputs/${now:%Y-%m-%d_%H-%M-%S}

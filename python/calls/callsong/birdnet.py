@@ -63,6 +63,43 @@ class BirdNetEmbedder:
         return np.stack([self.embed(w, sr) for w in waves])
 
 
+_WORKER_EMBEDDER: "BirdNetEmbedder | None" = None
+
+
+def _worker_init() -> None:
+    global _WORKER_EMBEDDER
+    _WORKER_EMBEDDER = BirdNetEmbedder()
+
+
+def _worker_embed(arg) -> np.ndarray:
+    wave, sr = arg
+    return _WORKER_EMBEDDER.embed(wave, sr)
+
+
+class ParallelEmbedder:
+    """Persistent process pool of BirdNet embedders (BirdNET is CPU-bound; on a
+    many-core box this is the throughput win once rendering is on a fast GPU).
+
+    Uses a 'spawn' context so the fresh workers never inherit the parent's JAX
+    / CUDA state; each worker loads its own tflite model once at startup.
+    """
+
+    def __init__(self, workers: int) -> None:
+        import concurrent.futures as cf
+        import multiprocessing as mp
+        self.workers = workers
+        self._ex = cf.ProcessPoolExecutor(
+            max_workers=workers, mp_context=mp.get_context("spawn"),
+            initializer=_worker_init)
+
+    def embed_many(self, waves: np.ndarray, sr: int = BIRDNET_SR) -> np.ndarray:
+        args = [(w, sr) for w in waves]
+        return np.stack(list(self._ex.map(_worker_embed, args, chunksize=2)))
+
+    def close(self) -> None:
+        self._ex.shutdown()
+
+
 class DescriptorProjector:
     """First-2-PCA projector with archive bounds, fit on bootstrap embeddings."""
 

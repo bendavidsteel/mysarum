@@ -23,7 +23,8 @@ archive_resolution: 24    # cells per PCA axis (24 x 24 grid)
 bootstrap: 96             # random instruments used to fit PCA + seed archive
 generations: 120
 offspring: 16             # instruments proposed per generation
-render_chunk: 128         # max (instrument x gesture) pairs per vmap (4 GB cap)
+render_chunk: 128         # max (instrument x gesture) pairs per vmap (raise on big GPUs)
+embed_workers: 1          # BirdNET embedding processes (raise on many-core hosts)
 mutation_sigma: 0.12
 crossover_prob: 0.3       # fraction of offspring formed by crossover of 2 elites
 

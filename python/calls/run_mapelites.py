@@ -27,7 +27,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from callsong import genome as gm
 from callsong import synth, gestures, features, audio_io
-from callsong.birdnet import BirdNetEmbedder, DescriptorProjector
+from callsong.birdnet import BirdNetEmbedder, ParallelEmbedder, DescriptorProjector
 from callsong.archive import Archive
 
 log = logging.getLogger("mapelites")
@@ -78,8 +78,9 @@ def main(cfg: DictConfig) -> None:
     bank = gestures.make_gesture_bank(cfg.seed, cfg.n_gestures, T,
                                       cfg.gesture_ctrl, cfg.gesture_sine, cfg.sr)
     render = synth.make_renderer(cfg.sr, cfg.oversample, T)
-    log.info("loading BirdNET (tensorflow-cpu)...")
-    embedder = BirdNetEmbedder()
+    log.info(f"loading BirdNET (tensorflow-cpu), embed_workers={cfg.embed_workers}...")
+    embedder = (ParallelEmbedder(cfg.embed_workers) if cfg.embed_workers > 1
+                else BirdNetEmbedder())
 
     def evaluate(genomes):
         """Render + embed + score a set of instruments. Returns per-call records."""

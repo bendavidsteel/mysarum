@@ -34,6 +34,60 @@ choices, `anisotropy_dir` is a free vec3 (normalized internally), so oblique /
 diagonal preferred directions are possible. Applied inside all three
 `grow_intrinsic_lengths*` functions. See `conf/sweep/anisotropic.yaml`.
 
+## Coral-inspired additions (ported from joel-simon/coral-growth)
+
+Four mechanisms make the phototropic mode branch / diversify / smooth like
+Simon's evolved corals. All default to **off** (exact old behaviour) and are
+demoed in `conf/sweep/coral.yaml`. They only fire in `growth_mode=phototropic`.
+
+1. **Self-shadowing occlusion** (`compute_occlusion`, `occlusion_strength`>0):
+   a vertex loses light for each nearby vertex sitting toward the light source
+   (within a cone `occlusion_cone`, radius `occlusion_radius` or repulsion_dist).
+   Reuses the collision spatial-hash candidates (so a vertex isn't shaded by its
+   own 1-ring). This is the branching driver: a bump shades its neighbours, they
+   stop growing, the bump elongates. Multiplies `ch1` light each substep.
+2. **Growth-field shaping** (in `grow_intrinsic_lengths_phototropic`):
+   `growth_budget_gate`∈[0,1] gates growth by the (occluded) light channel so lit
+   tips outcompete shaded valleys; `growth_field_smooth`∈[0,1] does a 1-ring
+   average of the per-vertex growth signal before it's injected (smoother folds,
+   `_smooth_vertex_field`).
+3. **Gray-Scott morphogens** (`gray_scott_step`/`run_morphogens`,
+   `morphogen_steps`>0, needs `state_dims>=5`): reaction-diffusion on the mesh
+   graph in `ch3`(U)/`ch4`(V); `morphogen_coupling` modulates the tissue growth
+   signal by V (`tissue *= 1 + coupling·(2V−1)`) → Turing-patterned growth zones.
+   With morphogens on, `ch3/ch4` are NOT treated as diffusing resources; `ch2`
+   (+`ch5+`) are. Seed with `seed_morphogens` (U=1, random V spots).
+4. **Normal-displacement inflation blend** (`growth_mode_mix`∈[0,1],
+   `inflation_strength`): adds a normal-directed outward *force*
+   `mix·strength·tissue·n` in the predict step. NB it is a force, not hard
+   displacement — the Rust port found plastic capture fails against stiff
+   springs (see [[project_floraform_growth_alternatives]]); XPBD balances it into
+   rounder lobes.
+
+## MAP-Elites diversity + printability search
+
+`map_elites.py` (hydra `config_name=map_elites`) illuminates a 2D archive whose
+axes are **shape** (compactness = SA/V^(2/3) × print height) and whose per-cell
+fitness is **printability** — each cell keeps the most printable genome that
+lands in it. Genotype = ~18 continuous environmental genes + the
+normal-displacement growth mix; fixed to phototropic hemisphere, `state_dims=5`
+(morphogens on). Reuses `nca_sweep.run_one(..., do_descriptors=False)`.
+
+Printability metrics live in `printability.py` (`print_metrics`,
+`printability_penalty`), pure NumPy on the extracted mesh. Build direction is
+**+z** (hemisphere flat side down): `overhang_fraction` = area-weighted faces
+with `n·(+z) < −cos(45°)`; plus `layers` (height/layer_height), `support_volume`
+(Σ overhang projected-area·height), `surface_area`. Fitness = weighted,
+reference-normalised sum (minimised); weights in `conf/map_elites.yaml`.
+
+```bash
+# First run (4 GB box): archive.npz + archive.png montage + elites.json
+GROWTH_MAX_VERTICES=4000 conda run -n base python map_elites.py
+# Bigger budget / resume from a checkpoint archive:
+conda run -n base python map_elites.py n_evals=400 sigma=0.1
+conda run -n base python map_elites.py resume_from=outputs/<run>/archive.npz
+```
+
 ## Run
 
 Always use the base conda env: `conda run -n base python <script>`.
@@ -125,7 +179,11 @@ of size — the old fixed `[0,width]×[0,height]` window clipped them to close-u
 ## Files
 
 - `growth_halfedge_jax.py` — half-edge state, mesh builders, XPBD, all four
-  growth modes, nvdiffrast renderer.
+  growth modes, the four coral-inspired mechanisms above, nvdiffrast renderer.
+- `map_elites.py` — MAP-Elites diversity+printability search (hydra
+  `config_name=map_elites`, config `conf/map_elites.yaml`).
+- `printability.py` — pure-NumPy print metrics (overhang / layers / support /
+  area) + weighted penalty, for the MAP-Elites fitness.
 - `nca_sweep.py` — hydra entry point that runs a list of configs, renders
   each, computes shape descriptors, writes a farthest-point gallery + Vendi
   scores.

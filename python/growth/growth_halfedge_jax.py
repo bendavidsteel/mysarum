@@ -118,6 +118,47 @@ MeshParams = collections.namedtuple('MeshParams', [
     #                     axis (edge growth scaled by |cos| of edge vs axis).
     'anisotropy_dir',
     'anisotropy_strength',
+    # ── Self-shadowing occlusion (coral-style; growth_mode == "phototropic")
+    #   occlusion_strength  0 = off. Local shadowing: a vertex loses light for
+    #                       each nearby vertex sitting toward the light source.
+    #                       This is the positive-feedback loop that turns domes
+    #                       into branches (a bump shades its neighbours, which
+    #                       then stop growing, so the bump elongates).
+    #   occlusion_radius    search radius (0 = use repulsion_dist).
+    #   occlusion_cone      cos of the half-angle of the shadow cone around
+    #                       light_dir; candidates outside the cone don't shade.
+    'occlusion_strength',
+    'occlusion_radius',
+    'occlusion_cone',
+    # ── Growth-field shaping (coral-style)
+    #   growth_field_smooth  1-ring averaging rate of the per-vertex growth
+    #                        signal before it is applied (smooths injected area
+    #                        → smoother folds, cf. coral's neighbour-averaged
+    #                        growth). 0 = off.
+    #   growth_budget_gate   in [0, 1]: gate growth by local (occluded) light so
+    #                        well-lit tips outcompete shaded valleys. 0 = off.
+    'growth_field_smooth',
+    'growth_budget_gate',
+    # ── Normal-displacement growth blend (coral-style inflation)
+    #   growth_mode_mix   in [0, 1]: 0 = pure intrinsic-length growth (current),
+    #                     1 = add a normal-directed inflation force of magnitude
+    #                     inflation_strength·tissue. Applied as an XPBD-balanced
+    #                     external force (NOT hard displacement — the Rust port
+    #                     found plastic capture fails against stiff springs).
+    #   inflation_strength  per-vertex outward force scale for the blend.
+    'growth_mode_mix',
+    'inflation_strength',
+    # ── Gray-Scott reaction-diffusion morphogens on the mesh graph
+    #   morphogen_steps    RD substeps per growth step (0 = morphogens off).
+    #                      Needs state_dims >= 5 (ch3 = U, ch4 = V).
+    #   morphogen_coupling growth-signal modulation by V (Turing-patterned
+    #                      growth zones): tissue *= 1 + coupling·(2V - 1).
+    'morphogen_feed',
+    'morphogen_kill',
+    'morphogen_diff_u',
+    'morphogen_diff_v',
+    'morphogen_steps',
+    'morphogen_coupling',
 ])
 
 
@@ -156,6 +197,19 @@ def default_params(**overrides):
         ground_pin_strength=0.15,
         anisotropy_dir=jnp.array([0.0, 0.0, 1.0], dtype=jnp.float32),
         anisotropy_strength=0.0,
+        occlusion_strength=0.0,
+        occlusion_radius=0.0,
+        occlusion_cone=0.5,
+        growth_field_smooth=0.0,
+        growth_budget_gate=0.0,
+        growth_mode_mix=0.0,
+        inflation_strength=0.0,
+        morphogen_feed=0.037,
+        morphogen_kill=0.06,
+        morphogen_diff_u=0.16,
+        morphogen_diff_v=0.08,
+        morphogen_steps=0,
+        morphogen_coupling=0.0,
     )
     defaults.update(overrides)
     return MeshParams(**defaults)
@@ -1629,6 +1683,40 @@ def compute_light_channel(state, params):
 
 
 @jax.jit
+def compute_occlusion(pos, cand_idx, mask, params):
+    """Per-vertex light multiplier in (0, 1] from local self-shadowing.
+
+    A vertex is shadowed by any nearby vertex that lies *toward the light*
+    (inside a cone of half-angle acos(occlusion_cone) around light_dir) within
+    occlusion_radius. This is the coral-style positive-feedback loop that turns
+    domes into branches: a bump grows toward light, shades its neighbours, the
+    neighbours stop growing, so the bump keeps elongating.
+
+    `cand_idx`/`mask` are the collision spatial-hash candidates (they already
+    exclude inactive verts, self, and direct 1-ring mesh neighbours — so a
+    vertex is not shaded by its own coplanar ring, only by other surface that
+    has folded over it). occlusion_strength == 0 returns all-ones (no change).
+    """
+    light_dir = params.light_dir / (jnp.linalg.norm(params.light_dir) + EPSILON)
+    radius = jnp.where(params.occlusion_radius > 0.0,
+                       params.occlusion_radius, params.repulsion_dist)
+
+    cand_pos = pos[cand_idx]                       # (N, K, 3)
+    diff = cand_pos - pos[:, None, :]              # vertex -> candidate
+    dist = jnp.sqrt(jnp.sum(diff * diff, axis=-1) + EPSILON)
+    dirdot = jnp.sum(diff * light_dir[None, None, :], axis=-1) / dist
+
+    toward = dirdot > params.occlusion_cone
+    within = dist < radius
+    shadower = mask & toward & within
+
+    # Nearer, better-aligned shadowers block more light.
+    w = jnp.maximum(0.0, 1.0 - dist / radius) * jnp.maximum(dirdot, 0.0)
+    occ = jnp.sum(jnp.where(shadower, w, 0.0), axis=1)
+    return 1.0 / (1.0 + params.occlusion_strength * occ)
+
+
+@jax.jit
 def diffuse_channel(state, channel, rate):
     """One explicit graph-Laplacian smoothing step on `channel`.
 
@@ -1647,6 +1735,62 @@ def diffuse_channel(state, channel, rate):
     avg = nbr_sum / jnp.maximum(degree, 1.0)
     new = (1.0 - rate) * s + rate * avg
     return state._replace(vertex_state=state.vertex_state.at[:, channel].set(new))
+
+
+@jax.jit
+def gray_scott_step(state, params):
+    """One Gray-Scott reaction-diffusion step on ch3 (U) / ch4 (V).
+
+    Diffusion uses the graph Laplacian L(f) = mean(neighbours) - f (matching
+    diffuse_channel's normalisation). Standard Gray-Scott kinetics with unit
+    step; U/V clipped to [0, 1]. Only active vertices evolve. Turing spots /
+    stripes in V then bias where growth happens (see morphogen_coupling).
+    """
+    he_valid = state.half_edge_idx != -1
+    safe_twin = jnp.clip(state.half_edge_twin, 0)
+    safe_dest = jnp.clip(state.half_edge_dest, 0)
+    he_src = safe_dest[safe_twin]
+    he_dst = safe_dest
+    active = (state.vertex_idx != -1).astype(jnp.float32)
+
+    degree = jnp.zeros(MAX_VERTICES).at[he_src].add(he_valid.astype(jnp.float32))
+    safe_degree = jnp.maximum(degree, 1.0)
+
+    def lap(f):
+        nbr = jnp.zeros(MAX_VERTICES).at[he_src].add(
+            jnp.where(he_valid, f[he_dst], 0.0)
+        )
+        return nbr / safe_degree - f
+
+    u = state.vertex_state[:, 3]
+    v = state.vertex_state[:, 4]
+    uvv = u * v * v
+    du = params.morphogen_diff_u * lap(u) - uvv + params.morphogen_feed * (1.0 - u)
+    dv = params.morphogen_diff_v * lap(v) + uvv \
+        - (params.morphogen_feed + params.morphogen_kill) * v
+    u = jnp.clip(u + du, 0.0, 1.0) * active + u * (1.0 - active)
+    v = jnp.clip(v + dv, 0.0, 1.0) * active
+    vs = state.vertex_state.at[:, 3].set(u).at[:, 4].set(v)
+    return state._replace(vertex_state=vs)
+
+
+def run_morphogens(state, params):
+    """Run `morphogen_steps` Gray-Scott steps (dynamic count; 0 = no-op)."""
+    def body(_, st):
+        return gray_scott_step(st, params)
+    return jax.lax.fori_loop(0, params.morphogen_steps, body, state)
+
+
+def seed_morphogens(state, key, u_ch=3, v_ch=4, spot_frac=0.05):
+    """Initialise the Gray-Scott substrate: U=1 everywhere, V=0 except a random
+    sprinkling of active seed spots (V=1, U=0) that RD grows into a pattern."""
+    active = state.vertex_idx != -1
+    u = jnp.where(active, 1.0, state.vertex_state[:, u_ch])
+    spots = active & (jax.random.uniform(key, (MAX_VERTICES,)) < spot_frac)
+    v = jnp.where(spots, 1.0, 0.0)
+    u = jnp.where(spots, 0.0, u)
+    vs = state.vertex_state.at[:, u_ch].set(u).at[:, v_ch].set(v)
+    return state._replace(vertex_state=vs)
 
 
 def boundary_source(state, channel, value, ground_z, band):
@@ -1730,12 +1874,37 @@ def grow_intrinsic_lengths(state, params, key, no_grow_v=None):
     return state._replace(half_edge_intrinsic_len=new_intrinsic)
 
 
+def _smooth_vertex_field(state, field, rate):
+    """One 1-ring averaging pass on a per-vertex scalar field (rate 0 = off).
+
+    new[v] = (1 - rate) * field[v] + rate * mean(field[neighbours]). Used to
+    neighbour-average the growth signal before it is injected, so excess area
+    enters smoothly (coral neighbour-averages growth the same way).
+    """
+    he_valid = state.half_edge_idx != -1
+    safe_twin = jnp.clip(state.half_edge_twin, 0)
+    safe_dest = jnp.clip(state.half_edge_dest, 0)
+    he_src = safe_dest[safe_twin]
+    nbr_sum = jnp.zeros(MAX_VERTICES).at[he_src].add(
+        jnp.where(he_valid, field[safe_dest], 0.0)
+    )
+    degree = jnp.zeros(MAX_VERTICES).at[he_src].add(he_valid.astype(jnp.float32))
+    avg = nbr_sum / jnp.maximum(degree, 1.0)
+    return (1.0 - rate) * field + rate * avg
+
+
 @jax.jit
 def grow_intrinsic_lengths_phototropic(state, params, key, no_grow_v=None):
     """Growth driven by ch0 (tissue) in [0, 1], no threshold.
 
     grow = tissue^1.5 (concave-down in [0,1], slow start, fast finish).
     Always positive: light-driven growth never shrinks, mirroring biology.
+
+    The per-vertex growth signal is optionally (a) gated by the occluded light
+    channel ch1 so shaded valleys stop growing while lit tips keep going
+    (growth_budget_gate) and (b) 1-ring smoothed (growth_field_smooth) before
+    being gathered onto half-edges. Together with occlusion these are the coral
+    branching mechanism; both default to 0 (exact old behaviour).
 
     `no_grow_v`: see grow_intrinsic_lengths (freezes pinned base vertices).
     """
@@ -1744,8 +1913,13 @@ def grow_intrinsic_lengths_phototropic(state, params, key, no_grow_v=None):
     safe_dest = jnp.clip(state.half_edge_dest, 0)
     he_src = safe_dest[safe_twin]
 
-    s = jnp.clip(state.vertex_state[he_src, 0], 0.0, 1.0)
-    grow = s ** 1.5
+    s_v = jnp.clip(state.vertex_state[:, 0], 0.0, 1.0)
+    grow_v = s_v ** 1.5
+    gate = params.growth_budget_gate
+    light_v = state.vertex_state[:, 1]
+    grow_v = grow_v * (1.0 - gate + gate * light_v)
+    grow_v = _smooth_vertex_field(state, grow_v, params.growth_field_smooth)
+    grow = grow_v[he_src]
 
     noise_per_vertex = 0.5 + jax.random.uniform(key, (MAX_VERTICES,))
     noise = noise_per_vertex[he_src]
@@ -1847,6 +2021,16 @@ def batched_physics_step(state, params, cheb_coeffs, key, n_substeps,
         )
 
         f_ext = compute_external_forces(pos, topo, params)
+        if growth_mode == 'phototropic':
+            # Feature 5: coral-style inflation — a normal-directed outward force
+            # scaled by local tissue and the growth_mode_mix. Applied as an
+            # XPBD-balanced force (not hard displacement, which stiff springs
+            # would fight) so the surface inflates into rounder lobes.
+            normals = _vertex_normals_from_state(st)
+            tissue0 = st.vertex_state[:, 0]
+            infl = (params.growth_mode_mix * params.inflation_strength) \
+                * tissue0[:, None] * normals
+            f_ext = f_ext + infl * topo.active[:, None].astype(jnp.float32)
         pos = predict_positions(st, f_ext, params)
 
         sort_order, bstart, bend, cell_coords = \
@@ -1898,16 +2082,25 @@ def batched_physics_step(state, params, cheb_coeffs, key, n_substeps,
         elif growth_mode == 'phototropic':
             active_f = (state.vertex_idx != -1).astype(jnp.float32)
 
+            # Feature 1: light with self-shadowing. Occlusion reuses the
+            # collision candidate neighbours (post-XPBD positions).
             light = compute_light_channel(st, params)
+            occ = compute_occlusion(st.vertex_pos, cand_idx, coll_mask, params)
+            light = light * occ
             vs = st.vertex_state.at[:, 1].set(light)
             st = st._replace(vertex_state=vs)
 
-            n_res = st.vertex_state.shape[1] - 2
+            # Channel layout: ch0 tissue, ch1 light, ch2 nutrient. With
+            # state_dims >= 5, ch3/ch4 are the Gray-Scott morphogens (U/V) and
+            # are NOT treated as diffusing resources; ch5+ are extra resources.
+            n_ch = st.vertex_state.shape[1]
+            use_morph = n_ch >= 5
+            res_channels = ([2] + list(range(5, n_ch))) if use_morph \
+                else list(range(2, n_ch))
             on_ground = (state.vertex_idx != -1) & (
                 st.vertex_pos[:, 2] < params.ground_z + params.spring_len * 0.5
             )
-            for ci in range(n_res):
-                ch = 2 + ci
+            for ch in res_channels:
                 s = st.vertex_state[:, ch]
                 s = (1.0 - params.resource_decay * params.state_dt) * s
                 st = st._replace(
@@ -1924,6 +2117,10 @@ def batched_physics_step(state, params, cheb_coeffs, key, n_substeps,
                     vertex_state=st.vertex_state.at[:, ch].set(refreshed),
                 )
 
+            # Feature 4: Gray-Scott morphogens (no-op when morphogen_steps == 0).
+            if use_morph:
+                st = run_morphogens(st, params)
+
             tissue = st.vertex_state[:, 0]
             nutrient = st.vertex_state[:, 2]
             production = light * nutrient
@@ -1931,6 +2128,12 @@ def batched_physics_step(state, params, cheb_coeffs, key, n_substeps,
             tissue_next = tissue + params.state_dt * (
                 production * head - params.tissue_decay * tissue
             )
+            # Morphogen coupling: V-rich Turing spots grow, V-poor zones don't.
+            if use_morph:
+                v_morph = st.vertex_state[:, 4]
+                tissue_next = tissue_next * (
+                    1.0 + params.morphogen_coupling * (2.0 * v_morph - 1.0)
+                )
             tissue_next = jnp.clip(tissue_next, 0.0, 1.0) * active_f
             st = st._replace(
                 vertex_state=st.vertex_state.at[:, 0].set(tissue_next),

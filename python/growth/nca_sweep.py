@@ -154,6 +154,10 @@ def apply_seed(state, key, pattern, state_dims, mode="nca"):
             state = state._replace(
                 vertex_state=state.vertex_state.at[:, 2].set(ch2),
             )
+        if state_dims >= 5:
+            # Gray-Scott substrate: ch3 = U (=1), ch4 = V (random seed spots).
+            key, sk = jax.random.split(key)
+            state = g.seed_morphogens(state, sk, u_ch=3, v_ch=4)
     else:
         for c in range(1, state_dims):
             key, sk = jax.random.split(key)
@@ -184,6 +188,20 @@ CONFIG_DEFAULTS = dict(
     ground_z=0.0,
     anisotropy_dir=[0.0, 0.0, 1.0],
     anisotropy_strength=0.0,
+    # Coral-inspired additions (all default to off = old behaviour)
+    occlusion_strength=0.0,
+    occlusion_radius=0.0,
+    occlusion_cone=0.5,
+    growth_field_smooth=0.0,
+    growth_budget_gate=0.0,
+    growth_mode_mix=0.0,
+    inflation_strength=0.0,
+    morphogen_feed=0.037,
+    morphogen_kill=0.06,
+    morphogen_diff_u=0.16,
+    morphogen_diff_v=0.08,
+    morphogen_steps=0,
+    morphogen_coupling=0.0,
 )
 
 
@@ -221,7 +239,8 @@ def _resolve_light_pos(light_pos_cfg, resolution):
     return jnp.array(lp, dtype=jnp.float32)
 
 
-def run_one(cfg, frames, substeps, resolution, max_edge_len, max_splits, renderer):
+def run_one(cfg, frames, substeps, resolution, max_edge_len, max_splits, renderer,
+            do_descriptors=True, do_render=True, k_spectrum=15):
     key = jax.random.PRNGKey(cfg["mlp_seed"])
     key, mlp_key = jax.random.split(key)
     mlp_params = g.make_mlp_params(
@@ -252,6 +271,19 @@ def run_one(cfg, frames, substeps, resolution, max_edge_len, max_splits, rendere
         ground_source_value=float(cfg["ground_source_value"]),
         anisotropy_dir=anisotropy_dir,
         anisotropy_strength=float(cfg["anisotropy_strength"]),
+        occlusion_strength=float(cfg["occlusion_strength"]),
+        occlusion_radius=float(cfg["occlusion_radius"]),
+        occlusion_cone=float(cfg["occlusion_cone"]),
+        growth_field_smooth=float(cfg["growth_field_smooth"]),
+        growth_budget_gate=float(cfg["growth_budget_gate"]),
+        growth_mode_mix=float(cfg["growth_mode_mix"]),
+        inflation_strength=float(cfg["inflation_strength"]),
+        morphogen_feed=float(cfg["morphogen_feed"]),
+        morphogen_kill=float(cfg["morphogen_kill"]),
+        morphogen_diff_u=float(cfg["morphogen_diff_u"]),
+        morphogen_diff_v=float(cfg["morphogen_diff_v"]),
+        morphogen_steps=int(cfg["morphogen_steps"]),
+        morphogen_coupling=float(cfg["morphogen_coupling"]),
     )
     state = _build_initial(cfg, params, resolution)
     key, sk = jax.random.split(key)
@@ -289,8 +321,9 @@ def run_one(cfg, frames, substeps, resolution, max_edge_len, max_splits, rendere
     # 3/4 turntable view, not the default top-down (which looks straight into
     # the open hemisphere — a ring with a dark hole).
     img = renderer.render(state, rot=g.turntable_rot(0.6, 0.35)) \
-        if not has_nan else None
+        if (do_render and not has_nan) else None
     descriptors = None
+    mesh = None
     if not has_nan and int(nv) > 30:
         verts_j, faces_j, n_active = g.extract_mesh_for_nvdiffrast(state)
         n_active = int(n_active)
@@ -300,15 +333,20 @@ def run_one(cfg, frames, substeps, resolution, max_edge_len, max_splits, rendere
         remap[used] = np.arange(len(used))
         verts_np = np.asarray(verts_j)[used].astype(np.float64)
         faces_np = remap[faces_np]
-        try:
-            descriptors = desc.mesh_descriptors(verts_np, faces_np, k_spectrum=15)
-        except Exception as e:
-            log.warning("descriptor failure: %s", e)
+        mesh = (verts_np, faces_np)
+        if do_descriptors:
+            try:
+                descriptors = desc.mesh_descriptors(
+                    verts_np, faces_np, k_spectrum=k_spectrum)
+            except Exception as e:
+                log.warning("descriptor failure: %s", e)
 
     return dict(
-        cfg=cfg, image=img, descriptors=descriptors, state=state,
+        cfg=cfg, image=img, descriptors=descriptors, state=state, mesh=mesh,
         growth_curve=growth, elapsed=elapsed, has_nan=has_nan,
-        n_verts=int(nv), ok=(not has_nan and descriptors is not None),
+        n_verts=int(nv),
+        ok=(not has_nan and (descriptors is not None
+                             or (not do_descriptors and mesh is not None))),
     )
 
 

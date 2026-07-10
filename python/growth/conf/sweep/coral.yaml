@@ -1,0 +1,57 @@
+# Coral-inspired growth demo: exercises the four physics additions ported from
+# joel-simon/coral-growth, on the phototropic hemisphere base. Compare tiles
+# to sweep=phototropic to see the effect of each mechanism.
+#
+#   occlusion_strength   self-shadowing (feature 1) — the branching driver
+#   growth_budget_gate   growth gated by occluded light (feature 2)
+#   growth_field_smooth  1-ring smoothing of the growth field (feature 2)
+#   morphogen_coupling   Gray-Scott Turing growth zones (feature 4; needs
+#                        state_dims=5)
+#   growth_mode_mix      normal-displacement inflation blend (feature 5)
+#
+# Quasi-static growth (growth_rate 1.5 / state_dt 0.04) so folds stay smooth.
+
+name: coral
+
+_common: &common
+  growth_mode: phototropic
+  shape: hemisphere
+  state_dims: 5            # ch0 tissue, ch1 light, ch2 nutrient, ch3/4 = U/V
+  seed_pattern: apex
+  light_dir: [0.0, 0.0, 1.0]
+  growth_rate: 1.5
+  state_dt: 0.04
+  hemi_radius_mult: 3.0
+  hemi_lat: 6
+  hemi_lon: 16
+  occlusion_radius: 90.0
+  occlusion_cone: 0.4
+  morphogen_steps: 6
+
+configs:
+  # ── A: baseline (all additions off) → reference dome ────────────────────
+  - {<<: *common, mlp_seed: 11}
+
+  # ── B: self-shadowing only, ramp strength (feature 1) ───────────────────
+  - {<<: *common, mlp_seed: 11, occlusion_strength: 1.0}
+  - {<<: *common, mlp_seed: 11, occlusion_strength: 2.5}
+
+  # ── C: shadowing + light-budget-gated growth (features 1+2) — branches ──
+  - {<<: *common, mlp_seed: 11, occlusion_strength: 2.5, growth_budget_gate: 0.8}
+  - {<<: *common, mlp_seed: 11, occlusion_strength: 2.5, growth_budget_gate: 0.8,
+     growth_field_smooth: 0.3}
+
+  # ── D: Gray-Scott morphogen growth zones (feature 4) ────────────────────
+  - {<<: *common, mlp_seed: 23, morphogen_coupling: 0.5}
+  - {<<: *common, mlp_seed: 23, morphogen_coupling: 0.5, occlusion_strength: 2.0,
+     growth_budget_gate: 0.6}
+
+  # ── E: normal-displacement inflation blend (feature 5) ──────────────────
+  - {<<: *common, mlp_seed: 31, growth_mode_mix: 0.6, inflation_strength: 40.0}
+  - {<<: *common, mlp_seed: 31, growth_mode_mix: 0.6, inflation_strength: 40.0,
+     occlusion_strength: 2.0, growth_budget_gate: 0.7}
+
+  # ── F: everything on (the full coral recipe) ────────────────────────────
+  - {<<: *common, mlp_seed: 47, occlusion_strength: 2.5, growth_budget_gate: 0.8,
+     growth_field_smooth: 0.3, morphogen_coupling: 0.4,
+     growth_mode_mix: 0.4, inflation_strength: 35.0}

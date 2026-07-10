@@ -1,0 +1,61 @@
+# MAP-Elites diversity search over floraform growth.
+#
+# Archive axes (behaviour descriptors = diversity):
+#   x = compactness (surface-area / volume^2/3; sphere ~ 4.84, ruffled >> that)
+#   y = print height (z-extent, build direction = +z)
+# Each cell keeps the most PRINTABLE genome that lands in it (fitness below).
+#
+# Run (4 GB box):
+#   GROWTH_MAX_VERTICES=4000 conda run -n base python map_elites.py
+#   conda run -n base python map_elites.py n_evals=400 sigma=0.1 resolution=320
+#
+# On a bigger GPU bump GROWTH_MAX_VERTICES and resolution.
+
+defaults:
+  - _self_
+
+out_dir: outputs/${now:%Y%m%d-%H%M%S}_mapelites
+
+# ── Simulation ────────────────────────────────────────────────────────────
+frames: 600
+substeps: 10
+resolution: 224
+max_edge_len: 42.0      # subdivide sooner → finer meshes, richer shape
+max_splits: 20
+
+# ── Mesh init (phototropic hemisphere, morphogens on = state_dims 5) ────────
+hemi_radius_mult: 3.0
+hemi_lat: 6
+hemi_lon: 16
+hemi_closed: false
+morphogen_steps: 6
+mlp_seed: 11
+
+# ── Search ──────────────────────────────────────────────────────────────
+seed: 0
+n_evals: 200          # first-pass budget on the 4 GB box (~2-3 h)
+init_batch: 30        # random genomes before mutation-of-elites kicks in
+sigma: 0.15           # Gaussian mutation std in normalised gene space
+save_every: 15        # checkpoint archive + montage every N evals
+resume_from: null     # path to a previous archive.npz to re-seed the search
+
+# ── Archive grid (ranges matched to the realised span; see growprobe) ───────
+bins_compactness: 12
+bins_height: 12
+compactness_range: [4.5, 22.0]
+height_range: [150.0, 950.0]
+
+# ── Printability fitness (minimised; weighted, reference-normalised) ────────
+overhang_angle_deg: 45.0
+layer_height: 30.0    # world units per layer (spring_len ~ 30)
+weights:
+  overhang_fraction: 1.0
+  layers: 0.5
+  support_volume: 0.4
+  surface_area: 0.2
+
+hydra:
+  run:
+    dir: ${out_dir}
+  job:
+    chdir: false

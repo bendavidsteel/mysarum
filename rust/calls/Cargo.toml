@@ -1,0 +1,28 @@
+[package]
+name = "calls"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.17", default-features = false, features = [
+    "bevy_winit", "bevy_render", "bevy_core_pipeline", "bevy_window",
+    "multi_threaded", "x11", "default_font",
+] }
+bevy_egui = "0.38"
+cpal = "0.15"
+ringbuf = "0.4"
+rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

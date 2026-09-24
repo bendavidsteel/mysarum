@@ -1,10 +1,10 @@
-"""MAP-Elites illumination of the syrinx instrument space.
+"""MAP-Elites illumination of the syrinx performance space.
 
-Each candidate *instrument* (genome) is played by a fixed bank of gestures;
-every resulting call is embedded by BirdNET, projected onto the first two PCA
-axes, and dropped into the archive cell it lands in — keeping the call of
-highest nonlinear-richness fitness per cell. The archive that emerges is a
-navigable palette of synthetic calls spread across the perceptual manifold.
+A genome is an instrument *and* the motor gesture that plays it. Each renders
+one call, which BirdNET embeds, projected onto the first two PCA axes and
+dropped into the archive cell it lands in — keeping the fittest call per cell.
+The archive that emerges is a navigable palette of synthetic calls spread
+across the perceptual manifold.
 
 Run:  uv run python run_mapelites.py
       uv run python run_mapelites.py generations=300 offspring=32
@@ -17,6 +17,8 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", ".7")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 import logging
+import signal
+import sys
 import time
 
 import hydra
@@ -50,24 +52,24 @@ def render_calls(render, phys_rows, alpha_rows, beta_rows, noise_rows,
     return np.concatenate(out, axis=0)
 
 
-def expand_pairs(genomes, bank, rng):
-    """Every instrument x every gesture. Returns phys, alpha, beta, noise and
-    bookkeeping arrays (genome index, gesture id)."""
-    n_inst = len(genomes)
-    n_g, _, T = bank.shape
-    phys = gm.decode(genomes)                       # (n_inst, P)
-    phys_rows = np.repeat(phys, n_g, axis=0)         # (n_inst*n_g, P)
-    alpha_rows = np.tile(bank[:, 0], (n_inst, 1))    # (n_inst*n_g, T)
-    beta_rows = np.tile(bank[:, 1], (n_inst, 1))
-    noise_rows = rng.uniform(-1, 1, size=(n_inst * n_g, T)).astype(np.float32)
-    inst_idx = np.repeat(np.arange(n_inst), n_g)
-    gest_id = np.tile(np.arange(n_g), n_inst)
-    return (phys_rows.astype(np.float32), alpha_rows.astype(np.float32),
-            beta_rows.astype(np.float32), noise_rows, inst_idx, gest_id)
+def build_batch(genomes, n_samples, sr, rng):
+    """Genomes -> (instrument phys, alpha, beta, noise), one call per genome.
+
+    Each genome carries its own CPG parameters, so the motor path is built here
+    rather than drawn from a shared bank."""
+    phys = gm.decode(genomes)
+    inst = phys[:, gm.INSTRUMENT].astype(np.float32)
+    paths = gestures.paths_from_params(phys[:, gm.GESTURE], n_samples, sr)
+    noise = rng.uniform(-1, 1, size=(len(genomes), n_samples)).astype(np.float32)
+    return inst, paths[:, 0], paths[:, 1], noise
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig) -> None:
+    # Turn SIGTERM into a normal exit so atexit runs and the BirdNET worker
+    # pool is torn down; spawned workers otherwise outlive an interrupted run.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+
     log.info("\n" + OmegaConf.to_yaml(cfg))
     rundir = os.getcwd()  # hydra chdir's into the run dir
     rng = np.random.default_rng(cfg.seed)
@@ -75,30 +77,36 @@ def main(cfg: DictConfig) -> None:
     fitw = OmegaConf.to_container(cfg.fitness)
 
     log.info(f"jax devices: {jax.devices()}")
-    bank = gestures.make_gesture_bank(cfg.seed, cfg.n_gestures, T,
-                                      cfg.gesture_ctrl, cfg.gesture_sine, cfg.sr)
+    log.info(f"genome: {gm.N_PARAMS} params "
+             f"({gm.N_INSTRUMENT} instrument + {gm.N_GESTURE} gesture)")
     render = synth.make_renderer(cfg.sr, cfg.oversample, T)
     log.info(f"loading BirdNET (tensorflow-cpu), embed_workers={cfg.embed_workers}...")
     embedder = (ParallelEmbedder(cfg.embed_workers) if cfg.embed_workers > 1
                 else BirdNetEmbedder())
 
     def evaluate(genomes):
-        """Render + embed + score a set of instruments. Returns per-call records."""
-        phys, alpha, beta, noise, inst_idx, gest_id = expand_pairs(genomes, bank, rng)
-        waves = render_calls(render, phys, alpha, beta, noise, cfg.render_chunk)
+        """Render + embed + score a set of genomes. Returns per-call records.
+
+        Chunked end to end: the motor paths are as big as the audio, so
+        building them all up front costs more memory than the render itself."""
+        waves = []
+        for i in range(0, len(genomes), cfg.render_chunk):
+            sl = slice(i, i + cfg.render_chunk)
+            phys, alpha, beta, noise = build_batch(genomes[sl], T, cfg.sr, rng)
+            waves.append(render_calls(render, phys, alpha, beta, noise,
+                                      cfg.render_chunk))
+        waves = np.concatenate(waves, axis=0)
         embs = embedder.embed_many(waves, cfg.sr)
         recs = []
         for k in range(len(waves)):
             fit, feats = features.compute(waves[k], cfg.sr, fitw)
-            recs.append(dict(genome=genomes[inst_idx[k]], emb=embs[k],
-                             gesture_id=int(gest_id[k]), fitness=fit,
+            recs.append(dict(genome=genomes[k], emb=embs[k], fitness=fit,
                              feats=feats, wave=waves[k]))
         return recs
 
     # ── bootstrap: random instruments -> fit PCA + archive bounds, seed archive ─
-    log.info(f"bootstrap: {cfg.bootstrap} random instruments "
-             f"x {cfg.n_gestures} gestures = "
-             f"{cfg.bootstrap * cfg.n_gestures} calls")
+    log.info(f"bootstrap: {cfg.bootstrap} random genomes "
+             f"= {cfg.bootstrap} calls")
     t0 = time.time()
     boot_genomes = gm.random_genomes(rng, cfg.bootstrap)
     boot_recs = evaluate(boot_genomes)
@@ -115,7 +123,7 @@ def main(cfg: DictConfig) -> None:
     archive = Archive(projector.bounds, cfg.archive_resolution)
     for r in boot_recs:
         d = projector.project(r["emb"])[0]
-        archive.add(r["genome"], d, r["fitness"], r["gesture_id"], r["feats"])
+        archive.add(r["genome"], d, r["fitness"], r["feats"])
     log.info(f"bootstrap done in {time.time() - t0:.1f}s — "
              f"coverage {100 * archive.coverage():.1f}%  "
              f"QD {archive.qd_score():.1f}  best {archive.best()[1]:.3f}")
@@ -135,8 +143,7 @@ def main(cfg: DictConfig) -> None:
         added = 0
         for r in recs:
             d = projector.project(r["emb"])[0]
-            added += archive.add(r["genome"], d, r["fitness"],
-                                 r["gesture_id"], r["feats"])
+            added += archive.add(r["genome"], d, r["fitness"], r["feats"])
 
         if gen % cfg.log_every == 0 or gen == cfg.generations:
             log.info(f"gen {gen:4d}  +{added:2d}/{len(recs)}  "
@@ -161,10 +168,8 @@ def main(cfg: DictConfig) -> None:
     for rank, flat_idx in enumerate(top):
         i, j = np.unravel_index(flat_idx, archive.fitness.shape)
         genome = archive.genomes[i, j]
-        gid = int(archive.gesture_id[i, j])
-        phys = gm.decode(genome[None])
-        noise = rng.uniform(-1, 1, size=(1, T)).astype(np.float32)
-        wave = render_calls(render, phys, bank[gid, 0][None], bank[gid, 1][None], noise)[0]
+        inst, alpha, beta, noise = build_batch(genome[None], T, cfg.sr, rng)
+        wave = render_calls(render, inst, alpha, beta, noise)[0]
         nm = f"rank{rank:02d}_cell{i}-{j}_fit{archive.fitness[i, j]:.3f}"
         audio_io.save_wav(os.path.join(calldir, nm + ".wav"), wave, cfg.sr)
         top_waves.append(wave)

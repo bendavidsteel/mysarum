@@ -17,7 +17,6 @@ class Archive:
         self.fitness = np.full(shape, -np.inf)
         self.genomes = np.zeros((*shape, gm.N_PARAMS), dtype=np.float32)
         self.descriptors = np.full((*shape, 2), np.nan)
-        self.gesture_id = np.full(shape, -1, dtype=np.int32)
         self.feats: dict[tuple[int, int], dict] = {}
 
     def _cell(self, desc: np.ndarray) -> tuple[int, int]:
@@ -29,13 +28,18 @@ class Archive:
         return i, j
 
     def add(self, genome: np.ndarray, descriptor: np.ndarray, fitness: float,
-            gesture_id: int, feats: dict | None = None) -> bool:
+            feats: dict | None = None) -> bool:
+        # A zero score means a gate disqualified the call — silent, noise, or
+        # phonating with no drive. Such a call must not take a cell: it would
+        # still beat the -inf of an empty one, so a cell only ever visited by
+        # disqualified calls would look filled and hold a call we rejected.
+        if not fitness > 0.0:
+            return False
         i, j = self._cell(descriptor)
         if fitness > self.fitness[i, j]:
             self.fitness[i, j] = fitness
             self.genomes[i, j] = genome
             self.descriptors[i, j] = descriptor
-            self.gesture_id[i, j] = gesture_id
             if feats is not None:
                 self.feats[(i, j)] = feats
             return True
@@ -73,5 +77,4 @@ class Archive:
 
     def save(self, path: str) -> None:
         np.savez(path, bounds=self.bounds, res=self.res, fitness=self.fitness,
-                 genomes=self.genomes, descriptors=self.descriptors,
-                 gesture_id=self.gesture_id)
+                 genomes=self.genomes, descriptors=self.descriptors)

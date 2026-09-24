@@ -8,10 +8,9 @@ sr: 48000          # BirdNET expects 48 kHz
 duration: 3.0      # seconds (one BirdNET segment)
 oversample: 6      # ODE + filter substeps per audio frame (anti-aliasing)
 
-# ── gestures (fixed probing bank) ─────────────────────────────────────────────
-n_gestures: 6      # total (alpha, beta) paths swept through each instrument
-gesture_ctrl: 5    # control points per random spline
-gesture_sine: 2    # of the n_gestures, how many are sinusoidal trill/warble probes
+# Gestures are part of the genome (see callsong/genome.py), not a fixed bank —
+# each candidate carries its own CPG parameters and renders exactly one call.
+# callsong.gestures.illuminate() is still there for diagnostics/plots.
 
 # Precomputed BirdNET-PCA descriptor projector (from scripts/fit_projector.py,
 # e.g. fit on Xeno-canto recordings). If null, PCA is fit on the bootstrap
@@ -20,18 +19,37 @@ projector_path: null
 
 # ── MAP-Elites ────────────────────────────────────────────────────────────────
 archive_resolution: 24    # cells per PCA axis (24 x 24 grid)
-bootstrap: 96             # random instruments used to fit PCA + seed archive
+bootstrap: 1024           # random genomes used to fit PCA + seed archive
 generations: 120
-offspring: 16             # instruments proposed per generation
-render_chunk: 128         # max (instrument x gesture) pairs per vmap (raise on big GPUs)
+offspring: 128            # genomes proposed per generation (one call each)
+render_chunk: 128         # max calls per vmap (raise on big GPUs)
 embed_workers: 1          # BirdNET embedding processes (raise on many-core hosts)
 mutation_sigma: 0.12
 crossover_prob: 0.3       # fraction of offspring formed by crossover of 2 elites
 
 # ── fitness weights ────────────────────────────────────────────────────────────
+# fitness = audible * tonal * unforced * (base + contrast*contrast_n + flux*flux_n)
+#
+# `unforced` is a gate, not a weight: it zeroes any call that phonates while the
+# gesture is applying no drive. That is what keeps sound dependent on the motor
+# score, so terms like k_vdp stay available for the timbres they unlock without
+# letting the search buy loudness by ignoring the gesture.
+#
+# Default is GATES ONLY (base 1, rewards 0). The BirdNET-PCA descriptors are
+# what spread the archive; a reward term additionally prefers one kind of call,
+# and then every cell fills with the nearest thing to that call. With the
+# rewards on, two gestures won 81% of cells and 14 of the top 24 shared a single
+# syllable rate. Set contrast/flux back to 1.0 (and base to 0.0) to select for
+# nonlinear richness within each cell instead.
+# `tonal` is (1 - spectral flatness), remapped so it actually discriminates,
+# and it is both a gate and a weightable term. Raise it to push harder against
+# hiss. Do NOT reach for `flux` to add variety: it scores white noise higher
+# than a tonal frequency sweep, so it pulls the archive towards noise.
 fitness:
-  contrast: 1.0
-  flux: 1.0
+  base: 1.0
+  tonal: 0.5
+  contrast: 0.5
+  flux: 0.0
   rms_floor: 1.0e-3
   rms_ref: 0.1
 

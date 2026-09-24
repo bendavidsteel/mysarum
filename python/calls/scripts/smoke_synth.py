@@ -28,11 +28,11 @@ print("gesture bank:", bank.shape)
 # Two instruments: Mindlin default, and a van-der-Pol-heavy variant.
 mindlin = gm.mindlin_genome()
 variant = mindlin.copy()
-variant[gm.NAMES.index("k_vdp")] = 0.9
+variant[gm.NAMES.index("k_sqy")] = 0.9
 variant[gm.NAMES.index("k_sq")] = 0.2
-phys = gm.decode(np.stack([mindlin, mindlin, variant]))  # 3 calls
+phys = gm.decode(np.stack([mindlin, mindlin, variant]))[:, gm.INSTRUMENT]  # 3 calls
 
-# instrument i, gesture ids: mindlin+g0 (ramp), mindlin+g1, variant+g0
+# instrument i, gesture ids: mindlin+g0 (ramp), mindlin+g1 (CPG), variant+g0
 alpha = np.stack([bank[0, 0], bank[1, 0], bank[0, 0]]).astype(np.float32)
 beta = np.stack([bank[0, 1], bank[1, 1], bank[0, 1]]).astype(np.float32)
 rng = np.random.default_rng(0)
@@ -59,7 +59,7 @@ print("NaN?", bool(np.isnan(wave).any()), " shape", wave.shape)
 
 outdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "_smoke")
 os.makedirs(outdir, exist_ok=True)
-names = ["mindlin_ramp", "mindlin_spline", "vdp_ramp"]
+names = ["mindlin_ramp", "mindlin_cpg", "sqy_ramp"]
 for k, nm in enumerate(names):
     fit, feats = features.compute(wave[k], SR)
     print(f"{nm:16s} rms={feats['rms']:.3f} tonal={feats['tonal']:.2f} "

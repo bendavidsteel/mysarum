@@ -29,8 +29,22 @@ class BirdNetEmbedder:
     """Lazy wrapper around a single BirdNET analyzer instance."""
 
     def __init__(self) -> None:
-        from birdnetlib.analyzer import Analyzer
-        self._analyzer = Analyzer()
+        # birdnetlib sets CUDA_VISIBLE_DEVICES='' at *import* time to keep
+        # TensorFlow on the CPU, and never puts it back. That hides the GPU
+        # from JAX too if JAX has not initialised its backend yet, so the
+        # synthesiser silently falls back to CPU — or fails outright —
+        # depending only on import order. TensorFlow reads the variable while
+        # initialising below, so restoring it afterwards keeps TF on the CPU
+        # and leaves the GPU for JAX.
+        prev = os.environ.get("CUDA_VISIBLE_DEVICES")
+        try:
+            from birdnetlib.analyzer import Analyzer
+            self._analyzer = Analyzer()
+        finally:
+            if prev is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = prev
         # In-memory buffer support differs across birdnetlib versions; probe once.
         try:
             from birdnetlib import RecordingBuffer  # noqa: F401
@@ -85,19 +99,31 @@ class ParallelEmbedder:
     """
 
     def __init__(self, workers: int) -> None:
+        import atexit
         import concurrent.futures as cf
         import multiprocessing as mp
         self.workers = workers
         self._ex = cf.ProcessPoolExecutor(
             max_workers=workers, mp_context=mp.get_context("spawn"),
             initializer=_worker_init)
+        # Spawned workers outlive the parent if it dies without shutting the
+        # pool down, and a long search is exactly the thing you interrupt.
+        atexit.register(self.close)
 
     def embed_many(self, waves: np.ndarray, sr: int = BIRDNET_SR) -> np.ndarray:
         args = [(w, sr) for w in waves]
         return np.stack(list(self._ex.map(_worker_embed, args, chunksize=2)))
 
     def close(self) -> None:
-        self._ex.shutdown()
+        ex, self._ex = getattr(self, "_ex", None), None
+        if ex is not None:
+            ex.shutdown(wait=False, cancel_futures=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
 
 class DescriptorProjector:

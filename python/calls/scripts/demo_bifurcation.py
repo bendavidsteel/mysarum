@@ -38,11 +38,11 @@ def main():
 
     # A slow alpha (pressure) ramp across the phonation onset at a few fixed
     # tensions; each sweep traces a different slice of the bifurcation diagram.
-    for beta_val in [-0.05, 0.05, 0.2]:
+    for beta_val in [0.05, 0.6, 1.8]:
         alpha = (gestures.ALPHA_MIN
                  + (gestures.ALPHA_MAX - gestures.ALPHA_MIN) * t).astype(np.float32)
         beta = np.full(N, beta_val, dtype=np.float32)
-        phys = gm.decode(gm.mindlin_genome()[None]).astype(np.float32)
+        phys = gm.decode(gm.mindlin_genome()[None])[:, gm.INSTRUMENT].astype(np.float32)
         noise = rng.uniform(-1, 1, size=(1, N)).astype(np.float32)
         wave = np.asarray(render(jnp.asarray(phys), jnp.asarray(alpha[None]),
                                  jnp.asarray(beta[None]), jnp.asarray(noise))[0])

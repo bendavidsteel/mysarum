@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# Browse a directory of audio files in mpv, stepping between files with the
+# arrow keys. Each file shows its *whole* spectrogram at once with a cursor
+# sweeping through it, so you can see what is coming rather than only what has
+# already played.
+#
+#   wavspec                     # newest outputs/*/calls/
+#   wavspec <dir>               # every audio file in <dir>, sorted
+#   wavspec <dir> --waves       # waveform instead of a spectrogram
+#   wavspec <dir> --live        # scrolling spectrum, no pre-render
+#   wavspec <dir> --rebuild     # ignore the cache and re-render
+#   wavspec <file> [<file>...]  # an explicit list
+#
+# Keys:  LEFT / RIGHT  previous / next file      (mpv's own < > still work)
+#        UP / DOWN     previous / next file
+#        Shift+arrows  seek within the file
+#        SPACE pause    9 / 0 volume    q quit
+#
+# The static views are pre-rendered to a cache (audio is stream-copied, so it
+# stays bit-exact) keyed on the source path, mtime and render settings; only
+# new or changed files are re-encoded.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+conf="$here/wavspec.input.conf"
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/wavspec"
+
+W=1280; H=640
+FMIN=200; FMAX=12000          # displayed band; calls live well inside it
+mode="spectrum"
+rebuild=0
+args=()
+for a in "$@"; do
+    case "$a" in
+        --waves)   mode="waves" ;;
+        --live)    mode="live" ;;
+        --rebuild) rebuild=1 ;;
+        *)         args+=("$a") ;;
+    esac
+done
+
+if [ "${#args[@]}" -eq 0 ]; then
+    repo="$(cd "$here/.." && pwd)"
+    newest="$(ls -1dt "$repo"/outputs/*/calls/ 2>/dev/null | head -1 || true)"
+    args=("${newest:-.}")
+    [ -n "$newest" ] && echo "wavspec: $newest"
+fi
+
+files=()
+for a in "${args[@]}"; do
+    if [ -d "$a" ]; then
+        while IFS= read -r f; do files+=("$f"); done < <(
+            find "$a" -maxdepth 1 -type f \
+                \( -iname '*.wav' -o -iname '*.flac' -o -iname '*.ogg' \
+                   -o -iname '*.mp3' -o -iname '*.aiff' -o -iname '*.opus' \) \
+            | sort)
+    elif [ -f "$a" ]; then
+        files+=("$a")
+    else
+        echo "wavspec: no such file or directory: $a" >&2
+        exit 1
+    fi
+done
+[ "${#files[@]}" -gt 0 ] || { echo "wavspec: no audio in ${args[*]}" >&2; exit 1; }
+
+# ── live mode: scrolling spectrum straight off the source, no pre-render ─────
+if [ "$mode" = live ]; then
+    echo "wavspec: ${#files[@]} files (live scroll) — LEFT/RIGHT to step, q to quit"
+    exec mpv --input-conf="$conf" \
+        --lavfi-complex="[aid1]asplit[ao][a];[a]showspectrum=s=${W}x${H}:slide=scroll:mode=combined:color=intensity:scale=log:fscale=log:start=${FMIN}:stop=${FMAX}:legend=1[vo]" \
+        --force-window=yes --keep-open=yes --loop-playlist=inf \
+        --osd-playing-msg='${playlist-pos-1}/${playlist-count}  ${filename}' \
+        --osd-duration=4000 -- "${files[@]}"
+fi
+
+# ── static view + sweeping cursor, via a pre-rendered cache ─────────────────
+# The legend is off deliberately: showspectrumpic's legend adds margins, and
+# the cursor is positioned against the full frame width, so any margin would
+# desynchronise the cursor from the audio it is pointing at.
+case "$mode" in
+    spectrum) pic="showspectrumpic=s=${W}x${H}:mode=combined:color=intensity:scale=log:fscale=log:start=${FMIN}:stop=${FMAX}:legend=0"
+              band="${FMIN} Hz-$((FMAX / 1000)) kHz log" ;;
+    waves)    pic="showwavespic=s=${W}x${H}:colors=white:split_channels=0"
+              band="waveform" ;;
+esac
+
+key="$(printf '%s|%s|%sx%s|%s|%s' "$mode" "$pic" "$W" "$H" "$FMIN" "$FMAX" \
+       | sha1sum | cut -c1-12)"
+built=0
+rendered=()
+for f in "${files[@]}"; do
+    real="$(readlink -f "$f")"
+    dirkey="$(printf '%s|%s' "$(dirname "$real")" "$key" | sha1sum | cut -c1-16)"
+    out="$cache/$dirkey/$(basename "${f%.*}").mkv"
+    mkdir -p "$(dirname "$out")"
+    if [ "$rebuild" -eq 1 ] || [ ! -s "$out" ] || [ "$real" -nt "$out" ]; then
+        [ "$built" -eq 0 ] && printf 'wavspec: rendering '
+        printf '.'
+        built=$((built + 1))
+        dur="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f")"
+        tmp_pic="$(mktemp --suffix=.png)"
+        ffmpeg -nostdin -hide_banner -loglevel error -y -i "$f" \
+            -lavfi "$pic" "$tmp_pic"
+        # overlay, not drawbox: in drawbox `t` is the *thickness* variable, so a
+        # `t`-based x expression silently evaluates to garbage and draws nothing.
+        ffmpeg -nostdin -hide_banner -loglevel error -y \
+            -loop 1 -framerate 30 -i "$tmp_pic" \
+            -f lavfi -i "color=white:s=3x${H}" \
+            -i "$f" \
+            -filter_complex "[0:v][1:v]overlay=x='(W-w)*t/${dur}':y=0[v]" \
+            -map "[v]" -map 2:a \
+            -c:v libx264 -preset veryfast -pix_fmt yuv420p \
+            -c:a copy -shortest "$out"
+        rm -f "$tmp_pic"
+    fi
+    rendered+=("$out")
+done
+[ "$built" -gt 0 ] && printf ' %d rendered\n' "$built"
+
+echo "wavspec: ${#rendered[@]} files ($band) — LEFT/RIGHT to step, q to quit"
+exec mpv --input-conf="$conf" \
+    --force-window=yes --keep-open=yes --loop-playlist=inf \
+    --osd-playing-msg='${playlist-pos-1}/${playlist-count}  ${filename}' \
+    --osd-duration=4000 \
+    -- "${rendered[@]}"

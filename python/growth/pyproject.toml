@@ -1,0 +1,20 @@
+[project]
+name = "growth"
+version = "0.1.0"
+description = "GPU differential growth (dgrow) + MAP-Elites / CLIP-guided imitation of organic forms"
+requires-python = ">=3.11,<3.13"
+# The GPU host has a CUDA 12.5 driver: torch must come from the cu124 index and
+# warp-lang must stay on a CUDA-12 build (1.9.x); newer warp wheels need CUDA 13.
+dependencies = [
+    "torch==2.6.0", "warp-lang==1.9.1", "numpy", "scipy", "matplotlib", "pillow",
+    "imageio", "imageio-ffmpeg", "hydra-core", "tqdm", "transformers", "polars",
+    "scikit-learn", "cma",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }

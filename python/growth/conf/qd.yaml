@@ -1,0 +1,21 @@
+n_evals: 100000
+max_hours: 10.5
+n_init: 256
+batch: 32
+gpus: [0, 1]
+judge_gpu: 0
+n_cells: 400
+dims: 6
+refit_every: 1024
+sigma: 0.08
+p_cross: 0.5
+max_verts: 40000
+max_ticks: 1000
+render_size: 384
+save_every: 4
+seed: 0
+out: null
+
+hydra:
+  run:
+    dir: outputs/qd_${now:%Y%m%d-%H%M%S}

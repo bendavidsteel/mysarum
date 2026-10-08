@@ -17,6 +17,10 @@ judged from renders by image models.
   dynamics in Warp kernels: strain springs, Bridson dihedral bending (rest angle
   = `curl · edge`), hash-grid repulsion between non-adjacent vertices, radial
   foundation, normal pressure, gravity, ground plane.
+- Light: `Sim.light()` ray-casts toward +z through a Warp BVH (median builder;
+  LBVH traces this sparse batched layout badly) every `light_every` ticks and
+  stores per-vertex exposure as a vertex field. Feeds `g_light` growth and the
+  NCA's light cue.
 - Growth: per-vertex rate `g = base + edge·exp(-d/λ) + curv·H + morph·V +
   height·tanh(z/10)`, smoothed on the graph, then applied as a per-face growth
   tensor to each rest triangle (`aniso` grows along/across ∇d). Mapping whole
@@ -25,14 +29,25 @@ judged from renders by image models.
 - Gray-Scott morphogens (`U`, `V`) run on the normalised graph Laplacian when
   `SimConfig.morph_steps > 0`.
 - Individuals that go non-finite are quarantined (frozen), not fatal.
+- `nca.py` — neural graph CA: a per-vertex state (12 channels in [-1,1]) updated
+  by a per-individual MLP over own state, neighbour mean and local cues
+  (distance, curvature, height, normal, boundary, noise, light), plus fixed
+  per-channel diffusion. Channel 0 → growth rate, 1 → anisotropy along ∇d,
+  2 → spontaneous curvature, 3–5 → surface RGB, 6 → phototropism (anisotropic
+  growth along the light direction projected into each face). Attach with
+  `Sim.attach_nca`. Its genome is 17 physics genes in [0,1] + ~1.2k raw MLP
+  weights; seeds add `stalk`.
 - `render.py` — Warp BVH ray tracer: AO, soft key-light shadow, two-tone
   front/back faces. `views()` = iso/side/top strip, `turntable()` = mp4/gif.
 - `presets.py` — seed meshes + hand-built presets after real organisms
   (lettuce, kale, saddle, hyperbolic, trumpet, brain, turing, coral).
 - `genome.py` — 18 genes in [0,1] → (seed shape, `Params`); gated genes switch
-  mechanisms fully off in the lower part of their range.
+  mechanisms fully off in the lower part of their range. `qd.py genome=nca` /
+  `imitate.py --genome nca` use `nca.py`'s genome instead.
 - `evaluate.py` — grow a batch of genomes until each hits its vertex budget,
-  relax, render iso + top.
+  relax, render iso + top. `grow_reps` grows each genome several times (QD
+  `reps`, imitation `--reps`) and searches score the mean, since NCA forms
+  can depend on the random draw.
 - `judge.py` — DINOv2-small embeddings (descriptors) and CLIP ViT-L/14
   organism-vs-decoy probabilities (fitness, imitation targets).
 
@@ -51,8 +66,8 @@ uv run python qd.py out=outputs/qd max_hours=10.5
 uv run python imitate.py "a nudibranch sea slug" --qd outputs/qd
 uv run python imitate.py --refs ~/photos/morels --qd outputs/qd
 
-# The 12 h chain used for the first big run (QD then four imitation targets)
-./run_overnight.sh
+# 12 h chain: QD then four imitation targets, for either genome
+./run_overnight.sh nca
 ```
 
 QD writes `evals.parquet` (every evaluation), `embeddings.npz`,

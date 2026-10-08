@@ -48,6 +48,12 @@ class Params:
     g_height: float = 0.0        # growth ∝ z (light from above)
     aniso: float = 0.0           # +1 grow along ∇d (radial), -1 across it (circumferential)
     g_noise: float = 0.0         # static per-vertex growth heterogeneity (inherited on split)
+    # neural CA channels (see nca.py): growth, anisotropy, spontaneous curvature
+    g_nca: float = 0.0
+    nca_aniso: float = 0.0
+    nca_curl: float = 0.0
+    nca_tropic: float = 0.0      # NCA-gated anisotropic growth toward the light
+    g_light: float = 0.0         # growth ∝ light exposure (shaded parts grow less)
     # Gray-Scott morphogens on the mesh graph (off when morph_steps == 0)
     gs_feed: float = 0.0367
     gs_kill: float = 0.0649
@@ -89,7 +95,8 @@ def k_springs(x: wp.array(dtype=wp.vec3), edges: wp.array(dtype=wp.vec2i),
 @wp.kernel
 def k_bending(x: wp.array(dtype=wp.vec3), hinges: wp.array(dtype=wp.vec4i),
               ind: wp.array(dtype=int), P: wp.array2d(dtype=float),
-              kb_col: int, curl_col: int, f: wp.array(dtype=wp.vec3)):
+              kb_col: int, curl_col: int, vcurl: wp.array(dtype=float),
+              f: wp.array(dtype=wp.vec3)):
     h = wp.tid()
     a = hinges[h][0]
     b = hinges[h][1]
@@ -118,7 +125,7 @@ def k_bending(x: wp.array(dtype=wp.vec3), hinges: wp.array(dtype=wp.vec4i),
     sgn = wp.sign(wp.dot(wp.cross(m1, m2), En))
     sin_half = sgn * wp.sqrt(wp.max((1.0 - cos_t) * 0.5, 0.0))
     p = ind[a]
-    theta0 = P[p, curl_col] * el
+    theta0 = (P[p, curl_col] + 0.5 * (vcurl[a] + vcurl[b])) * el
     s = P[p, kb_col] * el * el / (wp.sqrt(l1) + wp.sqrt(l2)) * (sin_half - wp.sin(0.5 * theta0))
     wp.atomic_add(f, c, s * u1)
     wp.atomic_add(f, d, s * u2)
@@ -255,6 +262,32 @@ def k_geodesic_tri(faces: wp.array(dtype=wp.vec3i), frest: wp.array(dtype=wp.vec
     wp.atomic_min(d, v1, _tri_update(d[v2], d[v0], l20, l12, l01))
 
 
+@wp.kernel
+def k_light(mesh: wp.uint64, x: wp.array(dtype=wp.vec3), vn: wp.array(dtype=wp.vec3),
+            light: wp.vec3, n_rays: int, spread: float, max_t: float, seed: int,
+            out: wp.array(dtype=float)):
+    # Fraction of jittered rays toward the light that escape, times the cosine
+    # term; a sheet is lit from whichever side faces the light.
+    i = wp.tid()
+    n = vn[i]
+    nl = wp.length(n)
+    if nl < 1.0e-12:
+        out[i] = 0.0
+        return
+    n = n / nl
+    if wp.dot(n, light) < 0.0:
+        n = -n
+    rng = wp.rand_init(seed, i)
+    p = x[i] + n * 0.05
+    free = float(0.0)
+    for k in range(n_rays):
+        j = wp.vec3(wp.randf(rng) - 0.5, wp.randf(rng) - 0.5, wp.randf(rng) - 0.5)
+        q = wp.mesh_query_ray(mesh, p, wp.normalize(light + spread * j), max_t)
+        if not q.result:
+            free += 1.0
+    out[i] = free / float(n_rays) * (0.3 + 0.7 * wp.dot(n, light))
+
+
 def _wp(t, dtype):
     dtype = {float: wp.float32, int: wp.int32}.get(dtype, dtype)
     return wp.from_torch(t.contiguous(), dtype=dtype)
@@ -271,6 +304,8 @@ class SimConfig:
     max_verts: int = 60000        # per individual
     max_step: float = 0.2         # per-substep displacement cap (stability guard)
     morph_steps: int = 0
+    nca_steps: int = 2            # neural CA updates per growth tick (when attached)
+    light_every: int = 4          # growth ticks between light-exposure ray casts
     remesh_every: int = 3         # growth ticks between split/flip passes
     g_smooth: int = 4             # diffusion passes on the growth field
     curv_smooth: int = 8          # diffusion passes on mean curvature
@@ -310,6 +345,8 @@ class Sim:
         self.t = 0.0
         self.dead = torch.zeros(self.n_ind, dtype=torch.bool, device=self.dev)
         self.active = torch.ones(self.n_ind, device=self.dev)  # growth on/off per individual
+        self.nca = None
+        self._light_tick = 0
         self._rebuild(initial=True)
 
     @classmethod
@@ -423,7 +460,14 @@ class Sim:
         s = torch.zeros_like(u)
         s.index_add_(0, e[:, 0], u[e[:, 1]])
         s.index_add_(0, e[:, 1], u[e[:, 0]])
-        return s / self.topo.valence.clamp(min=1).float() - u
+        deg = self.topo.valence.clamp(min=1).float()
+        return s / (deg[:, None] if u.dim() > 1 else deg) - u
+
+    def attach_nca(self, nca, preroll=32):
+        """Drive growth, anisotropy, curl and colour from a neural CA (nca.NCA)."""
+        self.nca = nca
+        self.vf["nca"] = nca.init_state(self)
+        nca.step(self, preroll)
 
     def morphogens(self, steps):
         P = self.P[self.ind]
@@ -446,6 +490,27 @@ class Sim:
         self.vf["V"] = torch.where(spots > 0, 0.25, 0.0)
         self.morphogens(preroll)
 
+    def light(self, n_rays=4, spread=0.6):
+        """Per-vertex exposure in [0,1] to light from +z, with self-shading.
+
+        Recast every `cfg.light_every` ticks; in between it is a vertex field,
+        so vertices from splits inherit their endpoints' exposure.
+        """
+        tick = getattr(self, "ticks", 0)
+        if "light" in self.vf and tick - self._light_tick < self.cfg.light_every:
+            return self.vf["light"]
+        pos = self.pos.contiguous()
+        idx = self.faces.int().reshape(-1).contiguous()  # must outlive the mesh
+        # The median BVH traces this sparse multi-individual layout far faster than LBVH.
+        mesh = wp.Mesh(points=_wp(pos, wp.vec3), indices=_wp(idx, int), bvh_constructor="median")
+        out = torch.zeros(pos.shape[0], device=self.dev)
+        wp.launch(k_light, dim=pos.shape[0], inputs=[
+            mesh.id, _wp(pos, wp.vec3), _wp(self.vertex_normals(), wp.vec3), wp.vec3(0.0, 0.0, 1.0),
+            n_rays, spread, 200.0, tick, _wp(out, float)], device=self.wdev)
+        self.vf["light"] = out
+        self._light_tick = tick
+        return out
+
     def growth_rate(self):
         P = self.P[self.ind]
         g = P[:, PI["g_base"]] + P[:, PI["g_edge"]] * torch.exp(-self.dist / P[:, PI["edge_lambda"]].clamp(min=1e-3))
@@ -456,7 +521,11 @@ class Sim:
         if (self.P[:, PI["g_height"]] != 0).any():
             z = self.pos[:, 2] - self.centers[self.ind, 2]
             g = g + P[:, PI["g_height"]] * torch.tanh(z / 10.0)
+        if (self.P[:, PI["g_light"]] != 0).any():
+            g = g + P[:, PI["g_light"]] * self.light()
         g = g * (1 + P[:, PI["g_noise"]] * self.vf["noise"])
+        if self.nca is not None:
+            g = g + P[:, PI["g_nca"]] * 0.5 * (self.vf["nca"][:, self.nca.CH_GROW] + 1)
         return g
 
     def smooth(self, u, iters, rate=0.5):
@@ -468,8 +537,9 @@ class Sim:
     def grow(self, dt_g):
         """Apply a per-face growth tensor to each rest triangle, average per edge.
 
-        F = I + dt·g·((1+a)·uuᵀ + (1-a)·(I-uuᵀ)), u = intrinsic ∇dist. Mapping
-        whole triangles keeps the rest metric realisable, unlike per-edge rates.
+        F = I + dt·g·(I + a·(2uuᵀ-I) + b·(2llᵀ-I)), u = intrinsic ∇dist, l = the
+        light direction in the face plane (NCA tropism). Mapping whole triangles
+        keeps the rest metric realisable, unlike per-edge rates.
         """
         cfg = self.cfg
         g = self.smooth(self.growth_rate(), cfg.g_smooth)
@@ -485,13 +555,33 @@ class Sim:
         gy = (d[:, 2] - d[:, 0] - gx * x2) / y2
         gn = torch.sqrt(gx**2 + gy**2)
         ux, uy = gx / gn.clamp(min=1e-6), gy / gn.clamp(min=1e-6)
-        a = self.P[self.ind[faces[:, 0]], PI["aniso"]] * (gn > 0.05)
+        a = self.P[self.ind[faces[:, 0]], PI["aniso"]]
+        if self.nca is not None:
+            s = self.vf["nca"][:, self.nca.CH_ANISO][faces].mean(1)
+            a = (a + self.P[self.ind[faces[:, 0]], PI["nca_aniso"]] * s).clamp(-0.9, 0.9)
+        a = a * (gn > 0.05)
+        # Light direction in the same triangle frame, read off the embedded triangle.
+        b = torch.zeros_like(a)
+        lx = ly = torch.zeros_like(a)
+        if self.nca is not None and (self.P[:, PI["nca_tropic"]] != 0).any():
+            p0, p1, p2 = self.pos[faces[:, 0]], self.pos[faces[:, 1]], self.pos[faces[:, 2]]
+            e1 = torch.nn.functional.normalize(p1 - p0, dim=1)
+            nrm = torch.nn.functional.normalize(torch.cross(p1 - p0, p2 - p0, dim=1), dim=1)
+            e2 = torch.cross(nrm, e1, dim=1)
+            tx, ty = e1[:, 2], e2[:, 2]
+            tl = torch.sqrt(tx**2 + ty**2)
+            lx, ly = tx / tl.clamp(min=1e-6), ty / tl.clamp(min=1e-6)
+            s = 0.5 * (self.vf["nca"][:, self.nca.CH_TROPIC][faces].mean(1) + 1)
+            b = self.P[self.ind[faces[:, 0]], PI["nca_tropic"]] * s * tl.clamp(max=1)
+            tot = a.abs() + b
+            k = torch.where(tot > 0.9, 0.9 / tot.clamp(min=1e-6), 1.0)
+            a, b = a * k, b * k
         gf = dt_g * g[faces].mean(1).clamp(-1, 2)
         gf = torch.where((self.vf["pinned"][faces] > 0.5).any(1), 0.0, gf)
-        # F = I + gf·(I + a·(2uuᵀ - I))
-        fxx = 1 + gf * (1 + a * (2 * ux * ux - 1))
-        fyy = 1 + gf * (1 + a * (2 * uy * uy - 1))
-        fxy = gf * a * 2 * ux * uy
+        # F = I + gf·(I + a·(2uuᵀ - I) + b·(2llᵀ - I))
+        fxx = 1 + gf * (1 + a * (2 * ux * ux - 1) + b * (2 * lx * lx - 1))
+        fyy = 1 + gf * (1 + a * (2 * uy * uy - 1) + b * (2 * ly * ly - 1))
+        fxy = gf * 2 * (a * ux * uy + b * lx * ly)
         def mapped(ex, ey):
             return torch.sqrt((fxx * ex + fxy * ey) ** 2 + (fxy * ex + fyy * ey) ** 2)
         z = torch.zeros_like(l01)
@@ -521,11 +611,15 @@ class Sim:
         max_r = float(self.P[:, PI["repel_r"]].max())
         grid = wp.HashGrid(128, 128, 128, device=self.wdev)
         need_normals = bool((self.P[:, PI["pressure"]] != 0).any())
+        vcurl_t = torch.zeros(self.pos.shape[0], device=self.dev)
+        if self.nca is not None:
+            vcurl_t = self.P[self.ind, PI["nca_curl"]] * self.vf["nca"][:, self.nca.CH_CURL]
+        vcurl = _wp(vcurl_t, float)
         N = self.pos.shape[0]
         for _ in range(n):
             wp.launch(k_springs, dim=edges.shape[0], inputs=[x, edges, rest, ind, P, PI["k_stretch"], f], device=self.wdev)
             if hinges.shape[0]:
-                wp.launch(k_bending, dim=hinges.shape[0], inputs=[x, hinges, ind, P, PI["k_bend"], PI["curl"], f], device=self.wdev)
+                wp.launch(k_bending, dim=hinges.shape[0], inputs=[x, hinges, ind, P, PI["k_bend"], PI["curl"], vcurl, f], device=self.wdev)
             grid.build(x, max_r)
             wp.launch(k_repel, dim=N, inputs=[grid.id, x, ind, P, PI["k_repel"], PI["repel_r"], adj, adj_off, max_r, f], device=self.wdev)
             if need_normals:
@@ -541,6 +635,8 @@ class Sim:
         cfg = self.cfg
         if cfg.morph_steps:
             self.morphogens(cfg.morph_steps)
+        if self.nca is not None:
+            self.nca.step(self, cfg.nca_steps)
         self.grow(dt_g)
         self.physics(cfg.substeps)
         self.vf["age"] += dt_g
@@ -565,6 +661,8 @@ class Sim:
         self.pos = torch.where(dv[:, None] & ~torch.isfinite(self.pos), self.centers[self.ind], self.pos)
         self.vel = torch.where(dv[:, None], 0.0, self.vel)
         self.rest = torch.nan_to_num(self.rest, nan=1.0, posinf=1.0)
+        if "nca" in self.vf:
+            self.vf["nca"] = torch.nan_to_num(self.vf["nca"])
         self.vf["pinned"] = torch.where(dv, 1.0, self.vf["pinned"])
         self.pinned_i32 = (self.vf["pinned"] > 0.5).int()
 
@@ -581,6 +679,8 @@ class Sim:
         extra = {k: v[idx] for k, v in self.vf.items()}
         extra["dist"] = self.dist[idx]
         extra["g"] = self.growth_rate()[idx]
+        if self.nca is not None:
+            extra["color"] = self.nca.color(self.vf["nca"][idx])
         return pos, faces, extra
 
     def counts(self):

@@ -10,6 +10,8 @@ ORGANISMS = [
     "a succulent plant", "a flower", "a rose", "a seashell", "a jellyfish",
     "a fan coral", "a cauliflower", "a walnut", "a human brain", "a pinecone",
     "a seaweed", "a sea urchin", "a morel mushroom", "a cabbage", "a gourd",
+    "a staghorn coral", "a lettuce coral", "a chanterelle mushroom", "a bracket fungus",
+    "a coral fungus", "a fern",
 ]
 NEGATIVES = [
     "crumpled paper", "a pile of trash", "a smooth blob", "a rock", "a plastic bag",

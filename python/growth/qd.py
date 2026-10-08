@@ -2,11 +2,14 @@
 
 Descriptor = PCA of DINOv2 embeddings of the iso + top renders (refit on the
 whole history every `refit_every` evaluations, then the archive is rebuilt).
-Fitness = how specifically CLIP thinks the render is a real organism.
+Fitness = how specifically CLIP thinks the render is a real organism, averaged
+over `reps` growths of the genome (different random draws); the replicate
+nearest that mean stands for the genome in the archive.
 One grower process per GPU; the judge runs in the main process.
 
     uv run python qd.py                       # -> outputs/qd_<timestamp>/
     uv run python qd.py n_evals=8000 gpus=[0,1] batch=32
+    uv run python qd.py genome=nca            # neural-CA genomes (nca.py)
 """
 
 import io
@@ -34,10 +37,10 @@ def worker(gpu, cfg, inq, outq):
             return
         bid, ids, genomes = job
         try:
-            res = evaluate.grow_batch(genomes, max_verts=cfg.max_verts, max_ticks=cfg.max_ticks,
-                                      seed=bid, size=cfg.render_size)
+            res = evaluate.grow_reps(genomes, cfg.reps, max_verts=cfg.max_verts, max_ticks=cfg.max_ticks,
+                                     seed=bid, size=cfg.render_size, kind=cfg.genome)
         except Exception as e:  # a bad batch must not kill the run
-            res = [dict(dead=True, error=repr(e), n_verts=0, seed="?") for _ in ids]
+            res = [[dict(dead=True, error=repr(e), n_verts=0, seed="?")] * cfg.reps for _ in ids]
         outq.put((bid, ids, genomes, res))
 
 
@@ -72,6 +75,16 @@ def fitness(r):
     return 0.5 * r["organic"] + 0.5 * r["label_p"]
 
 
+def representative(reps):
+    """(replicate nearest the mean fitness, mean fitness, per-replicate fitness); dead reps count 0."""
+    fits = [fitness(r) if not r["dead"] else 0.0 for r in reps]
+    alive = [i for i, r in enumerate(reps) if not r["dead"]]
+    if not alive:
+        return reps[0], -1.0, fits
+    m = float(np.mean(fits))
+    return reps[min(alive, key=lambda i: abs(fits[i] - m))], m, fits
+
+
 def montage(rows, run, path, cols=6, tile=256):
     """rows: list of dicts with id/label/fitness; tiles are the iso render."""
     n = len(rows)
@@ -99,8 +112,10 @@ def farthest(z, k, rng):
 
 @hydra.main(version_base=None, config_path="conf", config_name="qd")
 def main(cfg: DictConfig):
-    from dgrow import genome as G
+    from dgrow.evaluate import GENOMES
     from dgrow.judge import Judge
+
+    G = GENOMES[cfg.genome]
 
     run = os.getcwd() if cfg.out is None else cfg.out
     os.makedirs(f"{run}/imgs", exist_ok=True)
@@ -171,17 +186,19 @@ def main(cfg: DictConfig):
             print("timeout waiting for workers", file=log, flush=True)
             break
         in_flight -= 1
-        judge.score(res)
-        for i, g, r in zip(ids, genomes, res):
+        judge.score([r for reps in res for r in reps])
+        for i, g, reps in zip(ids, genomes, res):
+            r, fit, fits = representative(reps)
             row = dict(id=i, batch=bid, genome=[float(x) for x in g], seed=r.get("seed", "?"),
                        dead=bool(r["dead"]), n_verts=r["n_verts"], stop_tick=r.get("stop_tick", -1),
                        organic=r.get("organic", 0.0), label=r.get("label", ""),
                        label_p=r.get("label_p", 0.0), error=r.get("error", ""))
-            row["fitness"] = fitness(r) if not r["dead"] else -1.0
+            row["fitness"], row["fitness_reps"] = fit, fits
             if not r["dead"]:
                 embs[i] = r["dino"]
                 Image.fromarray(np.concatenate([r["iso"], r["top"]], 1)).save(f"{run}/imgs/{i}.jpg", quality=88)
-                np.savez_compressed(f"{run}/meshes/{i}.npz", pos=r["pos"], faces=r["faces"])
+                np.savez_compressed(f"{run}/meshes/{i}.npz", pos=r["pos"], faces=r["faces"],
+                                    **({"color": r["color"]} if "color" in r else {}))
             rows.append(row)
         n_done = len(rows)
         alive = [r for r in rows if not r["dead"]]
@@ -199,7 +216,7 @@ def main(cfg: DictConfig):
         qd = sum(f for _, f in elite.values())
         msg = (f"[{time.time() - t0:7.0f}s] evals {n_done} alive {len(alive)} cells {len(elite)}/{cfg.n_cells} "
                f"qd {qd:.1f} best {max((f for _, f in elite.values()), default=0):.3f} "
-               f"batch {res[0].get('secs', 0):.0f}s")
+               f"batch {res[0][0].get('secs', 0):.0f}s")
         print(msg, flush=True)
         print(msg, file=log, flush=True)
         if bid % cfg.save_every == 0:

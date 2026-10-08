@@ -1,7 +1,8 @@
 """Ray-traced clay renders of a triangle mesh (Warp BVH): AO + soft key-light shadow.
 
 Front and back faces get different albedos so the two sides of a sheet read
-apart; an optional per-vertex scalar tints the surface through a colormap.
+apart; an optional per-vertex scalar (through a colormap) or RGB colour
+replaces the clay albedo.
 """
 
 import math
@@ -116,7 +117,7 @@ BACK = (0.55, 0.30, 0.32)
 
 
 def render(pos, faces, W=768, H=768, azim=35.0, elev=30.0, spp=16, ao_n=4,
-           scalar=None, cmap="magma", ortho=False, fov=28.0, seed=0, center=None,
+           scalar=None, cmap="magma", color=None, ortho=False, fov=28.0, seed=0, center=None,
            radius=None, front=FRONT, back=BACK, light=(0.4, -0.3, 0.85)):
     """Render a mesh to an (H, W, 3) uint8 array. pos/faces are torch tensors on CUDA."""
     dev = pos.device
@@ -141,8 +142,10 @@ def render(pos, faces, W=768, H=768, azim=35.0, elev=30.0, spp=16, ao_n=4,
         eye = center.cpu() + dirn * (radius * 1.05 / math.sin(math.radians(fov) / 2))
     wmesh = wp.Mesh(points=wp.from_torch(pos, dtype=wp.vec3), indices=wp.from_torch(faces.reshape(-1), dtype=wp.int32))
     vn = _vertex_normals(pos, faces.long())
-    use_vcol = scalar is not None
-    if use_vcol:
+    use_vcol = scalar is not None or color is not None
+    if color is not None:
+        vcol = torch.as_tensor(color, device=dev).float().clamp(0, 1) ** 2.2
+    elif scalar is not None:
         s = scalar.float()
         lo_, hi_ = torch.quantile(s, 0.02), torch.quantile(s, 0.98)
         vcol = _cmap(((s - lo_) / (hi_ - lo_ + 1e-9)).clamp(0, 1), cmap).to(dev) ** 2.2

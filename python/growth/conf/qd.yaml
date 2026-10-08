@@ -1,7 +1,9 @@
+genome: param   # param | nca
 n_evals: 100000
 max_hours: 10.5
 n_init: 256
-batch: 32
+batch: 16       # genomes per job; each is grown `reps` times
+reps: 2
 gpus: [0, 1]
 judge_gpu: 0
 n_cells: 400

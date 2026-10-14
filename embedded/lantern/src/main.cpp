@@ -19,8 +19,10 @@ constexpr int OUTPUTS = 2;
 constexpr int LEDS = 45;  // per output
 constexpr uint8_t BRIGHTNESS = 255;
 constexpr int MAX_COMETS = 4;
-// Show only the strongest colour channel of each pixel; set false once the strips get 12V.
-constexpr bool SINGLE_CHANNEL = true;
+// Show only the strongest colour channel of each pixel, for strips without their 12V supply.
+constexpr bool SINGLE_CHANNEL = false;
+// FastLED's per-channel current model is close enough for these 12V strips; stays under a 1A supply.
+constexpr uint32_t MAX_MILLIAMPS = 900;
 static_assert(GRAPH_NODES == OUTPUTS * LEDS, "re-run tools/export_graph.py for this LED count");
 
 CRGB leds[OUTPUTS][LEDS];
@@ -273,6 +275,7 @@ void setup() {
     Serial.begin(115200);
     FastLED.addLeds<WS2813, 23, RGB>(leds[0], LEDS);
     FastLED.addLeds<WS2813, 19, RGB>(leds[1], LEDS);
+    FastLED.setMaxPowerInVoltsAndMilliamps(5, MAX_MILLIAMPS);
     FastLED.clear(true);
     uint32_t t = micros();
     for (int i = 0; i < 100; i++) gray_scott.step();

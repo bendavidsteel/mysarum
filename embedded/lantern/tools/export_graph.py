@@ -58,7 +58,7 @@ def csr(rows: np.ndarray, n: int) -> np.ndarray:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--radius", type=float, default=1.25)
-    p.add_argument("--sphere-level", type=int, default=3, help="icosphere subdivisions (3 = 642 vertices)")
+    p.add_argument("--sphere-level", type=int, default=2, help="icosphere subdivisions (2 = 162 vertices)")
     p.add_argument("--blur", type=float, default=0.5, help="LED sampling radius, in LED spacings")
     args = p.parse_args()
 

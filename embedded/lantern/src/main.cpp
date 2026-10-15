@@ -391,9 +391,10 @@ struct Cyclic {
 // Laplacian and the size of the local gradient, plus absolute values), so no direction on the
 // lantern is favoured. Updates pass through tanh with a slight pull towards zero, which keeps
 // the channels off their limits. The weights take a Metropolis walk: every few seconds a small
-// Ornstein-Uhlenbeck step is proposed, run, and kept or undone by how its fitness (spread across
-// the LEDs, movement up to a cap, and structure at a middle scale in the shown channels) compares
-// with the last kept weights. When the pattern goes
+// Ornstein-Uhlenbeck step is proposed, run, and kept or undone by how its fitness compares with
+// the last kept weights. Fitness is the energy of the shown channels in a middle band of spatial
+// and of temporal frequencies, so contrast at a few LEDs' scale and motion over fractions of a
+// second count, while speckle, flicker, flatness and stillness don't. When the pattern goes
 // flat, a small patch is scrambled; if it goes flat again soon after, the weights are redrawn.
 // Shown either as channel 0 on a colour map, or as channels 0-2 directly as red, green and blue,
 // so the colours evolve with the weights.
@@ -401,14 +402,16 @@ struct Nca {
     static constexpr int C = 8, F = 5 * C;
     // Weights have a gain of 1.6 over sqrt(F).
     static constexpr float W_STD = 1.6f / 6.3246f, LEAK = 0.4f, FLAT = 0.05f, DRIFT_STEPS = 3000;
-    static constexpr float MOVE_CAP = 0.03f, MOVE_WEIGHT = 5, BAND_WEIGHT = 1, TEMPERATURE = 0.03f;
+    static constexpr float SPACE_WEIGHT = 1, TIME_WEIGHT = 1, FAST = 1 / 3.0f, SLOW = 1 / 25.0f;
+    static constexpr float TEMPERATURE = 0.1f;  // on log fitness, so a relative change
     static constexpr uint32_t STEP_MS = 40, FLAT_STEPS = 25, RESEED_MS = 2000, TOOK_STEPS = 150;
-    static constexpr uint32_t EVAL_STEPS = 50;
+    static constexpr uint32_t EVAL_STEPS = 125;  // 5 s
     static constexpr Look LOOK = {VIRIDIS, false, 0.3f}, RGB_LOOK = {VIRIDIS, false, 0.3f, true};
     bool rgb = true;
     float state[GRAPH_NODES][C];
     float w[C][F], b[C], kept[C][F];
-    float fitness_sum = 0, kept_fitness = -1;  // -1 until the current weights have been scored
+    float fitness_sum = 0, kept_fitness = NAN;  // NAN until the current weights have been scored
+    float fast[GRAPH_NODES][3] = {}, slow[GRAPH_NODES][3] = {};  // moving averages of the shown channels
     float edge_dir[GRAPH_EDGES][3];  // unit direction of each edge in the tangent plane at its source
     uint32_t last_step = 0, last_seed = 0, flat_steps = 0, seed_steps = 0, eval_steps = 0;
 
@@ -434,14 +437,14 @@ struct Nca {
         for (auto &row : w)
             for (auto &x : row) x = W_STD * gauss();
         for (auto &x : b) x = 0.02f * gauss();
-        kept_fitness = -1, fitness_sum = 0, eval_steps = 0;
+        kept_fitness = NAN, fitness_sum = 0, eval_steps = 0;
     }
 
     // Keeps or undoes the weights just scored, then proposes the next step from the kept ones.
     void evaluate() {
-        float fitness = fitness_sum / EVAL_STEPS;
+        float fitness = logf(fitness_sum / EVAL_STEPS + 1e-6f);
         fitness_sum = 0, eval_steps = 0;
-        if (kept_fitness < 0 || frand() < expf(fminf(0, (fitness - kept_fitness) / TEMPERATURE))) {
+        if (isnan(kept_fitness) || frand() < expf(fminf(0, (fitness - kept_fitness) / TEMPERATURE))) {
             memcpy(kept, w, sizeof(w));
             kept_fitness = fitness;
         } else {
@@ -472,28 +475,42 @@ struct Nca {
         }
     }
 
-    // Share of the shown channels' variance in a middle band of spatial frequencies, as a
-    // difference of blurs: one blur removes speckle, and subtracting three removes large blobs.
-    float band() {
+    // Variance of the shown channels in a middle band of spatial frequencies, as a difference of
+    // blurs: one blur removes speckle, and subtracting three removes large blobs.
+    float space_band() {
         static float s[GRAPH_NODES][3], once[GRAPH_NODES][3], a[GRAPH_NODES][3], b[GRAPH_NODES][3];
         for (int i = 0; i < GRAPH_NODES; i++)
             for (int k = 0; k < 3; k++) s[i][k] = state[i][k];
         blur(s, once);
         blur(once, a);
         blur(a, b);
-        float fraction = 0;
+        float energy = 0;
         const int channels = rgb ? 3 : 1;
         for (int k = 0; k < channels; k++) {
-            float sum = 0, sq = 0, band_sum = 0, band_sq = 0;
+            float sum = 0, sq = 0;
             for (int i = 0; i < GRAPH_NODES; i++) {
                 float d = once[i][k] - b[i][k];
-                sum += s[i][k], sq += s[i][k] * s[i][k], band_sum += d, band_sq += d * d;
+                sum += d, sq += d * d;
             }
-            float m = sum / GRAPH_NODES, band_m = band_sum / GRAPH_NODES;
-            float var = sq / GRAPH_NODES - m * m, band_var = band_sq / GRAPH_NODES - band_m * band_m;
-            fraction += fmaxf(band_var, 0) / (fmaxf(var, 0) + 1e-4f) / channels;
+            float m = sum / GRAPH_NODES;
+            energy += fmaxf(sq / GRAPH_NODES - m * m, 0) / channels;
         }
-        return fraction;
+        return energy;
+    }
+
+    // Mean square of the shown channels in a middle band of temporal frequencies, as a difference
+    // of moving averages: the fast one removes step-to-step flicker, the slow one stillness.
+    float time_band() {
+        float energy = 0;
+        const int channels = rgb ? 3 : 1;
+        for (int i = 0; i < GRAPH_NODES; i++)
+            for (int k = 0; k < channels; k++) {
+                fast[i][k] += (state[i][k] - fast[i][k]) * FAST;
+                slow[i][k] += (state[i][k] - slow[i][k]) * SLOW;
+                float d = fast[i][k] - slow[i][k];
+                energy += d * d;
+            }
+        return energy / (GRAPH_NODES * channels);
     }
 
     void step() {
@@ -525,13 +542,9 @@ struct Nca {
                 next[i][c] = tanhf(s[c] + d);
             }
         }
-        float move = 0;
-        for (int i = 0; i < GRAPH_NODES; i++)
-            for (int c = 0; c < C; c++) move += fabsf(next[i][c] - state[i][c]);
-        move /= GRAPH_NODES * C;
         memcpy(state, next, sizeof(state));
 
-        // Mean over channels of the spread across LEDs.
+        // Mean over channels of the spread across LEDs, for spotting a flat pattern.
         float spread = 0;
         for (int c = 0; c < C; c++) {
             float sum = 0, sq = 0;
@@ -539,7 +552,7 @@ struct Nca {
             float m = sum / GRAPH_NODES;
             spread += sqrtf(fmaxf(sq / GRAPH_NODES - m * m, 0)) / C;
         }
-        fitness_sum += spread + MOVE_WEIGHT * fminf(move, MOVE_CAP) + BAND_WEIGHT * band();
+        fitness_sum += SPACE_WEIGHT * space_band() + TIME_WEIGHT * time_band();
         if (++eval_steps == EVAL_STEPS) evaluate();
         flat_steps = spread < FLAT ? flat_steps + 1 : 0;
         if (flat_steps >= FLAT_STEPS && millis() - last_seed > RESEED_MS) {

@@ -1,4 +1,4 @@
 # Run outputs (meshes, renders, parquet logs) live on the GPU host; regenerable.
-outputs/
+outputs
 __pycache__/
 .venv/

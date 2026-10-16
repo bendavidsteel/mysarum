@@ -80,8 +80,9 @@ wired in yet; it is meant as an extra QD fitness term for 3D-printable forms.
 
 ## Environment
 
-Runs on a remote 2-GPU box (RTX 3090s); code is rsynced there from this
-repo. uv only. Its driver is CUDA 12.5, so `pyproject.toml`
+Runs on a remote 2-GPU box (RTX 3090s) from a git checkout of this repo:
+push here, `git pull` there; its `outputs` is a symlink to the run data.
+uv only. Its driver is CUDA 12.5, so `pyproject.toml`
 pins torch 2.6.0 from the cu124 index and warp-lang 1.9.1 (newer warp wheels
 need a CUDA 13 driver). Models download from Hugging Face on first use; set
 `HF_HUB_OFFLINE=1` for long runs.

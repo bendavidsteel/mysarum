@@ -55,7 +55,7 @@ def main():
     for it in range(max(ticks)):
         done = torch.tensor([it >= t for t in ticks], device=sim.dev)
         sim.P[:, S.PI["g_base"]] = torch.where(done, 0.0, torch.tensor([p.g_base for p in params], device=sim.dev))
-        for k in ["g_edge", "g_curv", "g_morph", "g_height"]:
+        for k in ["g_edge", "g_curv", "g_morph", "g_height", "g_ambient", "accrete"]:
             sim.P[:, S.PI[k]] = torch.where(done, 0.0, torch.tensor([getattr(p, k) for p in params], device=sim.dev))
         sim.step(dts[0])
         if it % 100 == 0:

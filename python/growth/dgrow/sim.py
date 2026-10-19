@@ -5,6 +5,9 @@ Physics is explicit damped dynamics on a triangle mesh:
   bend     — Bridson dihedral hinges, rest angle = curl · edge length
   repel    — hash-grid vertex repulsion between non-adjacent vertices
   extras   — radial elastic foundation, normal pressure, gravity, ground plane
+  accrete  — deposit along the normal ∝ exposure·(bias + β·H + γ·√K)₊ with
+             surface tension; tips outgrow flanks and split (Kaandorp-style)
+  plastic  — rest curvature relaxes toward the current one (shapes set)
 Growth multiplies each edge's rest length by exp(dt · g_e); edges that grow
 past `split_len` are bisected, and intrinsic Delaunay flips keep triangles
 well-shaped. Several individuals can be simulated at once as one disjoint
@@ -19,6 +22,7 @@ import torch
 import warp as wp
 
 from . import mesh as M
+from .render import _hemi
 
 wp.config.quiet = True
 wp.init()
@@ -54,6 +58,25 @@ class Params:
     nca_curl: float = 0.0
     nca_tropic: float = 0.0      # NCA-gated anisotropic growth toward the light
     g_light: float = 0.0         # growth ∝ light exposure (shaded parts grow less)
+    g_ambient: float = 0.0       # growth ∝ ambient (hemisphere) exposure
+    # accretion: move the surface along its normal ∝ ambient exposure above a
+    # threshold (skeleton deposition; Kaandorp's branching rule), keeping the
+    # deposited surface stress-free
+    accrete: float = 0.0
+    acc_thresh: float = 0.3
+    acc_curv: float = 0.0        # tip enhancement: deposit ∝ (acc_bias + acc_curv·H)₊ (diffusion-limited flux)
+    acc_bias: float = 1.0        # < 0: only tips sharper than -bias/curv deposit
+    acc_light: float = 0.0       # resource mix: 0 = ambient (nutrient), 1 = overhead light
+    acc_smooth: float = 2.0      # diffusion passes on the flux: sets the branch width
+    acc_gauss: float = 0.0       # γ in the flux, on sign(K)√|K|: tips grow, cylinder flanks and saddles don't
+    acc_tension: float = 0.1     # surface tension on the accreting front (keeps it well-posed)
+    plastic: float = 0.0         # rate the rest curvature relaxes toward the current one
+    g_smooth: float = 4.0        # diffusion passes on the growth field
+    # NCA-controlled material: polarity axis, bending stiffness, anisotropic curl, accretion
+    nca_polar: float = 0.0
+    nca_stiff: float = 0.0       # k_bend · exp(nca_stiff · S) per vertex
+    nca_acurl: float = 0.0       # spontaneous curvature along the polarity axis (tubes)
+    nca_acc: float = 0.0
     # Gray-Scott morphogens on the mesh graph (off when morph_steps == 0)
     gs_feed: float = 0.0367
     gs_kill: float = 0.0649
@@ -69,6 +92,9 @@ class Params:
 
 
 PNAMES = Params.names()
+# Rest curl that makes a hinge stress-free at measured mean curvature H
+# (calibrated on an outward icosphere: bulging toward the normal is negative curl).
+PCURL = -0.4
 PI = {n: i for i, n in enumerate(PNAMES)}
 
 
@@ -95,8 +121,8 @@ def k_springs(x: wp.array(dtype=wp.vec3), edges: wp.array(dtype=wp.vec2i),
 @wp.kernel
 def k_bending(x: wp.array(dtype=wp.vec3), hinges: wp.array(dtype=wp.vec4i),
               ind: wp.array(dtype=int), P: wp.array2d(dtype=float),
-              kb_col: int, curl_col: int, vcurl: wp.array(dtype=float),
-              f: wp.array(dtype=wp.vec3)):
+              kb_col: int, curl_col: int, hcurl: wp.array(dtype=float),
+              hk: wp.array(dtype=float), f: wp.array(dtype=wp.vec3)):
     h = wp.tid()
     a = hinges[h][0]
     b = hinges[h][1]
@@ -125,8 +151,8 @@ def k_bending(x: wp.array(dtype=wp.vec3), hinges: wp.array(dtype=wp.vec4i),
     sgn = wp.sign(wp.dot(wp.cross(m1, m2), En))
     sin_half = sgn * wp.sqrt(wp.max((1.0 - cos_t) * 0.5, 0.0))
     p = ind[a]
-    theta0 = (P[p, curl_col] + 0.5 * (vcurl[a] + vcurl[b])) * el
-    s = P[p, kb_col] * el * el / (wp.sqrt(l1) + wp.sqrt(l2)) * (sin_half - wp.sin(0.5 * theta0))
+    theta0 = (P[p, curl_col] + hcurl[h]) * el
+    s = P[p, kb_col] * hk[h] * el * el / (wp.sqrt(l1) + wp.sqrt(l2)) * (sin_half - wp.sin(0.5 * theta0))
     wp.atomic_add(f, c, s * u1)
     wp.atomic_add(f, d, s * u2)
     wp.atomic_add(f, a, s * u3)
@@ -288,6 +314,30 @@ def k_light(mesh: wp.uint64, x: wp.array(dtype=wp.vec3), vn: wp.array(dtype=wp.v
     out[i] = free / float(n_rays) * (0.3 + 0.7 * wp.dot(n, light))
 
 
+@wp.kernel
+def k_ambient(mesh: wp.uint64, x: wp.array(dtype=wp.vec3), vn: wp.array(dtype=wp.vec3),
+              n_rays: int, max_t: float, seed: int, out: wp.array(dtype=float)):
+    # Fraction of cosine-weighted rays over the front hemisphere that travel
+    # max_t without hitting the surface: access to nutrient / ambient light.
+    i = wp.tid()
+    n = vn[i]
+    nl = wp.length(n)
+    if nl < 1.0e-12:
+        out[i] = 0.0
+        return
+    n = n / nl
+    rng = wp.rand_init(seed, i)
+    p = x[i] + n * 0.05
+    free = float(0.0)
+    for k in range(n_rays):
+        q = wp.mesh_query_ray(mesh, p, _hemi(n, rng), max_t)
+        if not q.result:
+            free += 1.0
+        else:
+            free += q.t / max_t
+    out[i] = free / float(n_rays)
+
+
 def _wp(t, dtype):
     dtype = {float: wp.float32, int: wp.int32}.get(dtype, dtype)
     return wp.from_torch(t.contiguous(), dtype=dtype)
@@ -306,8 +356,9 @@ class SimConfig:
     morph_steps: int = 0
     nca_steps: int = 2            # neural CA updates per growth tick (when attached)
     light_every: int = 4          # growth ticks between light-exposure ray casts
+    amb_rays: int = 16
+    amb_dist: float = 12.0        # ambient rays that travel this far count as open
     remesh_every: int = 3         # growth ticks between split/flip passes
-    g_smooth: int = 4             # diffusion passes on the growth field
     curv_smooth: int = 8          # diffusion passes on mean curvature
     min_rest: float = 0.4
     seed: int = 0
@@ -343,11 +394,15 @@ class Sim:
             "age": z.clone(),
         }
         self.t = 0.0
+        self.ticks = 0
+        self._bvh_tick = -1
         self.dead = torch.zeros(self.n_ind, dtype=torch.bool, device=self.dev)
         self.active = torch.ones(self.n_ind, device=self.dev)  # growth on/off per individual
         self.nca = None
-        self._light_tick = 0
+        self._cast_tick = {}
         self._rebuild(initial=True)
+        # Plastic rest curvature starts at the seed's own, so seeds aren't flattened.
+        self.vf["pcurl"] = PCURL * self.mean_curvature()
 
     @classmethod
     def from_meshes(cls, meshes, params, cfg, spacing=None, device="cuda"):
@@ -455,6 +510,24 @@ class Sim:
         h[self.topo.boundary] = 0.0
         return self.smooth(h, self.cfg.curv_smooth)
 
+    def gauss_curvature(self):
+        """Signed √|K| from the angle defect (1/length, positive at tips, 0 on cylinders)."""
+        f = self.faces
+        p = self.pos[f]
+        ang = []
+        area = 0.5 * torch.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0], dim=1).norm(dim=1)
+        for k in range(3):
+            u = torch.nn.functional.normalize(p[:, (k + 1) % 3] - p[:, k], dim=1)
+            v = torch.nn.functional.normalize(p[:, (k + 2) % 3] - p[:, k], dim=1)
+            ang.append(torch.acos((u * v).sum(1).clamp(-1, 1)))
+        N = self.pos.shape[0]
+        asum = torch.zeros(N, device=self.dev).index_add_(0, f.reshape(-1), torch.stack(ang, 1).reshape(-1))
+        A = torch.zeros(N, device=self.dev).index_add_(0, f.reshape(-1), (area / 3).repeat_interleave(3))
+        K = (2 * math.pi - asum) / A.clamp(min=1e-6)
+        K[self.topo.boundary] = 0.0
+        K = self.smooth(K, self.cfg.curv_smooth)
+        return torch.sign(K) * K.abs().sqrt()
+
     def _graph_lap(self, u):
         e = self.topo.edges
         s = torch.zeros_like(u)
@@ -490,26 +563,47 @@ class Sim:
         self.vf["V"] = torch.where(spots > 0, 0.25, 0.0)
         self.morphogens(preroll)
 
-    def light(self, n_rays=4, spread=0.6):
-        """Per-vertex exposure in [0,1] to light from +z, with self-shading.
+    def _bvh(self):
+        """Warp BVH over the current surface, built at most once per tick."""
+        if self._bvh_tick != self.ticks:
+            self._bvh_pos = self.pos.contiguous()
+            self._bvh_idx = self.faces.int().reshape(-1).contiguous()  # must outlive the mesh
+            # The median BVH traces this sparse multi-individual layout far faster than LBVH.
+            self._bvh_mesh = wp.Mesh(points=_wp(self._bvh_pos, wp.vec3), indices=_wp(self._bvh_idx, int),
+                                     bvh_constructor="median")
+            self._bvh_tick = self.ticks
+        return self._bvh_mesh
 
-        Recast every `cfg.light_every` ticks; in between it is a vertex field,
-        so vertices from splits inherit their endpoints' exposure.
-        """
-        tick = getattr(self, "ticks", 0)
-        if "light" in self.vf and tick - self._light_tick < self.cfg.light_every:
+    def _cached(self, name):
+        """Ray-cast fields are recast every `cfg.light_every` ticks; in between they are
+        vertex fields, so vertices from splits inherit their endpoints' values."""
+        return name in self.vf and self.ticks - self._cast_tick.get(name, -10**9) < self.cfg.light_every
+
+    def light(self, n_rays=4, spread=0.6):
+        """Per-vertex exposure in [0,1] to light from +z, with self-shading."""
+        if self._cached("light"):
             return self.vf["light"]
-        pos = self.pos.contiguous()
-        idx = self.faces.int().reshape(-1).contiguous()  # must outlive the mesh
-        # The median BVH traces this sparse multi-individual layout far faster than LBVH.
-        mesh = wp.Mesh(points=_wp(pos, wp.vec3), indices=_wp(idx, int), bvh_constructor="median")
-        out = torch.zeros(pos.shape[0], device=self.dev)
-        wp.launch(k_light, dim=pos.shape[0], inputs=[
-            mesh.id, _wp(pos, wp.vec3), _wp(self.vertex_normals(), wp.vec3), wp.vec3(0.0, 0.0, 1.0),
-            n_rays, spread, 200.0, tick, _wp(out, float)], device=self.wdev)
+        mesh = self._bvh()
+        out = torch.zeros(self.pos.shape[0], device=self.dev)
+        wp.launch(k_light, dim=out.shape[0], inputs=[
+            mesh.id, _wp(self._bvh_pos, wp.vec3), _wp(self.vertex_normals(), wp.vec3), wp.vec3(0.0, 0.0, 1.0),
+            n_rays, spread, 200.0, self.ticks, _wp(out, float)], device=self.wdev)
         self.vf["light"] = out
-        self._light_tick = tick
+        self._cast_tick["light"] = self.ticks
         return out
+
+    def ambient(self):
+        """Per-vertex openness in [0,1] of the front hemisphere (crevices → 0, tips → 1)."""
+        if self._cached("ambient"):
+            return self.vf["ambient"]
+        mesh = self._bvh()
+        out = torch.zeros(self.pos.shape[0], device=self.dev)
+        wp.launch(k_ambient, dim=out.shape[0], inputs=[
+            mesh.id, _wp(self._bvh_pos, wp.vec3), _wp(self.vertex_normals(), wp.vec3),
+            self.cfg.amb_rays, self.cfg.amb_dist, self.ticks + 7919, _wp(out, float)], device=self.wdev)
+        self.vf["ambient"] = self.smooth(out, 2)
+        self._cast_tick["ambient"] = self.ticks
+        return self.vf["ambient"]
 
     def growth_rate(self):
         P = self.P[self.ind]
@@ -523,6 +617,8 @@ class Sim:
             g = g + P[:, PI["g_height"]] * torch.tanh(z / 10.0)
         if (self.P[:, PI["g_light"]] != 0).any():
             g = g + P[:, PI["g_light"]] * self.light()
+        if (self.P[:, PI["g_ambient"]] != 0).any():
+            g = g + P[:, PI["g_ambient"]] * self.ambient()
         g = g * (1 + P[:, PI["g_noise"]] * self.vf["noise"])
         if self.nca is not None:
             g = g + P[:, PI["g_nca"]] * 0.5 * (self.vf["nca"][:, self.nca.CH_GROW] + 1)
@@ -534,61 +630,159 @@ class Sim:
             u = u + rate * self._graph_lap(u)
         return u
 
+    def smooth_var(self, u, iters):
+        """`smooth` with a per-vertex (fractional) number of passes."""
+        for k in range(math.ceil(float(iters.max()))):
+            u = u + 0.5 * (iters - k).clamp(0, 1) * self._graph_lap(u)
+        return u
+
+    def _face_grad(self, d, l01, x2, y2):
+        """Intrinsic gradient of a vertex field per face, in the rest frame
+        p0=(0,0), p1=(l01,0), p2=(x2,y2)."""
+        d = d[self.faces]
+        gx = (d[:, 1] - d[:, 0]) / l01
+        gy = (d[:, 2] - d[:, 0] - gx * x2) / y2
+        return gx, gy
+
+    def _face_frame(self):
+        """Embedded frame per face: e1 along v0→v1, e2 in-plane, unit normal."""
+        p0, p1, p2 = self.pos[self.faces[:, 0]], self.pos[self.faces[:, 1]], self.pos[self.faces[:, 2]]
+        e1 = torch.nn.functional.normalize(p1 - p0, dim=1)
+        nrm = torch.nn.functional.normalize(torch.cross(p1 - p0, p2 - p0, dim=1), dim=1)
+        return e1, torch.cross(nrm, e1, dim=1), nrm
+
+    def accrete(self, dt_g):
+        """Deposit along the normal ∝ ambient exposure; the new surface is stress-free."""
+        P = self.P[self.ind]
+        amb = self.ambient()
+        if (self.P[:, PI["acc_light"]] != 0).any():
+            m = P[:, PI["acc_light"]]
+            amb = (1 - m) * amb + m * self.light()
+        th = P[:, PI["acc_thresh"]]
+        r = P[:, PI["accrete"]] * ((amb - th) / (1 - th).clamp(min=1e-3)).clamp(min=0)
+        if self.nca is not None and (self.P[:, PI["nca_acc"]] != 0).any():
+            r = r * (1 + P[:, PI["nca_acc"]] * self.vf["nca"][:, self.nca.CH_ACC]).clamp(min=0)
+        # Diffusion-limited flux concentrates on tips: (bias + β·H + γ·√K)₊.
+        flux = P[:, PI["acc_bias"]]
+        if (self.P[:, PI["acc_curv"]] != 0).any():
+            flux = flux + P[:, PI["acc_curv"]] * self.mean_curvature().clamp(-2, 2)
+        if (self.P[:, PI["acc_gauss"]] != 0).any():
+            flux = flux + P[:, PI["acc_gauss"]] * self.gauss_curvature().clamp(-2, 2)
+        r = self.smooth_var(r * flux.clamp(min=0), P[:, PI["acc_smooth"]])
+        # Off on and next to pinned vertices: edges touching a pin never split.
+        pin = self.vf["pinned"]
+        near_pin = (pin + self._graph_lap(pin)) > 0
+        on = self.active[self.ind] * ~near_pin * (P[:, PI["accrete"]] > 0)
+        r = r * on
+        n = torch.nn.functional.normalize(self.vertex_normals(), dim=1)
+        # Umbrella Laplacian = curvature flow along n plus tangential relaxation.
+        lap = self._graph_lap(self.pos)
+        lap[self.topo.boundary] = 0.0
+        # At most a tenth of an edge per tick, so the springs keep up.
+        new = self.pos + (dt_g * r).clamp(max=0.1)[:, None] * n \
+            + (P[:, PI["acc_tension"]] * on).clamp(max=0.5)[:, None] * lap
+        e = self.topo.edges
+        l0 = (self.pos[e[:, 1]] - self.pos[e[:, 0]]).norm(dim=1)
+        l1 = (new[e[:, 1]] - new[e[:, 0]]).norm(dim=1)
+        self.rest = (self.rest + (l1 - l0).clamp(-0.1, 0.1)).clamp(min=self.cfg.min_rest)
+        self.pos = new
+
     def grow(self, dt_g):
         """Apply a per-face growth tensor to each rest triangle, average per edge.
 
-        F = I + dt·g·(I + a·(2uuᵀ-I) + b·(2llᵀ-I)), u = intrinsic ∇dist, l = the
-        light direction in the face plane (NCA tropism). Mapping whole triangles
-        keeps the rest metric realisable, unlike per-edge rates.
+        F = I + dt·g·(I + a·(2uuᵀ-I) + b·(2llᵀ-I) + c·(2ppᵀ-I)), u = intrinsic
+        ∇dist, l = the light direction in the face plane (NCA tropism), p = the
+        intrinsic gradient of the NCA's polarity channel. Mapping whole
+        triangles keeps the rest metric realisable, unlike per-edge rates.
         """
-        cfg = self.cfg
-        g = self.smooth(self.growth_rate(), cfg.g_smooth)
+        P = self.P[self.ind]
+        g = self.smooth_var(self.growth_rate(), P[:, PI["g_smooth"]])
         g = torch.where(self.vf["pinned"] > 0.5, 0.0, g) * self.active[self.ind]
         faces = self.faces
+        fi = self.ind[faces[:, 0]]
+        PF = self.P[fi]
+        nca = self.nca is not None
+        S = self.vf["nca"] if nca else None
         he = self.topo.he_edge.reshape(-1, 3)
         l01, l12, l20 = self.rest[he[:, 0]], self.rest[he[:, 1]], self.rest[he[:, 2]]
         x2 = (l01**2 + l20**2 - l12**2) / (2 * l01)
         y2 = torch.sqrt((l20**2 - x2**2).clamp(min=1e-8))
-        d = self.dist[faces]
-        # ∇d in the frame p0=(0,0), p1=(l01,0), p2=(x2,y2).
-        gx = (d[:, 1] - d[:, 0]) / l01
-        gy = (d[:, 2] - d[:, 0] - gx * x2) / y2
+        gx, gy = self._face_grad(self.dist, l01, x2, y2)
         gn = torch.sqrt(gx**2 + gy**2)
         ux, uy = gx / gn.clamp(min=1e-6), gy / gn.clamp(min=1e-6)
-        a = self.P[self.ind[faces[:, 0]], PI["aniso"]]
-        if self.nca is not None:
-            s = self.vf["nca"][:, self.nca.CH_ANISO][faces].mean(1)
-            a = (a + self.P[self.ind[faces[:, 0]], PI["nca_aniso"]] * s).clamp(-0.9, 0.9)
+        a = PF[:, PI["aniso"]]
+        if nca:
+            a = (a + PF[:, PI["nca_aniso"]] * S[:, self.nca.CH_ANISO][faces].mean(1)).clamp(-0.9, 0.9)
         a = a * (gn > 0.05)
         # Light direction in the same triangle frame, read off the embedded triangle.
-        b = torch.zeros_like(a)
-        lx = ly = torch.zeros_like(a)
-        if self.nca is not None and (self.P[:, PI["nca_tropic"]] != 0).any():
-            p0, p1, p2 = self.pos[faces[:, 0]], self.pos[faces[:, 1]], self.pos[faces[:, 2]]
-            e1 = torch.nn.functional.normalize(p1 - p0, dim=1)
-            nrm = torch.nn.functional.normalize(torch.cross(p1 - p0, p2 - p0, dim=1), dim=1)
-            e2 = torch.cross(nrm, e1, dim=1)
+        z = torch.zeros_like(a)
+        b, c, lx, ly, px, py, w = z, z, z, z, z, z, z
+        if nca and (self.P[:, PI["nca_tropic"]] != 0).any():
+            e1, e2, _ = self._face_frame()
             tx, ty = e1[:, 2], e2[:, 2]
             tl = torch.sqrt(tx**2 + ty**2)
             lx, ly = tx / tl.clamp(min=1e-6), ty / tl.clamp(min=1e-6)
-            s = 0.5 * (self.vf["nca"][:, self.nca.CH_TROPIC][faces].mean(1) + 1)
-            b = self.P[self.ind[faces[:, 0]], PI["nca_tropic"]] * s * tl.clamp(max=1)
-            tot = a.abs() + b
-            k = torch.where(tot > 0.9, 0.9 / tot.clamp(min=1e-6), 1.0)
-            a, b = a * k, b * k
+            s = 0.5 * (S[:, self.nca.CH_TROPIC][faces].mean(1) + 1)
+            b = PF[:, PI["nca_tropic"]] * s * tl.clamp(max=1)
+        # Polarity: the CA's own gradient sets a growth axis (auxin-like).
+        if nca and (self.P[:, PI["nca_polar"]] != 0).any():
+            qx, qy = self._face_grad(S[:, self.nca.CH_POL], l01, x2, y2)
+            qn = torch.sqrt(qx**2 + qy**2)
+            px, py = qx / qn.clamp(min=1e-6), qy / qn.clamp(min=1e-6)
+            w = torch.tanh(qn / 0.02) * (PF[:, PI["nca_polar"]] != 0)
+            c = PF[:, PI["nca_polar"]] * S[:, self.nca.CH_PSTR][faces].mean(1) * w
+        tot = a.abs() + b + c.abs()
+        k = torch.where(tot > 0.9, 0.9 / tot.clamp(min=1e-6), 1.0)
+        a, b, c = a * k, b * k, c * k
+        # Director for anisotropic curl: polarity where it is defined, else ∇d (doubled angle).
+        c2 = (1 - w) * (ux * ux - uy * uy) + w * (px * px - py * py)
+        s2 = (1 - w) * 2 * ux * uy + w * 2 * px * py
+        th = 0.5 * torch.atan2(s2, c2)
+        self._axis = (torch.cos(th), torch.sin(th))
         gf = dt_g * g[faces].mean(1).clamp(-1, 2)
         gf = torch.where((self.vf["pinned"][faces] > 0.5).any(1), 0.0, gf)
-        # F = I + gf·(I + a·(2uuᵀ - I) + b·(2llᵀ - I))
-        fxx = 1 + gf * (1 + a * (2 * ux * ux - 1) + b * (2 * lx * lx - 1))
-        fyy = 1 + gf * (1 + a * (2 * uy * uy - 1) + b * (2 * ly * ly - 1))
-        fxy = gf * 2 * (a * ux * uy + b * lx * ly)
+        fxx = 1 + gf * (1 + a * (2 * ux * ux - 1) + b * (2 * lx * lx - 1) + c * (2 * px * px - 1))
+        fyy = 1 + gf * (1 + a * (2 * uy * uy - 1) + b * (2 * ly * ly - 1) + c * (2 * py * py - 1))
+        fxy = gf * 2 * (a * ux * uy + b * lx * ly + c * px * py)
         def mapped(ex, ey):
             return torch.sqrt((fxx * ex + fxy * ey) ** 2 + (fxy * ex + fyy * ey) ** 2)
-        z = torch.zeros_like(l01)
-        new = torch.stack([mapped(l01, z), mapped(x2 - l01, y2), mapped(-x2, -y2)], 1)
+        # Stretch ratios times the stored lengths: a rest triangle that breaks the
+        # triangle inequality then can't feed back into its own edge lengths.
+        ex, ey = torch.stack([l01, x2 - l01, -x2], 1), torch.stack([z, y2, -y2], 1)
+        old = torch.sqrt(ex**2 + ey**2).clamp(min=1e-6)
+        new = torch.stack([l01, l12, l20], 1) * torch.stack(
+            [mapped(ex[:, k], ey[:, k]) for k in range(3)], 1) / old
         acc = torch.zeros_like(self.rest).index_add_(0, he.reshape(-1), new.reshape(-1))
         cnt = torch.zeros_like(self.rest).index_add_(0, he.reshape(-1), torch.ones_like(new.reshape(-1)))
-        self.rest = (acc / cnt.clamp(min=1)).clamp(min=cfg.min_rest)
+        self.rest = (acc / cnt.clamp(min=1)).clamp(min=self.cfg.min_rest)
+
+    def hinge_material(self):
+        """Per-hinge extra rest curvature and bending-stiffness multiplier."""
+        h = self.topo.hinges
+        a, b = h[:, 0], h[:, 1]
+        P = self.P[self.ind]
+        vc = torch.zeros(self.pos.shape[0], device=self.dev)
+        if (self.P[:, PI["plastic"]] > 0).any():
+            vc = vc + self.vf["pcurl"] * (P[:, PI["plastic"]] > 0)
+        vk = torch.ones_like(vc)
+        hc_aniso = torch.zeros(h.shape[0], device=self.dev)
+        if self.nca is not None:
+            S = self.vf["nca"]
+            vc = vc + P[:, PI["nca_curl"]] * S[:, self.nca.CH_CURL]
+            vk = torch.exp(P[:, PI["nca_stiff"]] * S[:, self.nca.CH_STIFF])
+            if (self.P[:, PI["nca_acurl"]] != 0).any() and hasattr(self, "_axis"):
+                # Curvature κ·(t·p)² across each hinge: rolls the sheet about the axis ⊥ p.
+                e1, e2, nrm = self._face_frame()
+                p3 = self._axis[0][:, None] * e1 + self._axis[1][:, None] * e2
+                E = torch.nn.functional.normalize(self.pos[b] - self.pos[a], dim=1)
+                proj = 0
+                for s in range(2):
+                    f = self.topo.he_face[self.topo.edge_he[self.topo.hinge_edge, s]]
+                    t = torch.nn.functional.normalize(torch.cross(nrm[f], E, dim=1), dim=1)
+                    proj = proj + 0.5 * (t * p3[f]).sum(1) ** 2
+                va = P[:, PI["nca_acurl"]] * S[:, self.nca.CH_ACURL]
+                hc_aniso = 0.5 * (va[a] + va[b]) * proj
+        return 0.5 * (vc[a] + vc[b]) + hc_aniso, 0.5 * (vk[a] + vk[b])
 
     # ── physics ──
     def physics(self, n):
@@ -611,15 +805,13 @@ class Sim:
         max_r = float(self.P[:, PI["repel_r"]].max())
         grid = wp.HashGrid(128, 128, 128, device=self.wdev)
         need_normals = bool((self.P[:, PI["pressure"]] != 0).any())
-        vcurl_t = torch.zeros(self.pos.shape[0], device=self.dev)
-        if self.nca is not None:
-            vcurl_t = self.P[self.ind, PI["nca_curl"]] * self.vf["nca"][:, self.nca.CH_CURL]
-        vcurl = _wp(vcurl_t, float)
+        hc_t, hk_t = self.hinge_material()
+        hcurl, hk = _wp(hc_t, float), _wp(hk_t, float)
         N = self.pos.shape[0]
         for _ in range(n):
             wp.launch(k_springs, dim=edges.shape[0], inputs=[x, edges, rest, ind, P, PI["k_stretch"], f], device=self.wdev)
             if hinges.shape[0]:
-                wp.launch(k_bending, dim=hinges.shape[0], inputs=[x, hinges, ind, P, PI["k_bend"], PI["curl"], vcurl, f], device=self.wdev)
+                wp.launch(k_bending, dim=hinges.shape[0], inputs=[x, hinges, ind, P, PI["k_bend"], PI["curl"], hcurl, hk, f], device=self.wdev)
             grid.build(x, max_r)
             wp.launch(k_repel, dim=N, inputs=[grid.id, x, ind, P, PI["k_repel"], PI["repel_r"], adj, adj_off, max_r, f], device=self.wdev)
             if need_normals:
@@ -631,18 +823,23 @@ class Sim:
                 PI["pressure"], PI["ground"], cfg.dt, cfg.max_step], device=self.wdev)
 
     def step(self, dt_g):
-        """One growth tick: grow rest lengths, relax, remesh."""
+        """One growth tick: grow rest lengths, accrete, relax, remesh."""
         cfg = self.cfg
         if cfg.morph_steps:
             self.morphogens(cfg.morph_steps)
         if self.nca is not None:
             self.nca.step(self, cfg.nca_steps)
         self.grow(dt_g)
+        if (self.P[:, PI["accrete"]] > 0).any():
+            self.accrete(dt_g)
+        if (self.P[:, PI["plastic"]] > 0).any():
+            k = (dt_g * self.P[self.ind, PI["plastic"]] * self.active[self.ind]).clamp(max=1)
+            self.vf["pcurl"] = self.vf["pcurl"] + k * (PCURL * self.mean_curvature() - self.vf["pcurl"])
         self.physics(cfg.substeps)
         self.vf["age"] += dt_g
         self.t += dt_g
         self._quarantine()
-        self.ticks = getattr(self, "ticks", 0) + 1
+        self.ticks += 1
         if self.ticks % cfg.remesh_every:
             return 0, 0
         return self.remesh()

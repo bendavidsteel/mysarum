@@ -10,9 +10,14 @@ its individual's MLP pulls the state toward a new value:
 
 Channels 0–2 drive the sheet (growth rate, anisotropy along ∇distance,
 spontaneous curvature), 3–5 are surface RGB, 6 steers growth toward the light
-(phototropism), the rest are hidden. Hidden channels diffuse at a range
-of fixed rates so the CA has short- and long-range signals to pattern with.
-New vertices from edge splits inherit the endpoint mean like any vertex field.
+(phototropism). 7 is a polarity field: its intrinsic gradient is a growth axis,
+with signed strength from 8 (auxin-like; a growth zone elongates along its own
+axis). 9 sets local bending stiffness (ribs, veins), 10 spontaneous curvature
+across the polarity axis (tubes, funnels, scrolls), 11 modulates accretion.
+The rest are hidden; they diffuse at a range of fixed rates so the CA has
+short- and long-range signals to pattern with. Cues also include ambient
+(hemisphere) exposure. New vertices from edge splits inherit the endpoint
+mean like any vertex field.
 
 Genome = physics genes in [0,1] followed by raw MLP weights (unbounded).
 """
@@ -25,19 +30,23 @@ import torch
 from . import genome as PG
 from .sim import Params
 
-C = 12
+C = 16
 HID = 24
-N_CUE = 7
+N_CUE = 8
 P_IN = 2 * C + N_CUE
 CH_GROW, CH_ANISO, CH_CURL, CH_TROPIC = 0, 1, 2, 6
+CH_POL, CH_PSTR, CH_STIFF, CH_ACURL, CH_ACC = 7, 8, 9, 10, 11
+N_OUT = 12  # channels with a fixed meaning; the rest are hidden
 CH_RGB = slice(3, 6)
-DIFF = [0.05] * 7 + list(np.linspace(0.0, 0.5, C - 7))
+# The polarity channel diffuses faster so its gradient is smooth enough to steer by.
+DIFF = [0.05] * 7 + [0.2] + [0.05] * 4 + list(np.linspace(0.0, 0.5, C - N_OUT))
 SHAPES = [("W1", (P_IN, HID)), ("b1", (HID,)), ("W2", (HID, C)), ("b2", (C,))]
 N_W = sum(math.prod(s) for _, s in SHAPES)
 
 
 class NCA:
     CH_GROW, CH_ANISO, CH_CURL, CH_TROPIC = CH_GROW, CH_ANISO, CH_CURL, CH_TROPIC
+    CH_POL, CH_PSTR, CH_STIFF, CH_ACURL, CH_ACC = CH_POL, CH_PSTR, CH_STIFF, CH_ACURL, CH_ACC
 
     def __init__(self, weights, dt, gain, device="cuda"):
         """weights (B, N_W) raw genome values; dt, gain (B,) per individual."""
@@ -60,7 +69,7 @@ class NCA:
 
     def init_state(self, sim):
         s = 0.1 * torch.randn(sim.pos.shape[0], C, device=sim.dev, generator=sim.gen)
-        s[:, :7] = 0.0
+        s[:, :N_OUT] = 0.0
         return s
 
     def cues(self, sim):
@@ -75,6 +84,7 @@ class NCA:
             sim.topo.boundary.float(),
             sim.vf["noise"],
             sim.light(),
+            sim.ambient(),
         ], 1)
 
     def _mlp(self, x, ind):
@@ -117,6 +127,9 @@ GENES = [
     "seed", "k_bend", "curl", "g_base", "g_nca", "aniso", "nca_aniso", "nca_curl",
     "foundation", "pressure", "gravity", "k_stretch", "rate", "nca_dt", "gain",
     "nca_tropic", "g_light",
+    "nca_polar", "nca_stiff", "nca_acurl", "g_smooth", "plastic",
+    "accrete", "acc_thresh", "acc_curv", "nca_acc", "g_ambient",
+    "acc_gauss", "acc_bias", "acc_smooth", "acc_light", "acc_tension",
 ]
 D_PHYS = len(GENES)
 D = D_PHYS + N_W
@@ -147,6 +160,21 @@ def decode(g):
         nca_tropic=_gate(x["nca_tropic"], 0.3, lambda u: _lin(u, 0.2, 0.8)),
         g_light=rate * _gate(x["g_light"], 0.4, lambda u: _lin(u, 0.05, 0.4)),
         ground=1.0 if seed in ("hemisphere", "stalk") else 0.0,
+        nca_polar=_gate(x["nca_polar"], 0.3, lambda u: _lin(u, 0.2, 0.9)),
+        nca_stiff=_gate(x["nca_stiff"], 0.3, lambda u: _lin(u, 0.3, 2.3)),
+        nca_acurl=_gate(x["nca_acurl"], 0.3, lambda u: _lin(u, 0.03, 0.3)),
+        g_smooth=_lin(x["g_smooth"], 0.0, 10.0),
+        plastic=_gate(x["plastic"], 0.5, lambda u: _log(u, 1.0, 20.0)),
+        accrete=_gate(x["accrete"], 0.5, lambda u: _log(u, 2.0, 25.0)),
+        acc_thresh=_lin(x["acc_thresh"], 0.0, 0.6),
+        acc_curv=_lin(x["acc_curv"], -2.0, 6.0),
+        acc_gauss=_lin(x["acc_gauss"], 0.0, 20.0),
+        acc_bias=_lin(x["acc_bias"], -1.5, 1.0),
+        acc_smooth=_log(x["acc_smooth"], 2.0, 80.0),
+        acc_light=_lin(x["acc_light"], 0.0, 1.0),
+        acc_tension=_log(x["acc_tension"], 0.02, 0.2),
+        nca_acc=_lin(x["nca_acc"], 0.0, 1.5),
+        g_ambient=rate * _gate(x["g_ambient"], 0.4, lambda u: _lin(u, 0.05, 0.4)),
     )
     ctrl = dict(weights=g[D_PHYS:], dt=_log(x["nca_dt"], 0.05, 0.5), gain=_lin(x["gain"], 0.8, 2.5))
     return seed, p, ctrl

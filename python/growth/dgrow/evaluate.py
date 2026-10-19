@@ -3,11 +3,44 @@
 import time
 
 import numpy as np
+import scipy.sparse as sp
 import torch
+from scipy.sparse.csgraph import connected_components
 
 from . import genome as G, nca as NC, presets, render, sim as S
 
 GENOMES = {"param": G, "nca": NC}
+
+
+def structure(pos, faces, levels=(0.35, 0.5, 0.65, 0.8, 0.9), min_faces=6):
+    """Structural descriptors: branch count (most separate curves cut by a
+    horizontal slice) and log height/width aspect."""
+    pos, faces = np.asarray(pos, np.float32), np.asarray(faces, np.int64)
+    z = pos[:, 2]
+    lo, hi = z.min(), z.max()
+    ext = pos.max(0) - pos.min(0)
+    aspect = float(np.log((hi - lo + 1e-3) / np.sqrt(ext[0] * ext[1] + 1e-3)))
+    fz = z[faces]
+    best = 1
+    for f in levels:
+        h = lo + f * (hi - lo)
+        cut = np.nonzero((fz.min(1) < h) & (fz.max(1) >= h))[0]
+        if len(cut) < min_faces:
+            continue
+        # Faces in one slice curve share the edges the plane crosses.
+        fc = faces[cut]
+        e = np.concatenate([fc[:, [0, 1]], fc[:, [1, 2]], fc[:, [2, 0]]])
+        fi = np.tile(np.arange(len(cut)), 3)
+        ze = z[e]
+        cross = (ze.min(1) < h) & (ze.max(1) >= h)
+        e, fi = np.sort(e[cross], 1), fi[cross]
+        _, eid = np.unique(e[:, 0] * len(pos) + e[:, 1], return_inverse=True)
+        n = len(cut) + eid.max() + 1
+        A = sp.coo_matrix((np.ones(len(fi)), (fi, len(cut) + eid)), shape=(n, n))
+        _, lab = connected_components(A, directed=False)
+        sizes = np.bincount(lab[:len(cut)])
+        best = max(best, int((sizes >= min_faces).sum()))
+    return dict(branches=best, aspect=aspect)
 
 
 def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
@@ -53,6 +86,7 @@ def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
         if not dead[i] and torch.isfinite(pos).all():
             ext = (pos.max(0).values - pos.min(0).values).cpu().numpy()
             res["extent"] = ext.tolist()
+            res.update(structure(pos.cpu().numpy(), faces.cpu().numpy()))
             col = ex.get("color")
             res["iso"] = render.render(pos, faces, W=size, H=size, azim=35, elev=30, spp=8, ao_n=3, color=col)
             res["top"] = render.render(pos, faces, W=size, H=size, azim=0, elev=89, spp=8, ao_n=3, color=col)

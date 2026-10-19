@@ -54,6 +54,10 @@ PRESETS = {
     # Apical growth + curvature feedback on a pinned dome -> branching coral.
     "coral": ("hemisphere", 8, dict(g_base=0.02, g_curv=0.5, g_height=0.3, k_bend=2.0,
                                     gravity=0.0, ground=1.0), 900, 0.01),
+    # Accretion ∝ ambient exposure on a pinned dome (Kaandorp): exposed tips
+    # outgrow the shaded flanks and split; plasticity keeps the deposit's shape.
+    "staghorn": ("hemisphere", 6, dict(accrete=6.0, acc_thresh=0.4, plastic=10.0, k_bend=2.0,
+                                       ground=1.0), 900, 0.01),
 }
 
 

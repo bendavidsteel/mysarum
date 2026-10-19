@@ -7,7 +7,9 @@ reps: 2
 gpus: [0, 1]
 judge_gpu: 0
 n_cells: 400
-dims: 6
+dims: 5
+struct_dims: 2   # branch count, aspect (qd.py STRUCT)
+struct_w: 1.0
 refit_every: 1024
 sigma: 0.08
 p_cross: 0.5

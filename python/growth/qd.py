@@ -1,7 +1,10 @@
 """CVT-MAP-Elites over growth genomes, with image-embedding descriptors.
 
 Descriptor = PCA of DINOv2 embeddings of the iso + top renders (refit on the
-whole history every `refit_every` evaluations, then the archive is rebuilt).
+whole history every `refit_every` evaluations, then the archive is rebuilt),
+plus `struct_dims` structural descriptors (log branch count, log aspect;
+evaluate.structure) z-scored over the history and scaled by `struct_w`, so
+branching forms keep cells of their own before CLIP rewards them.
 Fitness = how specifically CLIP thinks the render is a real organism, averaged
 over `reps` growths of the genome (different random draws); the replicate
 nearest that mean stands for the genome in the archive.
@@ -44,26 +47,37 @@ def worker(gpu, cfg, inq, outq):
         outq.put((bid, ids, genomes, res))
 
 
+STRUCT = ["branches", "aspect"]
+
+
+def struct_vec(r):
+    return np.array([np.log(r.get("branches", 1)), r.get("aspect", 0.0)])
+
+
 class Archive:
-    def __init__(self, n_cells, dims, seed=0):
+    def __init__(self, n_cells, dims, struct_dims=0, struct_w=1.0, seed=0):
         self.n_cells, self.dims, self.seed = n_cells, dims, seed
+        self.sd, self.sw = struct_dims, struct_w
         rng = np.random.default_rng(seed)
-        z = rng.normal(size=(40 * n_cells, dims))
+        z = rng.normal(size=(40 * n_cells, dims + struct_dims))
         z = z[np.abs(z).max(1) < 2.5]
         self.centroids = KMeans(n_cells, n_init=1, random_state=seed).fit(z).cluster_centers_
         self.pca = None
 
-    def fit(self, emb):
+    def fit(self, emb, st):
         self.pca = PCA(self.dims, whiten=True, random_state=self.seed).fit(emb)
+        self.s_mu, self.s_sd = st.mean(0), st.std(0) + 1e-6
 
-    def cells(self, emb):
+    def cells(self, emb, st):
         z = self.pca.transform(emb)
+        if self.sd:
+            z = np.concatenate([z, self.sw * (st[:, :self.sd] - self.s_mu[:self.sd]) / self.s_sd[:self.sd]], 1)
         d = ((z[:, None, :] - self.centroids[None]) ** 2).sum(-1)
         return d.argmin(1), z
 
-    def build(self, ids, emb, fit):
+    def build(self, ids, emb, st, fit):
         """cell -> (id, fitness) keeping the fittest per cell."""
-        cells, z = self.cells(emb)
+        cells, z = self.cells(emb, st)
         elite = {}
         for i, c, f in zip(ids, cells, fit):
             if c not in elite or f > elite[c][1]:
@@ -130,7 +144,7 @@ def main(cfg: DictConfig):
     judge = Judge(device="cuda")
 
     rows, embs = [], {}
-    archive = Archive(cfg.n_cells, cfg.dims, cfg.seed)
+    archive = Archive(cfg.n_cells, cfg.dims, cfg.struct_dims, cfg.struct_w, cfg.seed)
     elite, next_id, next_bid, in_flight = {}, 0, 0, 0
     last_refit = 0
     t0 = time.time()
@@ -157,8 +171,9 @@ def main(cfg: DictConfig):
         ok = [r for r in rows if not r["dead"]]
         ids = [r["id"] for r in ok]
         E = np.stack([embs[i] for i in ids])
-        archive.fit(E)
-        el, cell_of, z = archive.build(ids, E, [r["fitness"] for r in ok])
+        St = np.stack([struct_vec(r) for r in ok])
+        archive.fit(E, St)
+        el, cell_of, z = archive.build(ids, E, St, [r["fitness"] for r in ok])
         for r, zz in zip(ok, z):
             r["cell"], r["z"] = cell_of[r["id"]], zz.tolist()
         return el
@@ -192,7 +207,8 @@ def main(cfg: DictConfig):
             row = dict(id=i, batch=bid, genome=[float(x) for x in g], seed=r.get("seed", "?"),
                        dead=bool(r["dead"]), n_verts=r["n_verts"], stop_tick=r.get("stop_tick", -1),
                        organic=r.get("organic", 0.0), label=r.get("label", ""),
-                       label_p=r.get("label_p", 0.0), error=r.get("error", ""))
+                       label_p=r.get("label_p", 0.0), error=r.get("error", ""),
+                       branches=r.get("branches", 1), aspect=r.get("aspect", 0.0))
             row["fitness"], row["fitness_reps"] = fit, fits
             if not r["dead"]:
                 embs[i] = r["dino"]
@@ -208,7 +224,8 @@ def main(cfg: DictConfig):
         elif archive.pca is not None:
             new = [r for r in rows[-len(ids):] if not r["dead"]]
             if new:
-                cells, z = archive.cells(np.stack([embs[r["id"]] for r in new]))
+                cells, z = archive.cells(np.stack([embs[r["id"]] for r in new]),
+                                         np.stack([struct_vec(r) for r in new]))
                 for r, c, zz in zip(new, cells, z):
                     r["cell"], r["z"] = int(c), zz.tolist()
                     if int(c) not in elite or r["fitness"] > elite[int(c)][1]:

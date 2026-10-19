@@ -64,6 +64,8 @@ def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
     for it in range(max_ticks):
         sim.step(dt)
         if it % 10 == 0:
+            # Growing meshes fragment torch's cache until Warp can't allocate; hand it back.
+            torch.cuda.empty_cache()
             full = torch.tensor(sim.counts(), device=sim.dev) >= int(0.97 * max_verts)
             stopped = full | sim.dead
             newly = stopped.cpu().numpy() & (stop_tick == max_ticks)

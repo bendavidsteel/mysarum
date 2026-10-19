@@ -182,6 +182,8 @@ def main(cfg: DictConfig):
         df = pl.DataFrame([{k: v for k, v in r.items() if k != "z"} for r in rows])
         df.write_parquet(f"{run}/evals.parquet", compression="zstd")
         ids = sorted(embs)
+        if not ids:
+            return
         np.savez_compressed(f"{run}/embeddings.npz", ids=np.array(ids), dino=np.stack([embs[i] for i in ids]))
         with open(f"{run}/archive.json", "w") as fh:
             json.dump({str(c): v for c, v in elite.items()}, fh)

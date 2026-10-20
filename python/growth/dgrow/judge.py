@@ -12,6 +12,9 @@ ORGANISMS = [
     "a seaweed", "a sea urchin", "a morel mushroom", "a cabbage", "a gourd",
     "a staghorn coral", "a lettuce coral", "a chanterelle mushroom", "a bracket fungus",
     "a coral fungus", "a fern",
+    # branching plants (tip splitting)
+    "a romanesco broccoli", "a broccoli", "a reindeer lichen", "a liverwort", "a fiddlehead fern",
+    "a cholla cactus", "a crested coral cactus", "a club moss", "a bonsai tree", "a kelp seaweed",
 ]
 NEGATIVES = [
     "crumpled paper", "a pile of trash", "a smooth blob", "a rock", "a plastic bag",

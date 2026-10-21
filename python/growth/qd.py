@@ -2,7 +2,7 @@
 
 Descriptor = PCA of DINOv2 embeddings of the iso + top renders (refit on the
 whole history every `refit_every` evaluations, then the archive is rebuilt),
-plus `struct_dims` structural descriptors (log branch count, log aspect;
+plus `struct_dims` structural descriptors (log finger count, log aspect;
 evaluate.structure) z-scored over the history and scaled by `struct_w`, so
 branching forms keep cells of their own before CLIP rewards them.
 Fitness = how specifically CLIP thinks the render is a real organism, averaged
@@ -47,11 +47,11 @@ def worker(gpu, cfg, inq, outq):
         outq.put((bid, ids, genomes, res))
 
 
-STRUCT = ["branches", "aspect"]
+STRUCT = ["fingers", "aspect"]
 
 
 def struct_vec(r):
-    return np.array([np.log(r.get("branches", 1)), r.get("aspect", 0.0)])
+    return np.array([np.log(r.get("fingers", 1)), r.get("aspect", 0.0)])
 
 
 class Archive:
@@ -210,7 +210,8 @@ def main(cfg: DictConfig):
                        dead=bool(r["dead"]), n_verts=r["n_verts"], stop_tick=r.get("stop_tick", -1),
                        organic=r.get("organic", 0.0), label=r.get("label", ""),
                        label_p=r.get("label_p", 0.0), error=r.get("error", ""),
-                       branches=r.get("branches", 1), aspect=r.get("aspect", 0.0))
+                       branches=r.get("branches", 1), fingers=r.get("fingers", 1),
+                       aspect=r.get("aspect", 0.0))
             row["fitness"], row["fitness_reps"] = fit, fits
             if not r["dead"]:
                 embs[i] = r["dino"]

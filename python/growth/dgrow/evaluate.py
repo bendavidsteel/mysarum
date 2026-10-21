@@ -5,42 +5,81 @@ import time
 import numpy as np
 import scipy.sparse as sp
 import torch
-from scipy.sparse.csgraph import connected_components
+from scipy.sparse.csgraph import connected_components, dijkstra
 
 from . import genome as G, nca as NC, presets, render, sim as S
 
 GENOMES = {"param": G, "nca": NC}
 
 
+def slice_count(f, faces, h, min_faces=6):
+    """Separate curves cut from the mesh by the level set f = h."""
+    ff = f[faces]
+    cut = np.nonzero((ff.min(1) < h) & (ff.max(1) >= h))[0]
+    if len(cut) < min_faces:
+        return 0
+    # Faces in one curve share the edges the level set crosses.
+    fc = faces[cut]
+    e = np.concatenate([fc[:, [0, 1]], fc[:, [1, 2]], fc[:, [2, 0]]])
+    fi = np.tile(np.arange(len(cut)), 3)
+    fe = f[e]
+    cross = (fe.min(1) < h) & (fe.max(1) >= h)
+    e, fi = np.sort(e[cross], 1), fi[cross]
+    _, eid = np.unique(e[:, 0] * len(f) + e[:, 1], return_inverse=True)
+    n = len(cut) + eid.max() + 1
+    A = sp.coo_matrix((np.ones(len(fi)), (fi, len(cut) + eid)), shape=(n, n))
+    _, lab = connected_components(A, directed=False)
+    return int((np.bincount(lab[:len(cut)]) >= min_faces).sum())
+
+
+def base_distance(pos, faces):
+    """Geodesic (edge-path) distance from the lowest vertices, and the edge graph."""
+    e = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+    w = np.linalg.norm(pos[e[:, 0]] - pos[e[:, 1]], axis=1) + 1e-6
+    A = sp.csr_matrix((w, (e[:, 0], e[:, 1])), shape=(len(pos),) * 2)
+    A = A.maximum(A.T).tocsr()
+    base = np.nonzero(pos[:, 2] < pos[:, 2].min() + 0.5)[0]
+    d = dijkstra(A, indices=base, min_only=True)
+    return np.where(np.isfinite(d), d, 0.0), A
+
+
+def fingers(pos, faces, n_levels=16, min_len=3.0):
+    """Most protrusions cut off by one geodesic level set: components of
+    {d > h} that reach `min_len` past h and are longer than they are wide
+    (cap length > boundary length / pi). Fold crests also make caps, but they
+    are long thin loops, so they fail the width test."""
+    d, A = base_distance(pos, faces)
+    el = A.data.mean()
+    N = (A > 0).astype(np.float32)
+    U = sp.triu(A).tocoo()
+    best = 1
+    for h in np.linspace(0.15, 0.9, n_levels) * d.max():
+        up = d > h
+        keep = up[U.row] & up[U.col]
+        S = sp.coo_matrix((np.ones(keep.sum()), (U.row[keep], U.col[keep])), shape=A.shape)
+        _, lab = connected_components(S, directed=False)
+        lab = np.where(up, lab, -1)
+        # Boundary of a cap: its vertices with a neighbour at or below h.
+        rim = up & (N @ (~up).astype(np.float32) > 0)
+        k = lab.max() + 1
+        cap = np.zeros(k)
+        np.maximum.at(cap, lab[up], d[up] - h)
+        perim = np.bincount(lab[rim], minlength=k) * el
+        best = max(best, int(((cap > min_len) & (cap > perim / np.pi)).sum()))
+    return best
+
+
 def structure(pos, faces, levels=(0.35, 0.5, 0.65, 0.8, 0.9), min_faces=6):
-    """Structural descriptors: branch count (most separate curves cut by a
-    horizontal slice) and log height/width aspect."""
+    """Structural descriptors: `branches`, the most separate curves cut by a
+    horizontal slice; `fingers`, protrusions off geodesic level sets (see
+    `fingers`), which ignores folds; log height/width `aspect`."""
     pos, faces = np.asarray(pos, np.float32), np.asarray(faces, np.int64)
     z = pos[:, 2]
     lo, hi = z.min(), z.max()
     ext = pos.max(0) - pos.min(0)
     aspect = float(np.log((hi - lo + 1e-3) / np.sqrt(ext[0] * ext[1] + 1e-3)))
-    fz = z[faces]
-    best = 1
-    for f in levels:
-        h = lo + f * (hi - lo)
-        cut = np.nonzero((fz.min(1) < h) & (fz.max(1) >= h))[0]
-        if len(cut) < min_faces:
-            continue
-        # Faces in one slice curve share the edges the plane crosses.
-        fc = faces[cut]
-        e = np.concatenate([fc[:, [0, 1]], fc[:, [1, 2]], fc[:, [2, 0]]])
-        fi = np.tile(np.arange(len(cut)), 3)
-        ze = z[e]
-        cross = (ze.min(1) < h) & (ze.max(1) >= h)
-        e, fi = np.sort(e[cross], 1), fi[cross]
-        _, eid = np.unique(e[:, 0] * len(pos) + e[:, 1], return_inverse=True)
-        n = len(cut) + eid.max() + 1
-        A = sp.coo_matrix((np.ones(len(fi)), (fi, len(cut) + eid)), shape=(n, n))
-        _, lab = connected_components(A, directed=False)
-        sizes = np.bincount(lab[:len(cut)])
-        best = max(best, int((sizes >= min_faces).sum()))
-    return dict(branches=best, aspect=aspect)
+    branches = max([1] + [slice_count(z, faces, lo + f * (hi - lo), min_faces) for f in levels])
+    return dict(branches=branches, aspect=aspect, fingers=fingers(pos, faces))
 
 
 def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,

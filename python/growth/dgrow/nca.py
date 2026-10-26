@@ -129,7 +129,7 @@ GENES = [
     "nca_tropic", "g_light",
     "nca_polar", "nca_stiff", "nca_acurl", "g_smooth", "plastic",
     "accrete", "acc_thresh", "acc_curv", "nca_acc", "g_ambient",
-    "acc_gauss", "acc_bias", "acc_smooth", "acc_light", "acc_tension",
+    "acc_gauss", "acc_bias", "acc_smooth", "acc_light", "acc_tension", "g_curv",
 ]
 D_PHYS = len(GENES)
 D = D_PHYS + N_W
@@ -170,11 +170,13 @@ def decode(g):
         acc_curv=_lin(x["acc_curv"], -2.0, 6.0),
         acc_gauss=_lin(x["acc_gauss"], 0.0, 20.0),
         acc_bias=_lin(x["acc_bias"], -1.5, 1.0),
-        acc_smooth=_log(x["acc_smooth"], 2.0, 80.0),
+        acc_smooth=_log(x["acc_smooth"], 2.0, 20.0),
         acc_light=_lin(x["acc_light"], 0.0, 1.0),
         acc_tension=_log(x["acc_tension"], 0.02, 0.2),
         nca_acc=_lin(x["nca_acc"], 0.0, 1.5),
         g_ambient=rate * _gate(x["g_ambient"], 0.4, lambda u: _lin(u, 0.05, 0.4)),
+        # Area growth at convex tips widens them until they split.
+        g_curv=rate * _gate(x["g_curv"], 0.4, lambda u: _lin(u, 0.02, 0.2)),
     )
     ctrl = dict(weights=g[D_PHYS:], dt=_log(x["nca_dt"], 0.05, 0.5), gain=_lin(x["gain"], 0.8, 2.5))
     return seed, p, ctrl

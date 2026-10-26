@@ -58,6 +58,14 @@ PRESETS = {
     # outgrow the shaded flanks and split; plasticity keeps the deposit's shape.
     "staghorn": ("hemisphere", 6, dict(accrete=6.0, acc_thresh=0.4, plastic=10.0, k_bend=2.0,
                                        ground=1.0), 900, 0.01),
+    # Trunk that forks and forks again under a broccoli crown: little flux smoothing.
+    "broccoli_tree": ("hemisphere", 6, dict(accrete=12.0, acc_thresh=0.4, acc_light=0.7, acc_gauss=16.0,
+                                            acc_bias=-1.0, acc_smooth=4.0, plastic=10.0, k_bend=2.0,
+                                            ground=1.0), 1500, 0.01),
+    # Slender forking fingers (Clavaria): curvature-thresholded accretion, tips widened by g_curv.
+    "clavaria": ("hemisphere", 6, dict(accrete=8.0, acc_thresh=0.4, acc_light=0.7, acc_curv=2.0,
+                                       acc_bias=-0.3, acc_smooth=4.0, acc_tension=0.05, g_curv=0.1,
+                                       plastic=10.0, k_bend=2.0, ground=1.0), 3000, 0.01),
 }
 
 

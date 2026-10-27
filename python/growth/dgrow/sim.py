@@ -70,6 +70,8 @@ class Params:
     acc_smooth: float = 2.0      # diffusion passes on the flux: sets the branch width
     acc_gauss: float = 0.0       # γ in the flux, on sign(K)√|K|: tips grow, cylinder flanks and saddles don't
     acc_tension: float = 0.1     # surface tension on the accreting front (keeps it well-posed)
+    acc_solid: float = 0.0       # 0: tension everywhere (old shafts thin away), 1: only where depositing
+    acc_thicken: float = 0.0     # uniform deposit everywhere (cambium): older parts end up thicker
     plastic: float = 0.0         # rate the rest curvature relaxes toward the current one
     g_smooth: float = 4.0        # diffusion passes on the growth field
     # NCA-controlled material: polarity axis, bending stiffness, anisotropic curl, accretion
@@ -674,13 +676,19 @@ class Sim:
         near_pin = (pin + self._graph_lap(pin)) > 0
         on = self.active[self.ind] * ~near_pin * (P[:, PI["accrete"]] > 0)
         r = r * on
+        # Curvature flow shrinks every tube it acts on, and the rest lengths lock
+        # that in, so on solid tissue it only acts on the depositing front.
+        front = (r / P[:, PI["accrete"]].clamp(min=1e-6)).clamp(max=1.0)
+        solid = P[:, PI["acc_solid"]]
+        tension = P[:, PI["acc_tension"]] * on * (1 - solid + solid * front)
+        r = r + P[:, PI["acc_thicken"]] * on
         n = torch.nn.functional.normalize(self.vertex_normals(), dim=1)
         # Umbrella Laplacian = curvature flow along n plus tangential relaxation.
         lap = self._graph_lap(self.pos)
         lap[self.topo.boundary] = 0.0
         # At most a tenth of an edge per tick, so the springs keep up.
         new = self.pos + (dt_g * r).clamp(max=0.1)[:, None] * n \
-            + (P[:, PI["acc_tension"]] * on).clamp(max=0.5)[:, None] * lap
+            + tension.clamp(max=0.5)[:, None] * lap
         e = self.topo.edges
         l0 = (self.pos[e[:, 1]] - self.pos[e[:, 0]]).norm(dim=1)
         l1 = (new[e[:, 1]] - new[e[:, 0]]).norm(dim=1)

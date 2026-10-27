@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import warp as wp
 
-from . import mesh as M
+from . import field as FD, mesh as M
 from .render import _hemi
 
 wp.config.quiet = True
@@ -67,6 +67,8 @@ class Params:
     acc_curv: float = 0.0        # tip enhancement: deposit ∝ (acc_bias + acc_curv·H)₊ (diffusion-limited flux)
     acc_bias: float = 1.0        # < 0: only tips sharper than -bias/curv deposit
     acc_light: float = 0.0       # resource mix: 0 = ambient (nutrient), 1 = overhead light
+    acc_field: float = 0.0       # then mix toward diffusion-limited flux (dgrow.field): tips screen gaps
+    acc_up: float = 0.0          # field supply: 0 = from all sides, 1 = from above only (side walls no-flux)
     acc_smooth: float = 2.0      # diffusion passes on the flux: sets the branch width
     acc_gauss: float = 0.0       # γ in the flux, on sign(K)√|K|: tips grow, cylinder flanks and saddles don't
     acc_tension: float = 0.1     # surface tension on the accreting front (keeps it well-posed)
@@ -360,6 +362,8 @@ class SimConfig:
     light_every: int = 4          # growth ticks between light-exposure ray casts
     amb_rays: int = 16
     amb_dist: float = 12.0        # ambient rays that travel this far count as open
+    field_res: int = 96           # voxels per side of each individual's nutrient-field cube
+    field_pad: float = 10.0       # far boundary distance beyond the bounding box
     remesh_every: int = 3         # growth ticks between split/flip passes
     curv_smooth: int = 8          # diffusion passes on mean curvature
     min_rest: float = 0.4
@@ -607,6 +611,20 @@ class Sim:
         self._cast_tick["ambient"] = self.ticks
         return self.vf["ambient"]
 
+    def nutrient(self):
+        """Per-vertex diffusion-limited flux, scaled to [0,1] per individual."""
+        if self._cached("nutrient"):
+            return self.vf["nutrient"]
+        floor = self.P[:, PI["ground"]] > 0
+        n = torch.nn.functional.normalize(self.vertex_normals(), dim=1)
+        q = FD.surface_flux(self.pos, self.faces, self.ind, self.n_ind, n, floor,
+                            self.P[:, PI["acc_up"]], self.cfg.field_res, self.cfg.field_pad)
+        q = self.smooth(q, 2)
+        top = torch.zeros(self.n_ind, device=self.dev).scatter_reduce(0, self.ind, q, "amax")
+        self.vf["nutrient"] = q / top.clamp(min=1e-9)[self.ind]
+        self._cast_tick["nutrient"] = self.ticks
+        return self.vf["nutrient"]
+
     def growth_rate(self):
         P = self.P[self.ind]
         g = P[:, PI["g_base"]] + P[:, PI["g_edge"]] * torch.exp(-self.dist / P[:, PI["edge_lambda"]].clamp(min=1e-3))
@@ -660,6 +678,9 @@ class Sim:
         if (self.P[:, PI["acc_light"]] != 0).any():
             m = P[:, PI["acc_light"]]
             amb = (1 - m) * amb + m * self.light()
+        if (self.P[:, PI["acc_field"]] != 0).any():
+            m = P[:, PI["acc_field"]]
+            amb = (1 - m) * amb + m * self.nutrient()
         th = P[:, PI["acc_thresh"]]
         r = P[:, PI["accrete"]] * ((amb - th) / (1 - th).clamp(min=1e-3)).clamp(min=0)
         if self.nca is not None and (self.P[:, PI["nca_acc"]] != 0).any():

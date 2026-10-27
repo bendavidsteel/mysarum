@@ -62,6 +62,11 @@ PRESETS = {
     "broccoli_tree": ("hemisphere", 6, dict(accrete=12.0, acc_thresh=0.4, acc_light=0.7, acc_gauss=16.0,
                                             acc_bias=-1.0, acc_smooth=4.0, plastic=10.0, k_bend=2.0,
                                             ground=1.0), 1500, 0.01),
+    # Diffusion-limited accretion fed from above: a trunk that forks into a Y
+    # with side spurs, branches kept apart by screening.
+    "field_tree": ("hemisphere", 6, dict(accrete=16.0, acc_thresh=0.65, acc_field=1.0, acc_up=1.0,
+                                         acc_solid=1.0, acc_smooth=2.0, plastic=10.0, k_bend=2.0,
+                                         ground=1.0), 2000, 0.01),
     # Slender forking fingers (Clavaria): curvature-thresholded accretion, tips widened by g_curv.
     "clavaria": ("hemisphere", 6, dict(accrete=8.0, acc_thresh=0.4, acc_light=0.7, acc_curv=2.0,
                                        acc_bias=-0.3, acc_smooth=4.0, acc_tension=0.05, g_curv=0.1,

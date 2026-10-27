@@ -130,6 +130,7 @@ GENES = [
     "nca_polar", "nca_stiff", "nca_acurl", "g_smooth", "plastic",
     "accrete", "acc_thresh", "acc_curv", "nca_acc", "g_ambient",
     "acc_gauss", "acc_bias", "acc_smooth", "acc_light", "acc_tension", "g_curv",
+    "acc_field", "acc_up", "acc_solid",
 ]
 D_PHYS = len(GENES)
 D = D_PHYS + N_W
@@ -166,7 +167,7 @@ def decode(g):
         g_smooth=_lin(x["g_smooth"], 0.0, 10.0),
         plastic=_gate(x["plastic"], 0.5, lambda u: _log(u, 1.0, 20.0)),
         accrete=_gate(x["accrete"], 0.5, lambda u: _log(u, 2.0, 25.0)),
-        acc_thresh=_lin(x["acc_thresh"], 0.0, 0.6),
+        acc_thresh=_lin(x["acc_thresh"], 0.0, 0.75),
         acc_curv=_lin(x["acc_curv"], -2.0, 6.0),
         acc_gauss=_lin(x["acc_gauss"], 0.0, 20.0),
         acc_bias=_lin(x["acc_bias"], -1.5, 1.0),
@@ -177,6 +178,10 @@ def decode(g):
         g_ambient=rate * _gate(x["g_ambient"], 0.4, lambda u: _lin(u, 0.05, 0.4)),
         # Area growth at convex tips widens them until they split.
         g_curv=rate * _gate(x["g_curv"], 0.4, lambda u: _lin(u, 0.02, 0.2)),
+        # Diffusion-limited supply (dgrow.field): screened gaps let branches diverge.
+        acc_field=_gate(x["acc_field"], 0.3, lambda u: _lin(u, 0.3, 1.0)),
+        acc_up=_lin(x["acc_up"], 0.0, 1.0),
+        acc_solid=_lin(x["acc_solid"], 0.0, 1.0),
     )
     ctrl = dict(weights=g[D_PHYS:], dt=_log(x["nca_dt"], 0.05, 0.5), gain=_lin(x["gain"], 0.8, 2.5))
     return seed, p, ctrl

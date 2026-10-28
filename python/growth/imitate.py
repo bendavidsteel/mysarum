@@ -34,6 +34,8 @@ def main():
     ap.add_argument("--popsize", type=int, default=24)
     ap.add_argument("--sigma", type=float, default=0.12)
     ap.add_argument("--max_verts", type=int, default=40000)
+    ap.add_argument("--max_ticks", type=int, default=1000)
+    ap.add_argument("--x0", help="seed genome instead: .npy, or a result.json from an earlier run")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--genome", default="param", choices=["param", "nca"])
     ap.add_argument("--w_std", type=float, default=0.4, help="nca: weight step relative to sigma")
@@ -51,7 +53,9 @@ def main():
     score = J.target_scorer(a.target, refs)
 
     x0 = np.full(G.D, 0.5)
-    if a.qd:
+    if a.x0:
+        x0 = np.load(a.x0) if a.x0.endswith(".npy") else np.array(json.load(open(a.x0))["genome"])
+    elif a.qd:
         df = pl.read_parquet(f"{a.qd}/evals.parquet").filter(~pl.col("dead"))
         ims = [np.asarray(Image.open(f"{a.qd}/imgs/{i}.jpg")) for i in df["id"]]
         h = ims[0].shape[0]
@@ -76,7 +80,8 @@ def main():
     t0 = time.time()
     for gen in range(a.gens):
         X = np.array(es.ask())
-        res = evaluate.grow_reps(X, a.reps, max_verts=a.max_verts, seed=gen, kind=a.genome)
+        res = evaluate.grow_reps(X, a.reps, max_verts=a.max_verts, max_ticks=a.max_ticks, seed=gen,
+                                 kind=a.genome)
         fr = np.array([[max(score([r["iso"]])[0], score([r["top"]])[0]) if not r["dead"] else 0.0
                         for r in reps] for reps in res])
         f = fr.mean(1)

@@ -82,9 +82,10 @@ def main():
         X = np.array(es.ask())
         res = evaluate.grow_reps(X, a.reps, max_verts=a.max_verts, max_ticks=a.max_ticks, seed=gen,
                                  kind=a.genome)
-        # Mean over an angled and a near-horizontal view: a flat sprawl can pass as a
-        # tree from 30° up, but from the side it is a line on the floor.
-        fr = np.array([[score([r["iso"], r["side"]]).mean() if not r["dead"] else 0.0
+        # Mean over side views along x and y and an angled view (evaluate `views`): a
+        # flat sprawl can pass as a tree from 30° up, but from the side it is a line
+        # on the floor, and a form that works along one axis only loses on the other.
+        fr = np.array([[score(r["views"]).mean() if not r["dead"] else 0.0
                         for r in reps] for reps in res])
         f = fr.mean(1)
         es.tell(list(X), list(-f))
@@ -92,8 +93,8 @@ def main():
         if f[k] > max(best[0], 0.0):
             best = (float(f[k]), X[k].tolist(), fr[k].tolist())
             alive = [r for r in res[k] if not r["dead"]]
-            # One row per replicate: iso | side | top.
-            strip = np.concatenate([np.concatenate([r["iso"], r["side"], r["top"]], 1) for r in alive], 0)
+            # One row per replicate: x | y | angled | top.
+            strip = np.concatenate([np.concatenate(r["views"] + [r["top"]], 1) for r in alive], 0)
             Image.fromarray(strip).save(f"{out}/best.jpg", quality=92)
             Image.fromarray(strip).save(f"{out}/gen{gen:03d}.jpg", quality=85)
             for j, r in enumerate(alive):

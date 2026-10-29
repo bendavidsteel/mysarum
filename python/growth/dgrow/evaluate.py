@@ -131,7 +131,10 @@ def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
             col = ex.get("color")
             res["iso"] = render.render(pos, faces, W=size, H=size, azim=35, elev=30, spp=8, ao_n=3, color=col)
             res["top"] = render.render(pos, faces, W=size, H=size, azim=0, elev=89, spp=8, ao_n=3, color=col)
-            res["side"] = render.render(pos, faces, W=size, H=size, azim=35, elev=5, spp=8, ao_n=3, color=col)
+            # Along x and y near the horizon, plus angled from above; straight down
+            # reads as nothing to CLIP, so the top view is not scored.
+            res["views"] = [render.render(pos, faces, W=size, H=size, azim=a, elev=e, spp=8, ao_n=3, color=col)
+                            for a, e in ((0, 5), (90, 5), (35, 30))]
             if col is not None:
                 res["color"] = (col * 255).byte().cpu().numpy()
             res["pos"] = pos.half().cpu().numpy()

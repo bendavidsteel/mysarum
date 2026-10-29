@@ -35,7 +35,6 @@ def main():
     ap.add_argument("--sigma", type=float, default=0.12)
     ap.add_argument("--max_verts", type=int, default=40000)
     ap.add_argument("--max_ticks", type=int, default=1000)
-    ap.add_argument("--fix", default="", help="pin raw genes, e.g. acc_up=1,acc_field=1")
     ap.add_argument("--x0", help="seed genome instead: .npy, or a result.json from an earlier run")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--genome", default="param", choices=["param", "nca"])
@@ -67,15 +66,6 @@ def main():
         x0 = np.array(df["genome"][best])
         print(f"seed from QD #{df['id'][best]} score {s[best]:.3f}", flush=True)
 
-    fix = [(G.GENES.index(k), float(v)) for k, v in (kv.split("=") for kv in a.fix.split(",") if kv)]
-
-    def pin(X):
-        X = np.array(X, dtype=float)
-        for i, v in fix:
-            X[..., i] = v
-        return X
-
-    x0 = pin(x0)
     opts = {"popsize": a.popsize, "seed": 1}
     if a.genome == "param":
         opts["bounds"] = [0, 1]
@@ -89,10 +79,12 @@ def main():
     hist, best = [], (-1.0, None, None)
     t0 = time.time()
     for gen in range(a.gens):
-        X = pin(es.ask())
+        X = np.array(es.ask())
         res = evaluate.grow_reps(X, a.reps, max_verts=a.max_verts, max_ticks=a.max_ticks, seed=gen,
                                  kind=a.genome)
-        fr = np.array([[max(score([r["iso"]])[0], score([r["top"]])[0]) if not r["dead"] else 0.0
+        # Mean over an angled and a near-horizontal view: a flat sprawl can pass as a
+        # tree from 30° up, but from the side it is a line on the floor.
+        fr = np.array([[score([r["iso"], r["side"]]).mean() if not r["dead"] else 0.0
                         for r in reps] for reps in res])
         f = fr.mean(1)
         es.tell(list(X), list(-f))
@@ -100,8 +92,8 @@ def main():
         if f[k] > max(best[0], 0.0):
             best = (float(f[k]), X[k].tolist(), fr[k].tolist())
             alive = [r for r in res[k] if not r["dead"]]
-            # One row per replicate: iso | top.
-            strip = np.concatenate([np.concatenate([r["iso"], r["top"]], 1) for r in alive], 0)
+            # One row per replicate: iso | side | top.
+            strip = np.concatenate([np.concatenate([r["iso"], r["side"], r["top"]], 1) for r in alive], 0)
             Image.fromarray(strip).save(f"{out}/best.jpg", quality=92)
             Image.fromarray(strip).save(f"{out}/gen{gen:03d}.jpg", quality=85)
             for j, r in enumerate(alive):

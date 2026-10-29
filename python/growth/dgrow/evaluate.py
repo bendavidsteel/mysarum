@@ -131,6 +131,7 @@ def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
             col = ex.get("color")
             res["iso"] = render.render(pos, faces, W=size, H=size, azim=35, elev=30, spp=8, ao_n=3, color=col)
             res["top"] = render.render(pos, faces, W=size, H=size, azim=0, elev=89, spp=8, ao_n=3, color=col)
+            res["side"] = render.render(pos, faces, W=size, H=size, azim=35, elev=5, spp=8, ao_n=3, color=col)
             if col is not None:
                 res["color"] = (col * 255).byte().cpu().numpy()
             res["pos"] = pos.half().cpu().numpy()

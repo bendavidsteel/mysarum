@@ -36,6 +36,7 @@ def k_render(mesh: wp.uint64, vn: wp.array(dtype=wp.vec3), vcol: wp.array(dtype=
              use_vcol: int, eye: wp.vec3, fwd: wp.vec3, right: wp.vec3, up: wp.vec3,
              half_w: float, ortho: int, W: int, H: int, spp: int, ao_n: int, ao_dist: float,
              light: wp.vec3, front: wp.vec3, back: wp.vec3, bg0: wp.vec3, bg1: wp.vec3,
+             use_floor: int, floor_z: float, floor_o: wp.vec3, floor_r: float, floor_c: wp.vec3,
              seed: int, img: wp.array(dtype=wp.vec3)):
     tid = wp.tid()
     px = tid % W
@@ -54,26 +55,40 @@ def k_render(mesh: wp.uint64, vn: wp.array(dtype=wp.vec3), vcol: wp.array(dtype=
         else:
             d = wp.normalize(fwd + right * sx + up * sy)
         q = wp.mesh_query_ray(mesh, o, d, 1.0e6)
-        if not q.result:
-            acc += bg0 * (1.0 - 0.5 * (sy / half_w + 1.0)) + bg1 * 0.5 * (sy / half_w + 1.0)
+        bg = bg0 * (1.0 - 0.5 * (sy / half_w + 1.0)) + bg1 * 0.5 * (sy / half_w + 1.0)
+        t_hit = float(1.0e6)
+        if q.result:
+            t_hit = q.t
+        # Floor plane: hides whatever grew below it and catches contact shadows.
+        tf = float(-1.0)
+        if use_floor != 0 and d[2] < 0.0:
+            tf = (floor_z - o[2]) / d[2]
+        on_floor = tf > 0.0 and tf < t_hit
+        if not q.result and not on_floor:
+            acc += bg
             continue
-        f = q.face
-        m = wp.mesh_get(mesh)
-        i0 = m.indices[f * 3 + 0]
-        i1 = m.indices[f * 3 + 1]
-        i2 = m.indices[f * 3 + 2]
-        w2 = 1.0 - q.u - q.v
-        n = wp.normalize(vn[i0] * q.u + vn[i1] * q.v + vn[i2] * w2)
-        albedo = front
-        if use_vcol != 0:
-            albedo = vcol[i0] * q.u + vcol[i1] * q.v + vcol[i2] * w2
-        if wp.dot(n, d) > 0.0:
-            n = -n
-            if use_vcol == 0:
-                albedo = back
-            else:
-                albedo = albedo * 0.8
-        p = o + d * q.t + n * 1.0e-3 * ao_dist
+        n = wp.vec3(0.0, 0.0, 1.0)
+        albedo = floor_c
+        t = tf
+        if not on_floor:
+            t = q.t
+            f = q.face
+            m = wp.mesh_get(mesh)
+            i0 = m.indices[f * 3 + 0]
+            i1 = m.indices[f * 3 + 1]
+            i2 = m.indices[f * 3 + 2]
+            w2 = 1.0 - q.u - q.v
+            n = wp.normalize(vn[i0] * q.u + vn[i1] * q.v + vn[i2] * w2)
+            albedo = front
+            if use_vcol != 0:
+                albedo = vcol[i0] * q.u + vcol[i1] * q.v + vcol[i2] * w2
+            if wp.dot(n, d) > 0.0:
+                n = -n
+                if use_vcol == 0:
+                    albedo = back
+                else:
+                    albedo = albedo * 0.8
+        p = o + d * t + n * 1.0e-3 * ao_dist
         occ = float(0.0)
         for k in range(ao_n):
             r = _hemi(n, rng)
@@ -92,6 +107,11 @@ def k_render(mesh: wp.uint64, vn: wp.array(dtype=wp.vec3), vcol: wp.array(dtype=
         spec = wp.pow(wp.max(wp.dot(n, hv), 0.0), 40.0) * 0.12 * sh
         rim = wp.pow(1.0 - wp.abs(wp.dot(n, d)), 3.0) * 0.15
         lit = albedo * (0.35 * ao + 0.85 * ndl * sh * (0.4 + 0.6 * ao)) + wp.vec3(spec + rim * ao)
+        if on_floor:
+            # Fade the floor into the backdrop away from the form.
+            rf = wp.length(wp.vec3(p[0] - floor_o[0], p[1] - floor_o[1], 0.0)) / floor_r
+            w = wp.exp(-rf * rf)
+            lit = w * albedo * (0.45 * ao + 0.6 * ndl * sh) + (1.0 - w) * bg
         acc += lit
     c = acc / float(spp)
     img[tid] = wp.vec3(wp.pow(wp.clamp(c[0], 0.0, 1.0), 1.0 / 2.2),
@@ -118,14 +138,19 @@ BACK = (0.55, 0.30, 0.32)
 
 def render(pos, faces, W=768, H=768, azim=35.0, elev=30.0, spp=16, ao_n=4,
            scalar=None, cmap="magma", color=None, ortho=False, fov=28.0, seed=0, center=None,
-           radius=None, front=FRONT, back=BACK, light=(0.4, -0.3, 0.85)):
-    """Render a mesh to an (H, W, 3) uint8 array. pos/faces are torch tensors on CUDA."""
+           radius=None, front=FRONT, back=BACK, light=(0.4, -0.3, 0.85), floor=None):
+    """Render a mesh to an (H, W, 3) uint8 array. pos/faces are torch tensors on CUDA.
+    `floor`: z of a ground plane that hides anything below it; framing ignores that part."""
     dev = pos.device
     wdev = wp.device_from_torch(dev)
     pos = pos.float().contiguous()
     faces = faces.int().contiguous()
     if center is None:
         lo, hi = pos.min(0).values, pos.max(0).values
+        if floor is not None:
+            above = pos[pos[:, 2] >= floor]
+            if len(above):
+                lo, hi = above.min(0).values, above.max(0).values
         center = 0.5 * (lo + hi)
         radius = 0.5 * (hi - lo).norm().item()
     center = torch.as_tensor(center, dtype=torch.float32, device=dev)
@@ -158,7 +183,9 @@ def render(pos, faces, W=768, H=768, azim=35.0, elev=30.0, spp=16, ao_n=4,
         wmesh.id, wp.from_torch(vn, dtype=wp.vec3), wp.from_torch(vcol.contiguous(), dtype=wp.vec3), int(use_vcol),
         wp.vec3(*eye.tolist()), wp.vec3(*fwd.tolist()), wp.vec3(*right.tolist()), wp.vec3(*up.tolist()),
         float(half_w), int(ortho), W, H, spp, ao_n, float(radius * 0.15),
-        wp.vec3(*L), lin(front), lin(back), lin((0.93, 0.92, 0.90)), lin((0.75, 0.77, 0.80)), seed, img], device=wdev)
+        wp.vec3(*L), lin(front), lin(back), lin((0.93, 0.92, 0.90)), lin((0.75, 0.77, 0.80)),
+        int(floor is not None), float(0.0 if floor is None else floor), wp.vec3(*center.tolist()),
+        float(radius * 1.5), lin((0.84, 0.83, 0.80)), seed, img], device=wdev)
     out = wp.to_torch(img).reshape(H, W, 3)
     return (out * 255).clamp(0, 255).byte().cpu().numpy()
 

@@ -62,22 +62,29 @@ class Judge:
             org.max(1).values.cpu().numpy(), e.cpu().numpy()
 
     def score(self, results):
-        """Fill descriptors/fitness into evaluate.grow_batch results (alive ones)."""
+        """Fill descriptors/fitness into evaluate.grow_batch results (alive ones).
+        CLIP scores are means over the three floored `views`, as in imitation."""
         alive = [r for r in results if not r["dead"]]
         if not alive:
             return results
-        iso = [r["iso"] for r in alive]
-        top = [r["top"] for r in alive]
-        de = (self.dino_embed(iso) + self.dino_embed(top)) / 2
-        p_iso, lab, pmax, ce = self.clip_scores(iso)
-        p_top, _, _, _ = self.clip_scores(top)
-        for r, d, a, b, l, m, c in zip(alive, de, p_iso, p_top, lab, pmax, ce):
+        de = (self.dino_embed([r["iso"] for r in alive]) + self.dino_embed([r["top"] for r in alive])) / 2
+        n = len(alive)
+        org, _, _, ce = self.clip_scores([v for r in alive for v in r["views"]])
+        p = self._organism_probs(ce).reshape(n, 3, -1).mean(1)
+        org = org.reshape(n, 3).mean(1)
+        ce = ce.reshape(n, 3, -1)[:, 2]
+        for r, d, a, pp, c in zip(alive, de, org, p, ce):
+            k = int(pp.argmax())
             r["dino"] = d
             r["clip_emb"] = c
-            r["organic"] = float(max(a, b))
-            r["label"] = l
-            r["label_p"] = float(m)
+            r["organic"] = float(a)
+            r["label"] = ORGANISMS[k]
+            r["label_p"] = float(pp[k])
         return results
+
+    def _organism_probs(self, e):
+        p = (100.0 * torch.as_tensor(e, device=self.dev) @ self.text.T).softmax(1)
+        return p[:, :len(ORGANISMS)].cpu().numpy()
 
     @torch.no_grad()
     def clip_image_embed(self, images):

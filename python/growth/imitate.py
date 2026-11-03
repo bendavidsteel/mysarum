@@ -1,8 +1,10 @@
 """Evolve a growth genome to look like a target organism (CLIP-guided CMA-ES).
 
 Target is a text prompt or a folder of reference photos. CMA-ES starts from the
-QD-archive member that already best matches the target, so the search refines a
-form rather than starting from noise. Each genome is grown `--reps` times and
+best of a seed tournament: the `--seed_k` QD-archive members that already best
+match the target in their stored renders, plus any `--x0` genomes, all regrown
+and scored like the search does. So the search refines a form rather than
+starting from noise. Each genome is grown `--reps` times and
 scored by the mean, so a lucky random draw can't carry it. Each generation is
 grown as one batch.
 
@@ -35,7 +37,8 @@ def main():
     ap.add_argument("--sigma", type=float, default=0.12)
     ap.add_argument("--max_verts", type=int, default=40000)
     ap.add_argument("--max_ticks", type=int, default=1000)
-    ap.add_argument("--x0", help="seed genome instead: .npy, or a result.json from an earlier run")
+    ap.add_argument("--x0", nargs="*", default=[], help="seed candidates: .npy, or result.json from earlier runs")
+    ap.add_argument("--seed_k", type=int, default=4, help="QD members in the seed tournament")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--genome", default="param", choices=["param", "nca"])
     ap.add_argument("--w_std", type=float, default=0.4, help="nca: weight step relative to sigma")
@@ -52,19 +55,32 @@ def main():
         refs = [Image.open(p).convert("RGB") for p in sorted(glob.glob(f"{a.refs}/*"))]
     score = J.target_scorer(a.target, refs)
 
-    x0 = np.full(G.D, 0.5)
-    if a.x0:
-        x0 = np.load(a.x0) if a.x0.endswith(".npy") else np.array(json.load(open(a.x0))["genome"])
-    elif a.qd:
+    def load(path):
+        g = np.load(path) if path.endswith(".npy") else np.array(json.load(open(path))["genome"])
+        return G.upgrade(g) if len(g) != G.D else g
+
+    cands = [load(p) for p in a.x0]
+    if a.qd:
         df = pl.read_parquet(f"{a.qd}/evals.parquet").filter(~pl.col("dead"))
-        ims = [np.asarray(Image.open(f"{a.qd}/imgs/{i}.jpg")) for i in df["id"]]
-        h = ims[0].shape[0]
-        s = np.concatenate([np.maximum(score([im[:, :h] for im in ims[k:k + 64]]),
-                                       score([im[:, h:] for im in ims[k:k + 64]]))
-                            for k in range(0, len(ims), 64)])
-        best = int(np.argmax(s))
-        x0 = np.array(df["genome"][best])
-        print(f"seed from QD #{df['id'][best]} score {s[best]:.3f}", flush=True)
+        s = []
+        for k in range(0, len(df), 64):
+            ims = [np.asarray(Image.open(f"{a.qd}/imgs/{i}.jpg")) for i in df["id"][k:k + 64]]
+            h = ims[0].shape[0]
+            # imgs are x | y | angled | top; score the first three like the search.
+            s.append(np.mean([score([im[:, j * h:(j + 1) * h] for im in ims]) for j in range(3)], 0))
+        s = np.concatenate(s)
+        top = np.argsort(-s)[:a.seed_k]
+        print("QD seeds " + ", ".join(f"#{df['id'][int(i)]} {s[i]:.3f}" for i in top), flush=True)
+        cands += [np.array(df["genome"][int(i)]) for i in top]
+    x0 = np.full(G.D, 0.5)
+    if len(cands) > 1:
+        res = evaluate.grow_reps(np.array(cands), a.reps, max_verts=a.max_verts, max_ticks=a.max_ticks,
+                                 seed=1000, kind=a.genome)
+        f = [np.mean([score(r["views"]).mean() if not r["dead"] else 0.0 for r in reps]) for reps in res]
+        print("seed tournament " + " ".join(f"{v:.3f}" for v in f), flush=True)
+        x0 = cands[int(np.argmax(f))]
+    elif cands:
+        x0 = cands[0]
 
     opts = {"popsize": a.popsize, "seed": 1}
     if a.genome == "param":

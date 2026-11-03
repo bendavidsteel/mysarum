@@ -31,6 +31,10 @@ GENES = [
 D = len(GENES)
 
 
+def upgrade(g):
+    return np.asarray(g, dtype=float)
+
+
 def decode(g):
     g = np.clip(np.asarray(g, dtype=float), 0, 1)
     x = dict(zip(GENES, g))

@@ -129,14 +129,15 @@ def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
             res["extent"] = ext.tolist()
             res.update(structure(pos.cpu().numpy(), faces.cpu().numpy()))
             col = ex.get("color")
-            res["iso"] = render.render(pos, faces, W=size, H=size, azim=35, elev=30, spp=8, ao_n=3, color=col)
-            res["top"] = render.render(pos, faces, W=size, H=size, azim=0, elev=89, spp=8, ao_n=3, color=col)
-            # Along x and y near the horizon, plus angled from above; straight down
-            # reads as nothing to CLIP, so the top view is not scored. A floor at
-            # the seed's base hides anything grown below it.
+            # Along x and y near the horizon, plus angled from above, all on a floor at
+            # the seed's base that hides anything grown below it (an ungrounded seed
+            # can't pass a mirrored double as a tree). Straight down reads as nothing
+            # to CLIP, so `top` is only for DINO descriptors and contact sheets.
             fz = float(meshes[i]["pos"][:, 2].min())
             res["views"] = [render.render(pos, faces, W=size, H=size, azim=a, elev=e, spp=8, ao_n=3, color=col,
                                           floor=fz) for a, e in ((0, 5), (90, 5), (35, 30))]
+            res["iso"] = res["views"][2]
+            res["top"] = render.render(pos, faces, W=size, H=size, azim=0, elev=89, spp=8, ao_n=3, color=col)
             if col is not None:
                 res["color"] = (col * 255).byte().cpu().numpy()
             res["pos"] = pos.half().cpu().numpy()

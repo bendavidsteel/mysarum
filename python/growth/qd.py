@@ -1,11 +1,12 @@
 """CVT-MAP-Elites over growth genomes, with image-embedding descriptors.
 
-Descriptor = PCA of DINOv2 embeddings of the iso + top renders (refit on the
+Descriptor = PCA of DINOv2 embeddings of the angled + top renders (refit on the
 whole history every `refit_every` evaluations, then the archive is rebuilt),
 plus `struct_dims` structural descriptors (log finger count, log aspect;
 evaluate.structure) z-scored over the history and scaled by `struct_w`, so
 branching forms keep cells of their own before CLIP rewards them.
-Fitness = how specifically CLIP thinks the render is a real organism, averaged
+Fitness = how specifically CLIP thinks the renders are a real organism (mean
+over the floored x, y and angled views that imitation scores), averaged
 over `reps` growths of the genome (different random draws); the replicate
 nearest that mean stands for the genome in the archive.
 One grower process per GPU; the judge runs in the main process.
@@ -100,14 +101,14 @@ def representative(reps):
 
 
 def montage(rows, run, path, cols=6, tile=256):
-    """rows: list of dicts with id/label/fitness; tiles are the iso render."""
+    """rows: list of dicts with id/label/fitness; tiles are the angled view."""
     n = len(rows)
     H = (n + cols - 1) // cols
     im = Image.new("RGB", (cols * tile, H * tile), (235, 235, 235))
     d = ImageDraw.Draw(im)
     for k, r in enumerate(rows):
         t = Image.open(f"{run}/imgs/{r['id']}.jpg")
-        t = t.crop((0, 0, t.height, t.height)).resize((tile, tile))
+        t = t.crop((2 * t.height, 0, 3 * t.height, t.height)).resize((tile, tile))
         x, y = (k % cols) * tile, (k // cols) * tile
         im.paste(t, (x, y))
         d.text((x + 5, y + 4), f"#{r['id']} {r['label']} {r['fitness']:.2f}", fill=(20, 20, 20))
@@ -215,7 +216,8 @@ def main(cfg: DictConfig):
             row["fitness"], row["fitness_reps"] = fit, fits
             if not r["dead"]:
                 embs[i] = r["dino"]
-                Image.fromarray(np.concatenate([r["iso"], r["top"]], 1)).save(f"{run}/imgs/{i}.jpg", quality=88)
+                # x | y | angled | top, the first three as scored.
+                Image.fromarray(np.concatenate(r["views"] + [r["top"]], 1)).save(f"{run}/imgs/{i}.jpg", quality=88)
                 np.savez_compressed(f"{run}/meshes/{i}.npz", pos=r["pos"], faces=r["faces"],
                                     **({"color": r["color"]} if "color" in r else {}))
             rows.append(row)

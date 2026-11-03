@@ -18,8 +18,10 @@ import math
 from dataclasses import dataclass, field, fields
 
 import numpy as np
+import scipy.sparse as sp
 import torch
 import warp as wp
+from scipy.sparse.csgraph import connected_components
 
 from . import field as FD, mesh as M
 from .render import _hemi
@@ -81,6 +83,7 @@ class Params:
     nca_stiff: float = 0.0       # k_bend · exp(nca_stiff · S) per vertex
     nca_acurl: float = 0.0       # spontaneous curvature along the polarity axis (tubes)
     nca_acc: float = 0.0
+    nca_hole: float = 0.0        # cut faces where the CA's hole channel peaks (lace, fenestrae; Sim.perforate)
     # Gray-Scott morphogens on the mesh graph (off when morph_steps == 0)
     gs_feed: float = 0.0367
     gs_kill: float = 0.0649
@@ -365,6 +368,7 @@ class SimConfig:
     field_res: int = 96           # voxels per side of each individual's nutrient-field cube
     field_pad: float = 10.0       # far boundary distance beyond the bounding box
     remesh_every: int = 3         # growth ticks between split/flip passes
+    hole_after: int = 100         # no perforation before this tick (the seed is too small)
     curv_smooth: int = 8          # diffusion passes on mean curvature
     min_rest: float = 0.4
     seed: int = 0
@@ -871,7 +875,65 @@ class Sim:
         self.ticks += 1
         if self.ticks % cfg.remesh_every:
             return 0, 0
-        return self.remesh()
+        out = self.remesh()
+        if self.nca is not None and self.ticks >= cfg.hole_after and (self.P[:, PI["nca_hole"]] > 0).any():
+            self.perforate()
+        return out
+
+    def perforate(self, max_frac=0.1):
+        """Cut faces whose vertices all carry the NCA hole channel more than
+        0.6 - nca_hole above its local mean (a blur over ~6 edges), then keep
+        each individual's largest piece. Contrast, not level: a channel that
+        saturates everywhere would cut the whole sheet. The new rims are
+        boundary, so margin growth (boundary distance) can frill them. At most
+        `max_frac` of an individual's faces go per pass."""
+        P = self.P[self.ind]
+        pin = self.vf["pinned"]
+        near_pin = (pin + self._graph_lap(pin)) > 0
+        h = self.vf["nca"][:, self.nca.CH_HOLE]
+        hot = (h - self.smooth(h, 36) > 0.6 - P[:, PI["nca_hole"]]) \
+            & (P[:, PI["nca_hole"]] > 0) & ~near_pin & (self.active[self.ind] > 0)
+        cut = hot[self.faces].all(1)
+        if not cut.any():
+            return
+        fi = self.ind[self.faces[:, 0]]
+        nf = torch.bincount(fi, minlength=self.n_ind)
+        ok = torch.bincount(fi[cut], minlength=self.n_ind) <= max_frac * nf
+        cut &= ok[fi]
+        if not cut.any():
+            return
+        faces = self.faces[~cut]
+        # Largest connected piece per individual (scipy on the CPU; cuts are rare).
+        fc = faces.cpu().numpy()
+        N = self.pos.shape[0]
+        e = np.concatenate([fc[:, [0, 1]], fc[:, [1, 2]]])
+        A = sp.coo_matrix((np.ones(len(e), np.int8), (e[:, 0], e[:, 1])), shape=(N, N))
+        _, lab = connected_components(A, directed=False)
+        flab, find = lab[fc[:, 0]], self.ind[faces[:, 0]].cpu().numpy()
+        pair = find.astype(np.int64) * N + flab
+        u, cnt = np.unique(pair, return_counts=True)
+        best = {}
+        for k, c in zip(u, cnt):
+            i = int(k // N)
+            if c > best.get(i, (0, -1))[0]:
+                best[i] = (c, k)
+        keep = np.isin(pair, [k for _, k in best.values()])
+        faces = faces[torch.as_tensor(keep, device=self.dev)]
+        # Drop vertices no face uses; the remap is monotone, so edge keys stay sorted.
+        used = torch.zeros(N, dtype=torch.bool, device=self.dev)
+        used[faces.reshape(-1)] = True
+        idx = torch.nonzero(used).squeeze(1)
+        remap = torch.full((N,), -1, dtype=torch.long, device=self.dev)
+        remap[idx] = torch.arange(len(idx), device=self.dev)
+        e = self.topo.edges
+        live = used[e[:, 0]] & used[e[:, 1]]
+        keys = M.edge_key(remap[e[live, 0]], remap[e[live, 1]])
+        rest = self.rest[live]
+        self.pos, self.vel = self.pos[idx], self.vel[idx]
+        self.vf = {k: v[idx] for k, v in self.vf.items()}
+        self.faces = remap[faces]
+        self._bvh_tick = -1
+        self._rebuild(old=(keys, rest))
 
     def _quarantine(self):
         """Freeze individuals whose simulation went non-finite; keep the rest going."""

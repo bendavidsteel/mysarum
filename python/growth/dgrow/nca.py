@@ -13,8 +13,9 @@ spontaneous curvature), 3–5 are surface RGB, 6 steers growth toward the light
 (phototropism). 7 is a polarity field: its intrinsic gradient is a growth axis,
 with signed strength from 8 (auxin-like; a growth zone elongates along its own
 axis). 9 sets local bending stiffness (ribs, veins), 10 spontaneous curvature
-across the polarity axis (tubes, funnels, scrolls), 11 modulates accretion.
-The rest are hidden; they diffuse at a range of fixed rates so the CA has
+across the polarity axis (tubes, funnels, scrolls), 11 modulates accretion,
+12 perforates: faces where it peaks above its surroundings are cut (lace, fenestrae, sea-fan
+mesh), and the new rims count as boundary. The rest are hidden; they diffuse at a range of fixed rates so the CA has
 short- and long-range signals to pattern with. Cues also include ambient
 (hemisphere) exposure. New vertices from edge splits inherit the endpoint
 mean like any vertex field.
@@ -35,18 +36,18 @@ HID = 24
 N_CUE = 8
 P_IN = 2 * C + N_CUE
 CH_GROW, CH_ANISO, CH_CURL, CH_TROPIC = 0, 1, 2, 6
-CH_POL, CH_PSTR, CH_STIFF, CH_ACURL, CH_ACC = 7, 8, 9, 10, 11
-N_OUT = 12  # channels with a fixed meaning; the rest are hidden
+CH_POL, CH_PSTR, CH_STIFF, CH_ACURL, CH_ACC, CH_HOLE = 7, 8, 9, 10, 11, 12
+N_OUT = 13  # channels with a fixed meaning; the rest are hidden
 CH_RGB = slice(3, 6)
 # The polarity channel diffuses faster so its gradient is smooth enough to steer by.
-DIFF = [0.05] * 7 + [0.2] + [0.05] * 4 + list(np.linspace(0.0, 0.5, C - N_OUT))
+DIFF = [0.05] * 7 + [0.2] + [0.05] * 5 + list(np.linspace(0.0, 0.5, C - N_OUT))
 SHAPES = [("W1", (P_IN, HID)), ("b1", (HID,)), ("W2", (HID, C)), ("b2", (C,))]
 N_W = sum(math.prod(s) for _, s in SHAPES)
 
 
 class NCA:
     CH_GROW, CH_ANISO, CH_CURL, CH_TROPIC = CH_GROW, CH_ANISO, CH_CURL, CH_TROPIC
-    CH_POL, CH_PSTR, CH_STIFF, CH_ACURL, CH_ACC = CH_POL, CH_PSTR, CH_STIFF, CH_ACURL, CH_ACC
+    CH_POL, CH_PSTR, CH_STIFF, CH_ACURL, CH_ACC, CH_HOLE = CH_POL, CH_PSTR, CH_STIFF, CH_ACURL, CH_ACC, CH_HOLE
 
     def __init__(self, weights, dt, gain, device="cuda"):
         """weights (B, N_W) raw genome values; dt, gain (B,) per individual."""
@@ -130,7 +131,7 @@ GENES = [
     "nca_polar", "nca_stiff", "nca_acurl", "g_smooth", "plastic",
     "accrete", "acc_thresh", "acc_curv", "nca_acc", "g_ambient",
     "acc_gauss", "acc_bias", "acc_smooth", "acc_light", "acc_tension", "g_curv",
-    "acc_field", "acc_up", "acc_solid",
+    "acc_field", "acc_up", "acc_solid", "nca_hole",
 ]
 D_PHYS = len(GENES)
 D = D_PHYS + N_W
@@ -182,9 +183,18 @@ def decode(g):
         acc_field=_gate(x["acc_field"], 0.3, lambda u: _lin(u, 0.3, 1.0)),
         acc_up=_lin(x["acc_up"], 0.0, 1.0),
         acc_solid=_lin(x["acc_solid"], 0.0, 1.0),
+        # Perforation is destructive, so it is off in most of the gene's range.
+        nca_hole=_gate(x["nca_hole"], 0.6, lambda u: _lin(u, 0.15, 0.6)),
     )
     ctrl = dict(weights=g[D_PHYS:], dt=_log(x["nca_dt"], 0.05, 0.5), gain=_lin(x["gain"], 0.8, 2.5))
     return seed, p, ctrl
+
+
+def upgrade(g):
+    """Genome from before later physics genes were appended: new genes off (0)."""
+    g = np.asarray(g, dtype=float)
+    old = len(g) - N_W
+    return np.concatenate([g[:old], np.zeros(D_PHYS - old), g[old:]])
 
 
 def random(n, rng):

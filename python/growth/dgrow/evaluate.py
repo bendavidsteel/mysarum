@@ -83,8 +83,9 @@ def structure(pos, faces, levels=(0.35, 0.5, 0.65, 0.8, 0.9), min_faces=6):
 
 
 def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
-               substeps=20, morph_steps=4, seed=0, size=384, kind="param"):
-    """kind: 'param' (genome.py, hand-built growth fields) or 'nca' (nca.py, neural CA)."""
+               substeps=20, morph_steps=4, seed=0, size=384, kind="param", on_tick=None):
+    """kind: 'param' (genome.py, hand-built growth fields) or 'nca' (nca.py, neural CA).
+    on_tick(sim, tick) is called after every growth tick (film.py records with it)."""
     dec = [GENOMES[kind].decode(g) for g in genomes]
     seeds, params = [d[0] for d in dec], [d[1] for d in dec]
     meshes = [presets.seed_mesh(k, GENOMES[kind].SEED_RADIUS[k]) for k in seeds]
@@ -102,6 +103,8 @@ def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
     t0 = time.time()
     for it in range(max_ticks):
         sim.step(dt)
+        if on_tick is not None:
+            on_tick(sim, it)
         if it % 10 == 0:
             # Growing meshes fragment torch's cache until Warp can't allocate; hand it back.
             torch.cuda.empty_cache()
@@ -122,7 +125,7 @@ def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
     dead = sim.dead.cpu().numpy()
     for i in range(n):
         pos, faces, ex = sim.individual(i)
-        res = dict(seed=seeds[i], dead=bool(dead[i]), n_verts=int(pos.shape[0]),
+        res = dict(seed=seeds[i], dead=bool(dead[i]), n_verts=int(pos.shape[0]), floor=float(meshes[i]["pos"][:, 2].min()),
                    stop_tick=int(stop_tick[i]), secs=secs)
         if not dead[i] and torch.isfinite(pos).all():
             ext = (pos.max(0).values - pos.min(0).values).cpu().numpy()

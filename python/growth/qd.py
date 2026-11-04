@@ -4,10 +4,11 @@ Descriptor = PCA of DINOv2 embeddings of the angled + top renders (refit on the
 whole history every `refit_every` evaluations, then the archive is rebuilt),
 plus `struct_dims` structural descriptors (log finger count, log aspect;
 evaluate.structure) z-scored over the history and scaled by `struct_w`, so
-branching forms keep cells of their own before CLIP rewards them.
-Fitness = how specifically CLIP thinks the renders are a real organism (mean
-over the floored x, y and angled views that imitation scores), averaged
-over `reps` growths of the genome (different random draws); the replicate
+branching forms keep cells of their own before the judge rewards them.
+Fitness = how specifically the judge (CLIP × SigLIP 2, dgrow.judge) thinks the
+renders are a real organism (mean over the floored x, y and angled views that
+imitation scores), discounted for limbs thinner than the mesh resolves
+(evaluate.thin_factor) and averaged over `reps` growths of the genome (different random draws); the replicate
 nearest that mean stands for the genome in the archive.
 One grower process per GPU; the judge runs in the main process.
 
@@ -87,7 +88,10 @@ class Archive:
 
 
 def fitness(r):
-    return 0.5 * r["organic"] + 0.5 * r["label_p"]
+    # Imported here: dgrow initialises Warp, which must not happen before a worker
+    # has picked its GPU (spawned workers re-import this module).
+    from dgrow.evaluate import thin_factor
+    return (0.5 * r["organic"] + 0.5 * r["label_p"]) * thin_factor(r.get("thin", 0.0))
 
 
 def representative(reps):
@@ -212,7 +216,7 @@ def main(cfg: DictConfig):
                        organic=r.get("organic", 0.0), label=r.get("label", ""),
                        label_p=r.get("label_p", 0.0), error=r.get("error", ""),
                        branches=r.get("branches", 1), fingers=r.get("fingers", 1),
-                       aspect=r.get("aspect", 0.0))
+                       aspect=r.get("aspect", 0.0), thin=r.get("thin", 0.0))
             row["fitness"], row["fitness_reps"] = fit, fits
             if not r["dead"]:
                 embs[i] = r["dino"]

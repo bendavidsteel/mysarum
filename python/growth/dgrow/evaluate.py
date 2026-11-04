@@ -5,6 +5,7 @@ import time
 import numpy as np
 import scipy.sparse as sp
 import torch
+import warp as wp
 from scipy.sparse.csgraph import connected_components, dijkstra
 
 from . import genome as G, nca as NC, presets, render, sim as S
@@ -82,6 +83,66 @@ def structure(pos, faces, levels=(0.35, 0.5, 0.65, 0.8, 0.9), min_faces=6):
     return dict(branches=branches, aspect=aspect, fingers=fingers(pos, faces))
 
 
+@wp.kernel
+def k_thickness(mesh: wp.uint64, x: wp.array(dtype=wp.vec3), vn: wp.array(dtype=wp.vec3),
+                max_d: float, n_dir: int, out: wp.array(dtype=float), tube: wp.array(dtype=float)):
+    i = wp.tid()
+    d = -vn[i]
+    q = wp.mesh_query_ray(mesh, x[i] + d * 1.0e-3, d, max_d)
+    out[i] = -1.0
+    tube[i] = 0.0
+    # Only the inside of the opposite wall counts: then the ray crossed solid
+    # tissue. Open sheets and gaps between folds face the other way or miss.
+    if q.result and wp.dot(q.normal, d) > 0.0:
+        t = q.t
+        out[i] = t
+        # From the chord's midpoint, rays across it: inside a tube most hit the
+        # wall within 1.5 t; between the parallel walls of a fold almost none do.
+        m = x[i] + d * (0.5 * t)
+        a = wp.vec3(1.0, 0.0, 0.0)
+        if wp.abs(d[0]) > 0.8:
+            a = wp.vec3(0.0, 1.0, 0.0)
+        u = wp.normalize(wp.cross(d, a))
+        v = wp.cross(d, u)
+        hits = float(0.0)
+        for k in range(n_dir):
+            th = 2.0 * wp.pi * float(k) / float(n_dir)
+            r = wp.mesh_query_ray(mesh, m, wp.cos(th) * u + wp.sin(th) * v, 1.5 * t)
+            if r.result:
+                hits += 1.0
+        tube[i] = hits / float(n_dir)
+
+
+def thickness(pos, faces, max_d=50.0, n_dir=8):
+    """Per-vertex local diameter in edge lengths (distance along the inward normal
+    to the opposite wall; -1 where the ray leaves through open sheet or misses)
+    and tubeness in [0, 1] (≈0.8 for a tube, ≈0 for a fold or fin)."""
+    pos = pos.float().contiguous()
+    f = faces.int().contiguous()
+    wdev = wp.device_from_torch(pos.device)
+    m = wp.Mesh(points=wp.from_torch(pos, dtype=wp.vec3), indices=wp.from_torch(f.reshape(-1), dtype=wp.int32))
+    vn = render._vertex_normals(pos, f.long()).contiguous()
+    out = torch.empty(len(pos), device=pos.device)
+    tube = torch.empty(len(pos), device=pos.device)
+    wp.launch(k_thickness, dim=len(pos), inputs=[m.id, wp.from_torch(pos, dtype=wp.vec3), wp.from_torch(vn, dtype=wp.vec3),
+                                                  max_d, n_dir, wp.from_torch(out), wp.from_torch(tube)], device=wdev)
+    return out, tube
+
+
+def thin_fraction(pos, faces, max_d=1.5):
+    """Share of vertices on tubes narrower than `max_d` edges: limbs the mesh can't
+    resolve. Folds, fins and open sheets don't count (see `thickness`)."""
+    t, tube = thickness(pos, faces)
+    return float(((t >= 0) & (t < max_d) & (tube >= 0.5)).float().mean())
+
+
+def thin_factor(thin, free=0.15, scale=0.15):
+    """Fitness multiplier for wire limbs. Search otherwise maxes surface tension
+    until every limb is one edge wide: a wire silhouette reads as twigs to CLIP.
+    Brain-coral ridge crests come to ~0.14, wire trees to 0.4-0.7."""
+    return float(np.exp(-max(0.0, thin - free) / scale))
+
+
 def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
                substeps=20, morph_steps=4, seed=0, size=384, kind="param", on_tick=None):
     """kind: 'param' (genome.py, hand-built growth fields) or 'nca' (nca.py, neural CA).
@@ -131,6 +192,7 @@ def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
             ext = (pos.max(0).values - pos.min(0).values).cpu().numpy()
             res["extent"] = ext.tolist()
             res.update(structure(pos.cpu().numpy(), faces.cpu().numpy()))
+            res["thin"] = thin_fraction(pos, faces)
             col = ex.get("color")
             # Along x and y near the horizon, plus angled from above, all on a floor at
             # the seed's base that hides anything grown below it (an ungrounded seed

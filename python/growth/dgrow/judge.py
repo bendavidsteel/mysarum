@@ -1,8 +1,15 @@
-"""Image judges: DINOv2 embeddings (descriptors) and CLIP 'looks like an organism' (fitness)."""
+"""Image judges: DINOv2 embeddings (QD descriptors) and 'looks like an organism'
+(fitness) from a product of experts: CLIP ViT-L/14 and SigLIP 2 (so400m, 384 px)
+logits averaged, i.e. their label probabilities multiplied and renormalised. A
+form has to convince both at once, which is much harder to game than either:
+imitation winners evolved against CLIP alone scored near zero under SigLIP.
+The template says "3d render" so that every render, being one, doesn't lose to
+the "random 3d shape" decoy on style alone.
+"""
 
 import numpy as np
 import torch
-from transformers import AutoImageProcessor, AutoModel, CLIPModel, CLIPProcessor
+from transformers import AutoImageProcessor, AutoModel, AutoProcessor
 
 ORGANISMS = [
     "a brain coral", "a sea anemone", "a lettuce", "a kale leaf", "a nudibranch sea slug",
@@ -20,7 +27,8 @@ NEGATIVES = [
     "crumpled paper", "a pile of trash", "a smooth blob", "a rock", "a plastic bag",
     "a random 3d shape", "a ball", "a lump of clay", "fabric",
 ]
-TEMPLATE = "a photo of {}"
+TEMPLATE = "a 3d render of {}"
+EXPERTS = ("openai/clip-vit-large-patch14", "google/siglip2-so400m-patch14-384")
 
 
 def _proj(out):
@@ -28,19 +36,43 @@ def _proj(out):
     return out if torch.is_tensor(out) else out.pooler_output
 
 
+class Expert:
+    """One CLIP-style image/text model."""
+
+    def __init__(self, name, device):
+        self.dev = device
+        self.proc = AutoProcessor.from_pretrained(name)
+        self.model = AutoModel.from_pretrained(name).to(device).eval().half()
+        # SigLIP was trained on max-length padded text; CLIP's 100 is its own logit scale.
+        self.siglip = "siglip" in name
+        self.scale = float(self.model.logit_scale.exp()) if self.siglip else 100.0
+
+    @torch.no_grad()
+    def text(self, texts):
+        pad = dict(padding="max_length", max_length=64) if self.siglip else dict(padding=True)
+        tok = self.proc(text=texts, return_tensors="pt", truncation=True, **pad).to(self.dev)
+        return torch.nn.functional.normalize(_proj(self.model.get_text_features(**tok)).float(), dim=1)
+
+    @torch.no_grad()
+    def image(self, images):
+        x = self.proc(images=list(images), return_tensors="pt")["pixel_values"].to(self.dev).half()
+        return torch.nn.functional.normalize(_proj(self.model.get_image_features(pixel_values=x)).float(), dim=1)
+
+
 class Judge:
-    def __init__(self, device="cuda", clip_name="openai/clip-vit-large-patch14",
-                 dino_name="facebook/dinov2-small"):
+    def __init__(self, device="cuda", experts=EXPERTS, dino_name="facebook/dinov2-small"):
         self.dev = device
         self.dino_proc = AutoImageProcessor.from_pretrained(dino_name)
         self.dino = AutoModel.from_pretrained(dino_name).to(device).eval().half()
-        self.clip_proc = CLIPProcessor.from_pretrained(clip_name)
-        self.clip = CLIPModel.from_pretrained(clip_name).to(device).eval().half()
-        texts = [TEMPLATE.format(t) for t in ORGANISMS + NEGATIVES]
-        with torch.no_grad():
-            tok = self.clip_proc(text=texts, return_tensors="pt", padding=True).to(device)
-            t = _proj(self.clip.get_text_features(**tok))
-        self.text = torch.nn.functional.normalize(t.float(), dim=1)
+        self.experts = [Expert(n, device) for n in experts]
+        self.labels = self.text_embed(ORGANISMS + NEGATIVES)
+
+    def text_embed(self, labels):
+        return [e.text([TEMPLATE.format(t) for t in labels]) for e in self.experts]
+
+    def probs(self, images, T):
+        """(n_images, n_labels) probabilities from the experts' averaged logits."""
+        return torch.stack([e.scale * e.image(images) @ t.T for e, t in zip(self.experts, T)]).mean(0).softmax(1)
 
     @torch.no_grad()
     def dino_embed(self, images):
@@ -49,60 +81,33 @@ class Judge:
         # CLS + mean patch token: shape and texture.
         return torch.cat([h[:, 0], h[:, 1:].mean(1)], 1).float().cpu().numpy()
 
-    @torch.no_grad()
-    def clip_scores(self, images):
-        """(organism probability, best organism label, image embedding) per image."""
-        x = self.clip_proc(images=list(images), return_tensors="pt")["pixel_values"].to(self.dev).half()
-        e = torch.nn.functional.normalize(_proj(self.clip.get_image_features(pixel_values=x)).float(), dim=1)
-        logits = 100.0 * e @ self.text.T
-        p = logits.softmax(1)
-        k = len(ORGANISMS)
-        org = p[:, :k]
-        return org.sum(1).cpu().numpy(), [ORGANISMS[i] for i in org.argmax(1).cpu().numpy()], \
-            org.max(1).values.cpu().numpy(), e.cpu().numpy()
-
     def score(self, results):
         """Fill descriptors/fitness into evaluate.grow_batch results (alive ones).
-        CLIP scores are means over the three floored `views`, as in imitation."""
+        Organism probabilities are means over the three floored `views`, as in imitation."""
         alive = [r for r in results if not r["dead"]]
         if not alive:
             return results
         de = (self.dino_embed([r["iso"] for r in alive]) + self.dino_embed([r["top"] for r in alive])) / 2
-        n = len(alive)
-        org, _, _, ce = self.clip_scores([v for r in alive for v in r["views"]])
-        p = self._organism_probs(ce).reshape(n, 3, -1).mean(1)
-        org = org.reshape(n, 3).mean(1)
-        ce = ce.reshape(n, 3, -1)[:, 2]
-        for r, d, a, pp, c in zip(alive, de, org, p, ce):
+        p = self.probs([v for r in alive for v in r["views"]], self.labels)[:, :len(ORGANISMS)]
+        p = p.reshape(len(alive), 3, -1).mean(1).cpu().numpy()
+        for r, d, pp in zip(alive, de, p):
             k = int(pp.argmax())
             r["dino"] = d
-            r["clip_emb"] = c
-            r["organic"] = float(a)
+            r["organic"] = float(pp.sum())
             r["label"] = ORGANISMS[k]
             r["label_p"] = float(pp[k])
         return results
 
-    def _organism_probs(self, e):
-        p = (100.0 * torch.as_tensor(e, device=self.dev) @ self.text.T).softmax(1)
-        return p[:, :len(ORGANISMS)].cpu().numpy()
-
-    @torch.no_grad()
-    def clip_image_embed(self, images):
-        x = self.clip_proc(images=list(images), return_tensors="pt")["pixel_values"].to(self.dev).half()
-        return torch.nn.functional.normalize(_proj(self.clip.get_image_features(pixel_values=x)).float(), dim=1)
-
-    @torch.no_grad()
     def target_scorer(self, target=None, ref_images=None):
         """Return f(images) -> score in [0,1] for matching a text target or reference photos.
 
         Text: probability of `target` against the other organisms and the negatives.
-        Photos: cosine similarity to the mean reference embedding, mapped to [0,1].
+        Photos: cosine similarity to the mean reference embedding, mapped to [0,1]
+        and averaged over the experts.
         """
         if ref_images is not None:
-            ref = torch.nn.functional.normalize(self.clip_image_embed(ref_images).mean(0), dim=0)
-            return lambda ims: ((self.clip_image_embed(ims) @ ref).cpu().numpy() - 0.5) * 2
-        others = [o for o in ORGANISMS if o != target] + NEGATIVES
-        texts = [TEMPLATE.format(t) for t in [target] + others]
-        tok = self.clip_proc(text=texts, return_tensors="pt", padding=True).to(self.dev)
-        T = torch.nn.functional.normalize(_proj(self.clip.get_text_features(**tok)).float(), dim=1)
-        return lambda ims: (100.0 * self.clip_image_embed(ims) @ T.T).softmax(1)[:, 0].cpu().numpy()
+            refs = [torch.nn.functional.normalize(e.image(ref_images).mean(0), dim=0) for e in self.experts]
+            return lambda ims: np.mean([((e.image(ims) @ r).cpu().numpy() - 0.5) * 2
+                                        for e, r in zip(self.experts, refs)], 0)
+        T = self.text_embed([target] + [o for o in ORGANISMS if o != target] + NEGATIVES)
+        return lambda ims: self.probs(ims, T)[:, 0].cpu().numpy()

@@ -55,6 +55,10 @@ def main():
         refs = [Image.open(p).convert("RGB") for p in sorted(glob.glob(f"{a.refs}/*"))]
     score = J.target_scorer(a.target, refs)
 
+    def fitness(r):
+        # Mean over the views (evaluate `views`), discounted for wire limbs.
+        return 0.0 if r["dead"] else float(score(r["views"]).mean()) * evaluate.thin_factor(r["thin"])
+
     def load(path):
         g = np.load(path) if path.endswith(".npy") else np.array(json.load(open(path))["genome"])
         return G.upgrade(g) if len(g) != G.D else g
@@ -76,7 +80,7 @@ def main():
     if len(cands) > 1:
         res = evaluate.grow_reps(np.array(cands), a.reps, max_verts=a.max_verts, max_ticks=a.max_ticks,
                                  seed=1000, kind=a.genome)
-        f = [np.mean([score(r["views"]).mean() if not r["dead"] else 0.0 for r in reps]) for reps in res]
+        f = [np.mean([fitness(r) for r in reps]) for reps in res]
         print("seed tournament " + " ".join(f"{v:.3f}" for v in f), flush=True)
         x0 = cands[int(np.argmax(f))]
     elif cands:
@@ -101,8 +105,7 @@ def main():
         # Mean over side views along x and y and an angled view (evaluate `views`): a
         # flat sprawl can pass as a tree from 30° up, but from the side it is a line
         # on the floor, and a form that works along one axis only loses on the other.
-        fr = np.array([[score(r["views"]).mean() if not r["dead"] else 0.0
-                        for r in reps] for reps in res])
+        fr = np.array([[fitness(r) for r in reps] for reps in res])
         f = fr.mean(1)
         es.tell(list(X), list(-f))
         k = int(np.argmax(f))

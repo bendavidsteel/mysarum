@@ -2,7 +2,9 @@
 
 Front and back faces get different albedos so the two sides of a sheet read
 apart; an optional per-vertex scalar (through a colormap) or RGB colour
-replaces the clay albedo.
+replaces the clay albedo. An optional per-vertex material (iridescence, film
+thickness, translucency, gloss; each in [0, 1]) adds thin-film interference
+colour, light transmitted through thin tissue, and a glossy coat.
 """
 
 import math
@@ -31,9 +33,26 @@ def _hemi(n: wp.vec3, rng: wp.uint32):
     return wp.normalize(u * (wp.cos(phi) * s) + v * (wp.sin(phi) * s) + n * wp.sqrt(1.0 - r2))
 
 
+@wp.func
+def _film(cos_i: float, film: float):
+    # Thin-film interference: reflectance at red/green/blue of a film 200-500 nm
+    # thick (index 1.4); the hue shifts as the view grazes and as thickness varies.
+    nf = 1.4
+    cos_t = wp.sqrt(wp.max(1.0 - (1.0 - cos_i * cos_i) / (nf * nf), 0.0))
+    opd = 4.0 * 3.14159265 * nf * (200.0 + 300.0 * film) * cos_t
+    return wp.vec3(0.5 - 0.5 * wp.cos(opd / 650.0), 0.5 - 0.5 * wp.cos(opd / 540.0),
+                   0.5 - 0.5 * wp.cos(opd / 450.0))
+
+
+@wp.func
+def _sky(d: wp.vec3, bg0: wp.vec3, bg1: wp.vec3):
+    u = wp.clamp(0.5 * (d[2] + 1.0), 0.0, 1.0)
+    return bg0 * (1.0 - u) + bg1 * u * 1.15
+
+
 @wp.kernel
 def k_render(mesh: wp.uint64, vn: wp.array(dtype=wp.vec3), vcol: wp.array(dtype=wp.vec3),
-             use_vcol: int, eye: wp.vec3, fwd: wp.vec3, right: wp.vec3, up: wp.vec3,
+             use_vcol: int, vmat: wp.array(dtype=wp.vec4), use_mat: int, eye: wp.vec3, fwd: wp.vec3, right: wp.vec3, up: wp.vec3,
              half_w: float, ortho: int, W: int, H: int, spp: int, ao_n: int, ao_dist: float,
              light: wp.vec3, front: wp.vec3, back: wp.vec3, bg0: wp.vec3, bg1: wp.vec3,
              use_floor: int, floor_z: float, floor_o: wp.vec3, floor_r: float, floor_c: wp.vec3,
@@ -69,6 +88,7 @@ def k_render(mesh: wp.uint64, vn: wp.array(dtype=wp.vec3), vcol: wp.array(dtype=
             continue
         n = wp.vec3(0.0, 0.0, 1.0)
         albedo = floor_c
+        mat = wp.vec4()
         t = tf
         if not on_floor:
             t = q.t
@@ -82,12 +102,17 @@ def k_render(mesh: wp.uint64, vn: wp.array(dtype=wp.vec3), vcol: wp.array(dtype=
             albedo = front
             if use_vcol != 0:
                 albedo = vcol[i0] * q.u + vcol[i1] * q.v + vcol[i2] * w2
+            if use_mat != 0:
+                mat = vmat[i0] * q.u + vmat[i1] * q.v + vmat[i2] * w2
             if wp.dot(n, d) > 0.0:
                 n = -n
                 if use_vcol == 0:
                     albedo = back
                 else:
                     albedo = albedo * 0.8
+        iri = mat[0]
+        sss = mat[2]
+        gloss = mat[3]
         p = o + d * t + n * 1.0e-3 * ao_dist
         occ = float(0.0)
         for k in range(ao_n):
@@ -96,17 +121,54 @@ def k_render(mesh: wp.uint64, vn: wp.array(dtype=wp.vec3), vcol: wp.array(dtype=
             if qa.result:
                 occ += 1.0 - qa.t / ao_dist
         ao = 1.0 - occ / float(ao_n)
-        ndl = wp.max(wp.dot(n, light), 0.0)
+        jl = wp.normalize(light + 0.08 * wp.vec3(wp.randf(rng) - 0.5, wp.randf(rng) - 0.5, wp.randf(rng) - 0.5))
+        ndotl = wp.dot(n, light)
+        # Translucent tissue wraps the key light past the terminator.
+        wrap = 1.0 * sss
+        ndl = wp.max((ndotl + wrap) / (1.0 + wrap), 0.0)
         sh = float(1.0)
         if ndl > 0.0:
-            jl = wp.normalize(light + 0.08 * wp.vec3(wp.randf(rng) - 0.5, wp.randf(rng) - 0.5, wp.randf(rng) - 0.5))
             qs = wp.mesh_query_ray(mesh, p, jl, 1.0e6)
             if qs.result:
-                sh = 0.0
+                sh = 0.3 * sss
+        cos_v = wp.abs(wp.dot(n, d))
+        fres = 0.04 + 0.96 * wp.pow(1.0 - cos_v, 5.0)
         hv = wp.normalize(light - d)
-        spec = wp.pow(wp.max(wp.dot(n, hv), 0.0), 40.0) * 0.12 * sh
-        rim = wp.pow(1.0 - wp.abs(wp.dot(n, d)), 3.0) * 0.15
+        shin = 40.0 + 260.0 * gloss
+        spec = wp.pow(wp.max(wp.dot(n, hv), 0.0), shin) * (0.12 + 0.9 * gloss) * sh
+        rim = wp.pow(1.0 - cos_v, 3.0) * 0.15
         lit = albedo * (0.35 * ao + 0.85 * ndl * sh * (0.4 + 0.6 * ao)) + wp.vec3(spec + rim * ao)
+        if not on_floor:
+            if sss > 0.01:
+                # Light through the tissue: thickness along the inward normal (an
+                # open sheet or a gap counts as thin), transmitted light from behind.
+                qi = wp.mesh_query_ray(mesh, p - n * 2.0e-3 * ao_dist, -n, 8.0)
+                th = float(0.3)
+                if qi.result and wp.dot(qi.normal, -n) > 0.0:
+                    th = qi.t
+                trans = wp.exp(-th / (1.5 + 6.0 * sss))
+                bl = wp.max(-ndotl, 0.0)
+                pe = p - n * (th + 4.0e-3 * ao_dist)
+                if bl > 0.0:
+                    qb = wp.mesh_query_ray(mesh, pe, jl, 1.0e6)
+                    if qb.result:
+                        bl = 0.0
+                tcol = wp.cw_mul(albedo, albedo) * 1.6 + albedo * 0.2
+                lit = lit + sss * trans * wp.cw_mul(tcol, wp.vec3(1.4 * bl + 0.45 * ao))
+            if gloss > 0.01:
+                rd = d - 2.0 * wp.dot(d, n) * n
+                env = _sky(rd, bg0, bg1)
+                qr = wp.mesh_query_ray(mesh, p, rd, ao_dist * 2.0)
+                if qr.result:
+                    env = env * (0.25 + 0.75 * qr.t / (ao_dist * 2.0))
+                lit = lit * (1.0 - 0.3 * gloss * fres) + gloss * fres * env * 0.9
+            if iri > 0.01:
+                # Structural colour: the film's reflectance replaces some pigment
+                # and brightens toward grazing angles.
+                fc = _film(cos_v, mat[1])
+                sheen = 0.25 + 0.75 * wp.pow(1.0 - cos_v, 2.0)
+                film_lit = wp.cw_mul(fc, wp.vec3(sheen * (0.4 * ao + 0.6 * ndl * sh))) + fc * spec * 3.0
+                lit = lit * (1.0 - 0.45 * iri * sheen) + film_lit * iri
         if on_floor:
             # Fade the floor into the backdrop away from the form.
             rf = wp.length(wp.vec3(p[0] - floor_o[0], p[1] - floor_o[1], 0.0)) / floor_r
@@ -138,9 +200,10 @@ BACK = (0.55, 0.30, 0.32)
 
 def render(pos, faces, W=768, H=768, azim=35.0, elev=30.0, spp=16, ao_n=4,
            scalar=None, cmap="magma", color=None, ortho=False, fov=28.0, seed=0, center=None,
-           radius=None, front=FRONT, back=BACK, light=(0.4, -0.3, 0.85), floor=None):
+           radius=None, front=FRONT, back=BACK, light=(0.4, -0.3, 0.85), floor=None, material=None):
     """Render a mesh to an (H, W, 3) uint8 array. pos/faces are torch tensors on CUDA.
-    `floor`: z of a ground plane that hides anything below it; framing ignores that part."""
+    `floor`: z of a ground plane that hides anything below it; framing ignores that part.
+    `material`: (N, 4) per-vertex iridescence, film thickness, translucency, gloss in [0, 1]."""
     dev = pos.device
     wdev = wp.device_from_torch(dev)
     pos = pos.float().contiguous()
@@ -176,11 +239,14 @@ def render(pos, faces, W=768, H=768, azim=35.0, elev=30.0, spp=16, ao_n=4,
         vcol = _cmap(((s - lo_) / (hi_ - lo_ + 1e-9)).clamp(0, 1), cmap).to(dev) ** 2.2
     else:
         vcol = torch.zeros_like(pos)
+    mat = torch.zeros(1, 4, device=dev) if material is None else \
+        torch.as_tensor(material, device=dev).float().clamp(0, 1).contiguous()
     img = wp.zeros(W * H, dtype=wp.vec3, device=wdev)
     lin = lambda c: wp.vec3(*[x**2.2 for x in c])
     L = torch.nn.functional.normalize(torch.tensor(light), dim=0).tolist()
     wp.launch(k_render, dim=W * H, inputs=[
         wmesh.id, wp.from_torch(vn, dtype=wp.vec3), wp.from_torch(vcol.contiguous(), dtype=wp.vec3), int(use_vcol),
+        wp.from_torch(mat, dtype=wp.vec4), int(material is not None),
         wp.vec3(*eye.tolist()), wp.vec3(*fwd.tolist()), wp.vec3(*right.tolist()), wp.vec3(*up.tolist()),
         float(half_w), int(ortho), W, H, spp, ao_n, float(radius * 0.15),
         wp.vec3(*L), lin(front), lin(back), lin((0.93, 0.92, 0.90)), lin((0.75, 0.77, 0.80)),

@@ -997,6 +997,7 @@ class Sim:
         extra["g"] = self.growth_rate()[idx]
         if self.nca is not None:
             extra["color"] = self.nca.color(self.vf["nca"][idx])
+            extra["material"] = self.nca.material(self.vf["nca"][idx])
         return pos, faces, extra
 
     def counts(self):

@@ -25,9 +25,11 @@ def snapshot(sim, i):
     remap = torch.full((sim.pos.shape[0],), -1, dtype=torch.long, device=sim.dev)
     remap[idx] = torch.arange(len(idx), device=sim.dev)
     faces = remap[sim.faces[sel[sim.faces[:, 0]]]]
-    col = sim.nca.color(sim.vf["nca"][idx]) if sim.nca is not None else None
-    return ((sim.pos[idx] - sim.centers[i]).half().cpu(), faces.int().cpu(),
-            None if col is None else col.half().cpu())
+    pos = (sim.pos[idx] - sim.centers[i]).half().cpu()
+    if sim.nca is None:
+        return pos, faces.int().cpu(), None, None
+    S = sim.vf["nca"][idx]
+    return pos, faces.int().cpu(), sim.nca.color(S).half().cpu(), sim.nca.material(S).half().cpu()
 
 
 def frame_box(pos, floor):
@@ -38,10 +40,10 @@ def frame_box(pos, floor):
 
 
 def film(frames, floor, path, size, spp, deg_per_frame=0.8, spin=120, elev=22.0, fps=30):
-    """frames: snapshots (pos, faces, color). Camera radius only ever grows, eased."""
+    """frames: snapshots (pos, faces, color, material). Camera radius only ever grows, eased."""
     out, c_s, r_s, az = [], None, 0.0, 0.0
     with imageio.get_writer(path, fps=fps, quality=8, macro_block_size=8) as w:
-        for k, (pos, faces, col) in enumerate(frames + [frames[-1]] * spin):
+        for k, (pos, faces, col, mat) in enumerate(frames + [frames[-1]] * spin):
             pos = pos.float().cuda()
             c, r = frame_box(pos, floor)
             r = max(r, 6.0)
@@ -50,7 +52,8 @@ def film(frames, floor, path, size, spp, deg_per_frame=0.8, spin=120, elev=22.0,
             az += deg_per_frame if k < len(frames) else 360.0 / spin
             w.append_data(render.render(pos, faces.long().cuda(), W=size, H=size, azim=35 + az, elev=elev,
                                         center=c_s, radius=r_s, spp=spp, ao_n=4, floor=floor,
-                                        color=None if col is None else col.float().cuda()))
+                                        color=None if col is None else col.float().cuda(),
+                                        material=None if mat is None else mat.float().cuda()))
 
 
 def main():

@@ -118,7 +118,7 @@ def main():
             Image.fromarray(strip).save(f"{out}/gen{gen:03d}.jpg", quality=85)
             for j, r in enumerate(alive):
                 np.savez_compressed(f"{out}/best_{j}.npz", pos=r["pos"], faces=r["faces"],
-                                    **({"color": r["color"]} if "color" in r else {}))
+                                    **{k: r[k] for k in ("color", "material") if k in r})
         hist.append(dict(gen=gen, best=float(f.max()), mean=float(f.mean())))
         print(f"[{time.time() - t0:6.0f}s] gen {gen} best {f.max():.3f} mean {f.mean():.3f} overall {best[0]:.3f}", flush=True)
     with open(f"{out}/result.json", "w") as fh:

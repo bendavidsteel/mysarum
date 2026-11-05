@@ -15,7 +15,8 @@ with signed strength from 8 (auxin-like; a growth zone elongates along its own
 axis). 9 sets local bending stiffness (ribs, veins), 10 spontaneous curvature
 across the polarity axis (tubes, funnels, scrolls), 11 modulates accretion,
 12 perforates: faces where it peaks above its surroundings are cut (lace, fenestrae, sea-fan
-mesh), and the new rims count as boundary. The rest are hidden; they diffuse at a range of fixed rates so the CA has
+mesh), and the new rims count as boundary. 13–16 are surface material for the
+renderer: iridescence, thin-film thickness, translucency, gloss. The rest are hidden; they diffuse at a range of fixed rates so the CA has
 short- and long-range signals to pattern with. Cues also include ambient
 (hemisphere) exposure. New vertices from edge splits inherit the endpoint
 mean like any vertex field.
@@ -31,16 +32,17 @@ import torch
 from . import genome as PG
 from .sim import Params
 
-C = 16
+C = 20
 HID = 24
 N_CUE = 8
 P_IN = 2 * C + N_CUE
 CH_GROW, CH_ANISO, CH_CURL, CH_TROPIC = 0, 1, 2, 6
 CH_POL, CH_PSTR, CH_STIFF, CH_ACURL, CH_ACC, CH_HOLE = 7, 8, 9, 10, 11, 12
-N_OUT = 13  # channels with a fixed meaning; the rest are hidden
+CH_MAT = slice(13, 17)  # iridescence, film thickness, translucency, gloss
+N_OUT = 17  # channels with a fixed meaning; the rest are hidden
 CH_RGB = slice(3, 6)
 # The polarity channel diffuses faster so its gradient is smooth enough to steer by.
-DIFF = [0.05] * 7 + [0.2] + [0.05] * 5 + list(np.linspace(0.0, 0.5, C - N_OUT))
+DIFF = [0.05] * 7 + [0.2] + [0.05] * 9 + list(np.linspace(0.0, 0.5, C - N_OUT))
 SHAPES = [("W1", (P_IN, HID)), ("b1", (HID,)), ("W2", (HID, C)), ("b2", (C,))]
 N_W = sum(math.prod(s) for _, s in SHAPES)
 
@@ -121,6 +123,14 @@ class NCA:
         # Kept off pure black/white/primaries so surfaces read as pigment, not plastic.
         return 0.5 + 0.35 * S[:, CH_RGB]
 
+    @staticmethod
+    def material(S):
+        """(N, 4) iridescence, film thickness, translucency, gloss in [0, 1]. The
+        effects start above a channel value of 0.2, so a quiet channel is matte."""
+        m = ((S[:, CH_MAT] - 0.2) / 0.8).clamp(0, 1)
+        m[:, 1] = 0.5 * (S[:, CH_MAT.start + 1] + 1)
+        return m
+
 
 # ── genome ──
 
@@ -190,11 +200,30 @@ def decode(g):
     return seed, p, ctrl
 
 
+def _n_w(c):
+    return (2 * c + N_CUE) * HID + HID + HID * c + c
+
+
 def upgrade(g):
-    """Genome from before later physics genes were appended: new genes off (0)."""
+    """Genome from before later physics genes or state channels were added: new
+    genes off (0); weights into and out of new channels 0, so the old form grows,
+    and renders, unchanged."""
     g = np.asarray(g, dtype=float)
-    old = len(g) - N_W
-    return np.concatenate([g[:old], np.zeros(D_PHYS - old), g[old:]])
+    c = next(c for c in (C, 16) if 0 < len(g) - _n_w(c) <= D_PHYS)
+    d = len(g) - _n_w(c)
+    w = g[d:]
+    if c != C:
+        W1 = w[:(2 * c + N_CUE) * HID].reshape(2 * c + N_CUE, HID)
+        k = W1.size
+        b1, W2, b2 = w[k:k + HID], w[k + HID:k + HID + HID * c].reshape(HID, c), w[k + HID + HID * c:]
+        # New channels slot in after the old fixed ones, ahead of the hidden ones.
+        o, a = 13, C - c
+        pad = lambda x, axis: np.insert(x, [o] * a, 0.0, axis=axis)
+        # NCA scales W1 by 1/sqrt(inputs); keep the effective weights.
+        W1 = np.concatenate([pad(W1[:c], 0), pad(W1[c:2 * c], 0), W1[2 * c:]]) \
+            * math.sqrt(P_IN / (2 * c + N_CUE))
+        w = np.concatenate([W1.ravel(), b1, pad(W2, 1).ravel(), pad(b2, 0)])
+    return np.concatenate([g[:d], np.zeros(D_PHYS - d), w])
 
 
 def random(n, rng):

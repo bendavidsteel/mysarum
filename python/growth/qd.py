@@ -223,7 +223,7 @@ def main(cfg: DictConfig):
                 # x | y | angled | top, the first three as scored.
                 Image.fromarray(np.concatenate(r["views"] + [r["top"]], 1)).save(f"{run}/imgs/{i}.jpg", quality=88)
                 np.savez_compressed(f"{run}/meshes/{i}.npz", pos=r["pos"], faces=r["faces"],
-                                    **({"color": r["color"]} if "color" in r else {}))
+                                    **{k: r[k] for k in ("color", "material") if k in r})
             rows.append(row)
         n_done = len(rows)
         alive = [r for r in rows if not r["dead"]]

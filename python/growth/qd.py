@@ -144,6 +144,9 @@ def map_montage(elite, grid, run, path, tile=96):
 
 @hydra.main(version_base=None, config_path="conf", config_name="qd")
 def main(cfg: DictConfig):
+    # Before dgrow is imported: it initialises Warp, which opens a CUDA context on
+    # every visible device. Workers set their own GPU in a fresh process.
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.judge_gpu)
     from dgrow.evaluate import GENOMES
     from dgrow.judge import Judge
 
@@ -158,7 +161,6 @@ def main(cfg: DictConfig):
     procs = [ctx.Process(target=worker, args=(g, cfg, inq, outq), daemon=True) for g in cfg.gpus]
     for p in procs:
         p.start()
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.judge_gpu)
     judge = Judge(device="cuda")
 
     rows, embs = [], {}

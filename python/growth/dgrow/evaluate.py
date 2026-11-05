@@ -161,6 +161,10 @@ def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
                               [c["gain"] for c in ctrl], device=sim.dev))
     n = len(genomes)
     stop_tick = np.full(n, max_ticks)
+    # A stopped individual settles for `relax` substeps, then leaves the batch
+    # (Sim.retire) so the stragglers don't keep paying for it.
+    settle = max(1, relax // substeps)
+    retire_at, final = {}, {}
     t0 = time.time()
     for it in range(max_ticks):
         sim.step(dt)
@@ -170,22 +174,27 @@ def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
             # Growing meshes fragment torch's cache until Warp can't allocate; hand it back.
             torch.cuda.empty_cache()
             full = torch.tensor(sim.counts(), device=sim.dev) >= int(0.97 * max_verts)
-            stopped = full | sim.dead
-            newly = stopped.cpu().numpy() & (stop_tick == max_ticks)
-            stop_tick[newly] = it
-            sim.active = torch.where(stopped, 0.0, sim.active)
-            if bool(stopped.all()):
-                break
-    # Let the last growth settle before measuring.
-    sim.active.zero_()
-    for _ in range(relax // substeps):
-        sim.step(dt)
+            stopped = (full | sim.dead).cpu().numpy()
+            for i in np.nonzero(stopped & (stop_tick == max_ticks))[0]:
+                stop_tick[i] = it
+                retire_at[int(i)] = it + settle
+            sim.active = torch.where(torch.as_tensor(stopped, device=sim.dev), 0.0, sim.active)
+        due = [i for i, t in retire_at.items() if t <= it and i not in final]
+        if due:
+            final.update(sim.retire(due))
+        if len(final) == n:
+            break
+    if len(final) < n:
+        sim.active.zero_()
+        for _ in range(settle):
+            sim.step(dt)
+        final.update(sim.retire([i for i in range(n) if i not in final]))
     secs = time.time() - t0
 
     out = []
     dead = sim.dead.cpu().numpy()
     for i in range(n):
-        pos, faces, ex = sim.individual(i)
+        pos, faces, ex = final[i]
         res = dict(seed=seeds[i], dead=bool(dead[i]), n_verts=int(pos.shape[0]), floor=float(meshes[i]["pos"][:, 2].min()),
                    stop_tick=int(stop_tick[i]), secs=secs)
         if not dead[i] and torch.isfinite(pos).all():

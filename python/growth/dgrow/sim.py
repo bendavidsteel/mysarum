@@ -619,10 +619,22 @@ class Sim:
         """Per-vertex diffusion-limited flux, scaled to [0,1] per individual."""
         if self._cached("nutrient"):
             return self.vf["nutrient"]
-        floor = self.P[:, PI["ground"]] > 0
-        n = torch.nn.functional.normalize(self.vertex_normals(), dim=1)
-        q = FD.surface_flux(self.pos, self.faces, self.ind, self.n_ind, n, floor,
-                            self.P[:, PI["acc_up"]], self.cfg.field_res, self.cfg.field_pad)
+        # Only individuals still growing that use the field get a voxel cube.
+        need = (self.P[:, PI["acc_field"]] > 0) & (self.P[:, PI["accrete"]] > 0) & (self.active > 0)
+        q = torch.zeros(self.pos.shape[0], device=self.dev)
+        if need.any():
+            sub = torch.nonzero(need).squeeze(1)
+            cid = torch.full((self.n_ind,), -1, dtype=torch.long, device=self.dev)
+            cid[sub] = torch.arange(len(sub), device=self.dev)
+            vsel = need[self.ind]
+            vidx = torch.nonzero(vsel).squeeze(1)
+            remap = torch.full((self.pos.shape[0],), -1, dtype=torch.long, device=self.dev)
+            remap[vidx] = torch.arange(len(vidx), device=self.dev)
+            faces = remap[self.faces[vsel[self.faces[:, 0]]]]
+            n = torch.nn.functional.normalize(self.vertex_normals()[vidx], dim=1)
+            q[vidx] = FD.surface_flux(self.pos[vidx], faces, cid[self.ind[vidx]], len(sub), n,
+                                      self.P[sub, PI["ground"]] > 0, self.P[sub, PI["acc_up"]],
+                                      self.cfg.field_res, self.cfg.field_pad)
         q = self.smooth(q, 2)
         top = torch.zeros(self.n_ind, device=self.dev).scatter_reduce(0, self.ind, q, "amax")
         self.vf["nutrient"] = q / top.clamp(min=1e-9)[self.ind]
@@ -918,8 +930,24 @@ class Sim:
             if c > best.get(i, (0, -1))[0]:
                 best[i] = (c, k)
         keep = np.isin(pair, [k for _, k in best.values()])
-        faces = faces[torch.as_tensor(keep, device=self.dev)]
-        # Drop vertices no face uses; the remap is monotone, so edge keys stay sorted.
+        self._compact(faces[torch.as_tensor(keep, device=self.dev)])
+
+    def retire(self, ids):
+        """Take finished individuals out of the batch: {i: individual(i)} for each,
+        then drop their vertices so the rest step without carrying them."""
+        out = {int(i): self.individual(int(i)) for i in ids}
+        gone = torch.zeros(self.n_ind, dtype=torch.bool, device=self.dev)
+        gone[torch.as_tensor(list(out), device=self.dev)] = True
+        self.active = torch.where(gone, 0.0, self.active)
+        keep = ~gone[self.ind[self.faces[:, 0]]]
+        if keep.any():  # nothing left to step once the last one goes
+            self._compact(self.faces[keep])
+        return out
+
+    def _compact(self, faces):
+        """Keep only `faces`; drop vertices no face uses. The remap is monotone, so
+        edge keys stay sorted."""
+        N = self.pos.shape[0]
         used = torch.zeros(N, dtype=torch.bool, device=self.dev)
         used[faces.reshape(-1)] = True
         idx = torch.nonzero(used).squeeze(1)

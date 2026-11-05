@@ -1,15 +1,20 @@
-"""CVT-MAP-Elites over growth genomes, with image-embedding descriptors.
+"""MAP-Elites over growth genomes on a 2-D UMAP of image embeddings.
 
-Descriptor = PCA of DINOv2 embeddings of the angled + top renders (refit on the
-whole history every `refit_every` evaluations, then the archive is rebuilt),
-plus `struct_dims` structural descriptors (log finger count, log aspect;
-evaluate.structure) z-scored over the history and scaled by `struct_w`, so
-branching forms keep cells of their own before the judge rewards them.
+Descriptor = UMAP of the DINOv2 embeddings of the angled + top renders, cut
+into a `grid` x `grid` lattice whose axes span the 1st-99th percentile of the
+fitted points (outliers land in the edge cells). UMAP is refit on the whole
+history every `refit_every` evaluations and the archive rebuilt; in between,
+new forms are placed with UMAP's transform. Neighbouring cells hold forms that
+look alike, so niches follow visual kinds rather than PCA's colour/size axes.
 Fitness = how specifically the judge (CLIP × SigLIP 2, dgrow.judge) thinks the
 renders are a real organism (mean over the floored x, y and angled views that
 imitation scores), discounted for limbs thinner than the mesh resolves
-(evaluate.thin_factor) and averaged over `reps` growths of the genome (different random draws); the replicate
-nearest that mean stands for the genome in the archive.
+(evaluate.thin_factor). Its label term is relative: the judge's confidence in a
+form's top label over that label's `label_q` quantile in the history (at least
+`label_floor`), so easy labels like lettuce coral don't outscore every other
+kind and a form that is the best of a rare kind scores well. Averaged over
+`reps` growths of the genome (different random draws); the replicate nearest
+that mean stands for the genome in the archive.
 One grower process per GPU; the judge runs in the main process.
 
     uv run python qd.py                       # -> outputs/qd_<timestamp>/
@@ -29,8 +34,6 @@ import polars as pl
 import torch.multiprocessing as mp
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image, ImageDraw
-from sklearn.cluster import KMeans
-from sklearn.decomposition import PCA
 
 
 def worker(gpu, cfg, inq, outq):
@@ -49,37 +52,32 @@ def worker(gpu, cfg, inq, outq):
         outq.put((bid, ids, genomes, res))
 
 
-STRUCT = ["fingers", "aspect"]
-
-
-def struct_vec(r):
-    return np.array([np.log(r.get("fingers", 1)), r.get("aspect", 0.0)])
-
-
 class Archive:
-    def __init__(self, n_cells, dims, struct_dims=0, struct_w=1.0, seed=0):
-        self.n_cells, self.dims, self.seed = n_cells, dims, seed
-        self.sd, self.sw = struct_dims, struct_w
-        rng = np.random.default_rng(seed)
-        z = rng.normal(size=(40 * n_cells, dims + struct_dims))
-        z = z[np.abs(z).max(1) < 2.5]
-        self.centroids = KMeans(n_cells, n_init=1, random_state=seed).fit(z).cluster_centers_
-        self.pca = None
+    def __init__(self, grid, n_neighbors, min_dist, seed=0):
+        self.grid, self.nn, self.md, self.seed = grid, n_neighbors, min_dist, seed
+        self.umap = None
 
-    def fit(self, emb, st):
-        self.pca = PCA(self.dims, whiten=True, random_state=self.seed).fit(emb)
-        self.s_mu, self.s_sd = st.mean(0), st.std(0) + 1e-6
+    @staticmethod
+    def _unit(emb):
+        # Euclidean on unit vectors ranks like cosine.
+        return emb / np.linalg.norm(emb, axis=1, keepdims=True)
 
-    def cells(self, emb, st):
-        z = self.pca.transform(emb)
-        if self.sd:
-            z = np.concatenate([z, self.sw * (st[:, :self.sd] - self.s_mu[:self.sd]) / self.s_sd[:self.sd]], 1)
-        d = ((z[:, None, :] - self.centroids[None]) ** 2).sum(-1)
-        return d.argmin(1), z
+    def fit(self, emb):
+        from cuml.manifold import UMAP
+        self.umap = UMAP(n_components=2, n_neighbors=self.nn, min_dist=self.md, random_state=self.seed)
+        z = np.asarray(self.umap.fit_transform(self._unit(emb).astype(np.float32)))
+        self.lo, self.hi = np.percentile(z, 1, 0), np.percentile(z, 99, 0)
+        return z
 
-    def build(self, ids, emb, st, fit):
-        """cell -> (id, fitness) keeping the fittest per cell."""
-        cells, z = self.cells(emb, st)
+    def cells(self, emb=None, z=None):
+        if z is None:
+            z = np.asarray(self.umap.transform(self._unit(emb).astype(np.float32)))
+        g = (((z - self.lo) / (self.hi - self.lo)).clip(0, 1 - 1e-9) * self.grid).astype(int)
+        return g[:, 0] * self.grid + g[:, 1], z
+
+    def build(self, ids, emb, fit):
+        """Refit, then cell -> (id, fitness) keeping the fittest per cell."""
+        cells, z = self.cells(z=self.fit(emb))
         elite = {}
         for i, c, f in zip(ids, cells, fit):
             if c not in elite or f > elite[c][1]:
@@ -87,21 +85,36 @@ class Archive:
         return elite, dict(zip(map(int, ids), map(int, cells))), z
 
 
-def fitness(r):
+def fitness(r, ref):
+    """ref: label -> reference confidence for the relative label term (see module doc)."""
     # Imported here: dgrow initialises Warp, which must not happen before a worker
     # has picked its GPU (spawned workers re-import this module).
     from dgrow.evaluate import thin_factor
-    return (0.5 * r["organic"] + 0.5 * r["label_p"]) * thin_factor(r.get("thin", 0.0))
+    rel = min(1.0, r["label_p"] / ref.get(r["label"], ref[None]))
+    return (0.5 * r["organic"] + 0.5 * rel) * thin_factor(r.get("thin", 0.0))
 
 
-def representative(reps):
+SCORES = ("dead", "organic", "label", "label_p", "thin")
+
+
+def representative(reps, ref):
     """(replicate nearest the mean fitness, mean fitness, per-replicate fitness); dead reps count 0."""
-    fits = [fitness(r) if not r["dead"] else 0.0 for r in reps]
+    fits = [fitness(r, ref) if not r["dead"] else 0.0 for r in reps]
     alive = [i for i, r in enumerate(reps) if not r["dead"]]
     if not alive:
         return reps[0], -1.0, fits
     m = float(np.mean(fits))
     return reps[min(alive, key=lambda i: abs(fits[i] - m))], m, fits
+
+
+def label_refs(rows, q, floor):
+    """label -> max(floor, q-quantile of label_p over live replicates with that label); None -> floor."""
+    reps = [r for row in rows for r in row["reps"] if not r["dead"]]
+    ref = {None: floor}
+    if reps:
+        df = pl.DataFrame(reps).group_by("label").agg(pl.col("label_p").quantile(q))
+        ref.update({k: max(floor, v) for k, v in df.iter_rows()})
+    return ref
 
 
 def montage(rows, run, path, cols=6, tile=256):
@@ -119,14 +132,14 @@ def montage(rows, run, path, cols=6, tile=256):
     im.save(path)
 
 
-def farthest(z, k, rng):
-    sel = [int(rng.integers(len(z)))]
-    d = ((z - z[sel[0]]) ** 2).sum(1)
-    while len(sel) < min(k, len(z)):
-        i = int(d.argmax())
-        sel.append(i)
-        d = np.minimum(d, ((z - z[i]) ** 2).sum(1))
-    return sel
+def map_montage(elite, grid, run, path, tile=96):
+    """The archive laid out as its grid: each cell's elite, angled view."""
+    im = Image.new("RGB", (grid * tile, grid * tile), (235, 236, 238))
+    for c, (i, _) in elite.items():
+        t = Image.open(f"{run}/imgs/{i}.jpg")
+        t = t.crop((2 * t.height, 0, 3 * t.height, t.height)).resize((tile, tile))
+        im.paste(t, ((c // grid) * tile, (grid - 1 - c % grid) * tile))
+    im.save(path)
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="qd")
@@ -149,7 +162,8 @@ def main(cfg: DictConfig):
     judge = Judge(device="cuda")
 
     rows, embs = [], {}
-    archive = Archive(cfg.n_cells, cfg.dims, cfg.struct_dims, cfg.struct_w, cfg.seed)
+    archive = Archive(cfg.grid, cfg.umap_neighbors, cfg.umap_min_dist, cfg.seed)
+    ref = {None: cfg.label_floor}
     elite, next_id, next_bid, in_flight = {}, 0, 0, 0
     last_refit = 0
     t0 = time.time()
@@ -173,18 +187,20 @@ def main(cfg: DictConfig):
         in_flight += 1
 
     def rebuild():
+        """Refresh the label references, rescore the history, refit UMAP, rebuild."""
+        nonlocal ref
+        ref = label_refs(rows, cfg.label_q, cfg.label_floor)
+        for r in rows:
+            r["fitness"] = representative(r["reps"], ref)[1]
         ok = [r for r in rows if not r["dead"]]
         ids = [r["id"] for r in ok]
-        E = np.stack([embs[i] for i in ids])
-        St = np.stack([struct_vec(r) for r in ok])
-        archive.fit(E, St)
-        el, cell_of, z = archive.build(ids, E, St, [r["fitness"] for r in ok])
+        el, cell_of, z = archive.build(ids, np.stack([embs[i] for i in ids]), [r["fitness"] for r in ok])
         for r, zz in zip(ok, z):
             r["cell"], r["z"] = cell_of[r["id"]], zz.tolist()
         return el
 
     def save():
-        df = pl.DataFrame([{k: v for k, v in r.items() if k != "z"} for r in rows])
+        df = pl.DataFrame([{k: v for k, v in r.items() if k not in ("z", "reps")} for r in rows])
         df.write_parquet(f"{run}/evals.parquet", compression="zstd")
         ids = sorted(embs)
         if not ids:
@@ -192,12 +208,13 @@ def main(cfg: DictConfig):
         np.savez_compressed(f"{run}/embeddings.npz", ids=np.array(ids), dino=np.stack([embs[i] for i in ids]))
         with open(f"{run}/archive.json", "w") as fh:
             json.dump({str(c): v for c, v in elite.items()}, fh)
+        with open(f"{run}/label_refs.json", "w") as fh:
+            json.dump({str(k): v for k, v in ref.items()}, fh)
         er = [next(r for r in rows if r["id"] == e[0]) for e in elite.values()]
         er.sort(key=lambda r: -r["fitness"])
         if er:
             montage(er[:36], run, f"{run}/top.png")
-            z = np.array([r["z"] for r in er])
-            montage([er[i] for i in farthest(z, 36, np.random.default_rng(0))], run, f"{run}/diverse.png")
+            map_montage(elite, cfg.grid, run, f"{run}/map.png")
 
     for _ in range(2 * len(procs)):
         emit()
@@ -210,13 +227,14 @@ def main(cfg: DictConfig):
         in_flight -= 1
         judge.score([r for reps in res for r in reps])
         for i, g, reps in zip(ids, genomes, res):
-            r, fit, fits = representative(reps)
+            r, fit, fits = representative(reps, ref)
             row = dict(id=i, batch=bid, genome=[float(x) for x in g], seed=r.get("seed", "?"),
                        dead=bool(r["dead"]), n_verts=r["n_verts"], stop_tick=r.get("stop_tick", -1),
                        organic=r.get("organic", 0.0), label=r.get("label", ""),
                        label_p=r.get("label_p", 0.0), error=r.get("error", ""),
                        branches=r.get("branches", 1), fingers=r.get("fingers", 1),
-                       aspect=r.get("aspect", 0.0), thin=r.get("thin", 0.0))
+                       aspect=r.get("aspect", 0.0), thin=r.get("thin", 0.0),
+                       reps=[{k: x.get(k, 0.0) for k in SCORES} for x in reps])
             row["fitness"], row["fitness_reps"] = fit, fits
             if not r["dead"]:
                 embs[i] = r["dino"]
@@ -227,21 +245,21 @@ def main(cfg: DictConfig):
             rows.append(row)
         n_done = len(rows)
         alive = [r for r in rows if not r["dead"]]
-        if n_done >= cfg.n_init and (archive.pca is None or n_done - last_refit >= cfg.refit_every):
+        if n_done >= cfg.n_init and (archive.umap is None or n_done - last_refit >= cfg.refit_every):
             elite = rebuild()
             last_refit = n_done
-        elif archive.pca is not None:
+        elif archive.umap is not None:
             new = [r for r in rows[-len(ids):] if not r["dead"]]
             if new:
-                cells, z = archive.cells(np.stack([embs[r["id"]] for r in new]),
-                                         np.stack([struct_vec(r) for r in new]))
+                cells, z = archive.cells(np.stack([embs[r["id"]] for r in new]))
                 for r, c, zz in zip(new, cells, z):
                     r["cell"], r["z"] = int(c), zz.tolist()
                     if int(c) not in elite or r["fitness"] > elite[int(c)][1]:
                         elite[int(c)] = (r["id"], r["fitness"])
         qd = sum(f for _, f in elite.values())
-        msg = (f"[{time.time() - t0:7.0f}s] evals {n_done} alive {len(alive)} cells {len(elite)}/{cfg.n_cells} "
-               f"qd {qd:.1f} best {max((f for _, f in elite.values()), default=0):.3f} "
+        labels = len({r["label"] for r in rows if r["id"] in {e[0] for e in elite.values()}})
+        msg = (f"[{time.time() - t0:7.0f}s] evals {n_done} alive {len(alive)} cells {len(elite)}/{cfg.grid ** 2} "
+               f"labels {labels} qd {qd:.1f} best {max((f for _, f in elite.values()), default=0):.3f} "
                f"batch {res[0][0].get('secs', 0):.0f}s")
         print(msg, flush=True)
         print(msg, file=log, flush=True)

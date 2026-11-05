@@ -1,8 +1,11 @@
 """Growth time-lapse mp4s: regrow genomes, snapshot every few ticks, then spin the
-finished form. The camera zooms out as the form grows and orbits slowly.
+finished form. The camera zooms out as the form grows and orbits slowly. Each
+form is filmed until it leaves the batch (evaluate.grow_batch), so the film
+ends on the settled form that the search scored.
 
     uv run python film.py --qd outputs/qd_v2 --ids 87 305 158 --out outputs/films
     uv run python film.py --results outputs/imitate_v2/*/result.json --out outputs/films
+    uv run python film.py --qd outputs/qd_v4 --ids 652 --size 1080 --spp 64 --deg 0.5 --spin 300 --elev 18
 
 A regrowth uses fresh random draws, so it can differ in detail from the archived run.
 """
@@ -67,10 +70,14 @@ def main():
     ap.add_argument("--every", type=int, default=4, help="ticks per frame")
     ap.add_argument("--size", type=int, default=640)
     ap.add_argument("--spp", type=int, default=16)
+    ap.add_argument("--deg", type=float, default=0.8, help="orbit degrees per growth frame")
+    ap.add_argument("--spin", type=int, default=120, help="frames for the closing full turn")
+    ap.add_argument("--elev", type=float, default=22.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="outputs/films")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
+    G = evaluate.GENOMES[a.genome]
     names, genomes = [], []
     if a.qd:
         df = pl.read_parquet(f"{a.qd}/evals.parquet")
@@ -82,14 +89,15 @@ def main():
         r = json.load(open(p))
         names.append(r["target"].split(" ", 1)[-1].replace(" ", "_"))
         genomes.append(r["genome"])
+    genomes = [G.upgrade(g) if len(g) != G.D else g for g in map(np.asarray, genomes)]
     shots = [[] for _ in genomes]
 
     def record(sim, t):
         if t % a.every:
             return
         for i in range(len(genomes)):
-            # Stop recording an individual once it has stopped growing.
-            if bool(sim.active[i] > 0) or not shots[i]:
+            # Until it has settled and left the batch (Sim.retire).
+            if bool((sim.ind == i).any()):
                 shots[i].append(snapshot(sim, i))
 
     res = evaluate.grow_batch(np.array(genomes), max_verts=a.max_verts, max_ticks=a.max_ticks,
@@ -98,7 +106,7 @@ def main():
         if r["dead"]:
             print(name, "died", flush=True)
             continue
-        film(fr, r["floor"], f"{a.out}/{name}.mp4", a.size, a.spp)
+        film(fr, r["floor"], f"{a.out}/{name}.mp4", a.size, a.spp, a.deg, a.spin, a.elev)
         print(name, len(fr), "frames", flush=True)
 
 

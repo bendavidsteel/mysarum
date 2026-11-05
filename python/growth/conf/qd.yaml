@@ -1,19 +1,20 @@
 genome: param   # param | nca
 n_evals: 100000
 max_hours: 10.5
-n_init: 256
+n_init: 512
 batch: 16       # genomes per job; each is grown `reps` times
-reps: 2
+reps: 1
 gpus: [0, 1]
 judge_gpu: 0
-n_cells: 400
-dims: 5
-struct_dims: 2   # finger count, aspect (qd.py STRUCT)
-struct_w: 1.0
+grid: 24        # cells per UMAP axis
+umap_neighbors: 15
+umap_min_dist: 0.3
+label_q: 0.9     # relative label term: label_p over this quantile of its label ...
+label_floor: 0.3 # ... but never over less than this
 refit_every: 1024
 sigma: 0.08
 p_cross: 0.5
-max_verts: 40000
+max_verts: 20000
 max_ticks: 1000
 render_size: 384
 save_every: 4

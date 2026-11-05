@@ -8,7 +8,9 @@ requires-python = ">=3.11,<3.13"
 dependencies = [
     "torch==2.6.0", "warp-lang==1.9.1", "numpy", "scipy", "matplotlib", "pillow",
     "imageio", "imageio-ffmpeg", "hydra-core", "tqdm", "transformers", "polars",
-    "scikit-learn", "cma",
+    "cma", "cuml-cu12==25.10.*",
+    # cuml 25.10 breaks on newer scikit-learn (BaseEstimator API).
+    "scikit-learn<1.7",
 ]
 
 [[tool.uv.index]]

@@ -34,18 +34,22 @@ judged from renders by image models.
   (distance, curvature, height, normal, boundary, noise, light), plus fixed
   per-channel diffusion. Channel 0 → growth rate, 1 → anisotropy along ∇d,
   2 → spontaneous curvature, 3–5 → surface RGB, 6 → phototropism (anisotropic
-  growth along the light direction projected into each face). Attach with
+  growth along the light direction projected into each face), 7–12 polarity,
+  stiffness, curl, accretion, perforation, 13–16 render material (iridescence,
+  film thickness, translucency, gloss). `nca.upgrade` pads older genomes. Attach with
   `Sim.attach_nca`. Its genome is 17 physics genes in [0,1] + ~1.2k raw MLP
   weights; seeds add `stalk`.
 - `render.py` — Warp BVH ray tracer: AO, soft key-light shadow, two-tone
-  front/back faces. `views()` = iso/side/top strip, `turntable()` = mp4/gif.
+  front/back faces; optional per-vertex material (thin-film iridescence,
+  transmitted light through thin tissue, gloss coat). `views()` = iso/side/top strip, `turntable()` = mp4/gif.
 - `presets.py` — seed meshes + hand-built presets after real organisms
   (lettuce, kale, saddle, hyperbolic, trumpet, brain, turing, coral).
 - `genome.py` — 18 genes in [0,1] → (seed shape, `Params`); gated genes switch
   mechanisms fully off in the lower part of their range. `qd.py genome=nca` /
   `imitate.py --genome nca` use `nca.py`'s genome instead.
-- `evaluate.py` — grow a batch of genomes until each hits its vertex budget,
-  relax, render iso + top. `grow_reps` grows each genome several times (QD
+- `evaluate.py` — grow a batch of genomes until each hits its vertex budget;
+  each settles, then leaves the batch (`Sim.retire`) so stragglers don't keep
+  paying for finished meshes; render the scored views + top. `grow_reps` grows each genome several times (QD
   `reps`, imitation `--reps`) and searches score the mean, since NCA forms
   can depend on the random draw.
 - `judge.py` — DINOv2-small embeddings (descriptors) and CLIP ViT-L/14
@@ -59,7 +63,7 @@ Units: lengths are in initial edge lengths (split at 1.4, floor 0.4).
 # Presets side by side (overrides after ':'), montage in --out
 uv run python explore.py brain coral lettuce:k_bend=6 --out outputs/explore
 
-# CVT-MAP-Elites, one grower process per GPU, judge in the main process
+# MAP-Elites on a UMAP grid (cuml), one grower process per GPU, judge in the main process
 uv run python qd.py out=outputs/qd max_hours=10.5
 
 # Evolve toward a text target or a folder of photos, seeded from a QD run
@@ -71,9 +75,10 @@ uv run python imitate.py --refs ~/photos/morels --qd outputs/qd
 ```
 
 QD writes `evals.parquet` (every evaluation), `embeddings.npz`,
-`archive.json` (cell → id, fitness), `imgs/<id>.jpg`, `meshes/<id>.npz`, and
-`top.png` / `diverse.png` montages. The descriptor PCA is refit on the whole
-history every `refit_every` evals and the archive rebuilt.
+`archive.json` (cell → id, fitness), `label_refs.json`, `imgs/<id>.jpg`,
+`meshes/<id>.npz`, and `top.png` / `map.png` (the archive grid) montages. The
+descriptor UMAP is refit on the whole history every `refit_every` evals and
+the archive rebuilt.
 
 `printability.py` (overhang / layers / support volume, pure NumPy) is not
 wired in yet; it is meant as an extra QD fitness term for 3D-printable forms.
@@ -84,7 +89,8 @@ Runs on a remote 2-GPU box (RTX 3090s) from a git checkout of this repo:
 push here, `git pull` there; its `outputs` is a symlink to the run data.
 uv only. Its driver is CUDA 12.5, so `pyproject.toml`
 pins torch 2.6.0 from the cu124 index and warp-lang 1.9.1 (newer warp wheels
-need a CUDA 13 driver). Models download from Hugging Face on first use; set
+need a CUDA 13 driver); cuml 25.10 needs scikit-learn < 1.7. Home is near its
+quota: `uv cache prune` frees space. Models download from Hugging Face on first use; set
 `HF_HUB_OFFLINE=1` for long runs.
 
 ## Tuning notes

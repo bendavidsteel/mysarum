@@ -1,0 +1,15 @@
+[project]
+name = "gra"
+version = "0.1.0"
+description = "Graph cellular automata in JAX: parameter search and grown swimmers"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "jax[cuda12]",
+    "numpy",
+    "matplotlib",
+    "networkx",
+    "hydra-core",
+    "tqdm",
+    "imageio",
+    "imageio-ffmpeg",
+]

@@ -1,0 +1,652 @@
+"""Grown swimmers: GRA bodies that grow to a steady topology, then swim.
+
+grow:  MAP-Elites over GRA params for bodies whose topology stops changing on
+       its own. Node positions are relaxed with springs + repulsion as they grow.
+swim:  topology and GRA states are frozen. A K-channel continuous CA runs on the
+       nodes, with channels mixing only across edges, and sets each edge's
+       rest length. The body moves through a drag fluid; fitness is net
+       centre-of-mass travel.
+render: mp4s of growth and swimming.
+
+    uv run python swim.py grow --gens 30
+    uv run python swim.py swim --gens 60
+    uv run python swim.py render
+"""
+
+import argparse
+import pickle
+import time
+from pathlib import Path
+from typing import NamedTuple
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+import sim
+
+N = 256
+sim.MAX_NODES = N
+D = sim.MAX_DEGREE
+TOPO_EVERY = sim.TOPO_EVERY
+
+OUT = Path(__file__).parent / "outputs" / "swim"
+
+
+# ── Growth with layout ───────────────────────────────────────────────────────
+
+def _gather(nbrs, deg, active):
+    safe = jnp.clip(nbrs, 0, N - 1)
+    valid = ((jnp.arange(D)[None] < deg[:, None]) & (nbrs >= 0)
+             & active[safe] & active[:, None])
+    return safe, valid
+
+
+def relax(pos, nbrs, deg, active, dt=0.05, k=2.0, charge=0.3):
+    """Overdamped spring + long-range repulsion step (unit rest length)."""
+    safe, valid = _gather(nbrs, deg, active)
+    d = pos[safe] - pos[:, None]
+    dist = jnp.sqrt((d ** 2).sum(-1) + 1e-6)
+    f = (k * valid * (dist - 1.0) / dist)[..., None] * d
+    f = f.sum(1)
+    diff = pos[:, None] - pos[None]
+    r2 = (diff ** 2).sum(-1)
+    pair = active[:, None] & active[None]
+    f = f + charge * ((pair / (1.0 + r2))[..., None] * diff).sum(1)
+    step = dt * f
+    norm = jnp.sqrt((step ** 2).sum(-1, keepdims=True) + 1e-12)
+    step = step * jnp.minimum(1.0, 0.2 / norm)
+    return jnp.where(active[:, None], pos + step, pos)
+
+
+def place_new(pos, prev_active, state, key):
+    """New nodes start at the mean of their already-placed neighbours."""
+    active = state.node_active
+    new = active & ~prev_active
+    safe, valid = _gather(state.neighbors, state.num_neighbors, active)
+    known = prev_active & active
+    for _ in range(3):
+        w = valid & known[safe]
+        cnt = w.sum(1)
+        mean = (pos[safe] * w[..., None]).sum(1) / jnp.maximum(cnt, 1)[:, None]
+        upd = new & ~known & (cnt > 0)
+        pos = jnp.where(upd[:, None], mean, pos)
+        known = known | upd
+    jitter = 0.3 * jax.random.normal(key, pos.shape)
+    return jnp.where(new[:, None], pos + jitter, pos)
+
+
+def grow(params, state, key, num_blocks, record=False):
+    """Run num_blocks * TOPO_EVERY GRA steps with one topology op per block."""
+    pos = jax.random.normal(key, (N, 2)) * 2.0
+
+    def inner(carry, _):
+        state, pos = carry
+        state = sim.apply_growth(state, params)
+        pos = relax(pos, state.neighbors, state.num_neighbors, state.node_active)
+        return (state, pos), None
+
+    def block(carry, b):
+        state, pos, last_change, key = carry
+        (state, pos), _ = jax.lax.scan(inner, (state, pos), None, length=TOPO_EVERY)
+        prev_active, prev_nb = state.node_active, state.neighbors
+        state = sim.apply_collapses(sim.apply_divisions(state, params), params)
+        key, k = jax.random.split(key)
+        pos = place_new(pos, prev_active, state, k)
+        changed = (jnp.any(state.neighbors != prev_nb)
+                   | jnp.any(state.node_active != prev_active))
+        last_change = jnp.where(changed, b, last_change)
+        out = (state.num_active, pos, state.node_active, state.node_states,
+               state.neighbors, state.num_neighbors) if record \
+            else state.num_active
+        return (state, pos, last_change, key), out
+
+    init = (state, pos, jnp.array(0), key)
+    (state, pos, last_change, _), trace = jax.lax.scan(
+        block, init, jnp.arange(num_blocks))
+    return state, pos, last_change, trace
+
+
+def init_states(keys, graph_idx):
+    graphs = sim.load_initial_graphs()
+    states = []
+    for k, g in zip(keys, graph_idx):
+        states.append(sim.make_init_state(k, int(g) % len(graphs)))
+    return jax.tree.map(lambda *x: jnp.stack(x), *states)
+
+
+def mutate_params(params, key, scale=0.1):
+    leaves, tree = jax.tree.flatten(params)
+    ks = jax.random.split(key, len(leaves))
+    leaves = [v + jax.random.normal(k, v.shape) * scale * jnp.maximum(jnp.abs(v).mean(), 0.01)
+              for v, k in zip(leaves, ks)]
+    p = jax.tree.unflatten(tree, leaves)
+    return p._replace(
+        kernel_mu=jnp.clip(p.kernel_mu, 0.0, 18.0),
+        kernel_sigma=jnp.clip(p.kernel_sigma, 0.1, 4.0),
+        growth_mu=jnp.clip(p.growth_mu, 0.0, 1.0),
+        growth_sigma=jnp.clip(p.growth_sigma, 0.05, 1.0),
+        state_dt=jnp.clip(p.state_dt, 0.001, 0.2),
+        div_mu=jnp.clip(p.div_mu, 0.0, 1.0),
+        div_sigma=jnp.clip(p.div_sigma, 0.05, 1.0),
+        div_threshold=jnp.clip(p.div_threshold, 0.3, 0.99),
+        div_prob=jnp.clip(p.div_prob, 0.0001, 0.05),
+        death_mu=jnp.clip(p.death_mu, 0.0, 1.0),
+        death_sigma=jnp.clip(p.death_sigma, 0.05, 1.0),
+        death_threshold=jnp.clip(p.death_threshold, 0.3, 0.99),
+        death_prob=jnp.clip(p.death_prob, 0.0001, 0.05),
+    )
+
+
+# ── Bodies: host-side cleanup of a grown graph ───────────────────────────────
+
+class Body(NamedTuple):
+    pos: np.ndarray     # (N, 2)
+    active: np.ndarray  # (N,) bool
+    nbrs: np.ndarray    # (N, D) int32, -1 empty
+    deg: np.ndarray     # (N,) int32
+    gra: np.ndarray     # (N, 3) frozen GRA channel states
+
+
+def extract_body(pos, active, nbrs, deg, gra):
+    """Largest connected component, mutual edges only, reindexed from 0.
+
+    Edges must be mutual or spring forces don't cancel and the body can push
+    itself along through its own bookkeeping.
+    """
+    import networkx as nx
+    g = nx.Graph()
+    idx = np.nonzero(active)[0]
+    g.add_nodes_from(idx)
+    for i in idx:
+        for j in nbrs[i, :deg[i]]:
+            if j >= 0 and j != i and active[j] and i in nbrs[j, :deg[j]]:
+                g.add_edge(int(i), int(j))
+    if g.number_of_nodes() == 0:
+        return None
+    comp = sorted(max(nx.connected_components(g), key=len))
+    remap = {old: new for new, old in enumerate(comp)}
+    n = len(comp)
+    b_nbrs = np.full((N, D), -1, np.int32)
+    b_deg = np.zeros(N, np.int32)
+    for old in comp:
+        i = remap[old]
+        for j in g.neighbors(old):
+            b_nbrs[i, b_deg[i]] = remap[j]
+            b_deg[i] += 1
+    b_pos = np.zeros((N, 2), np.float32)
+    b_pos[:n] = pos[comp] - pos[comp].mean(0)
+    b_gra = np.zeros((N, 3), np.float32)
+    b_gra[:n] = gra[comp]
+    return Body(b_pos, np.arange(N) < n, b_nbrs, b_deg, b_gra)
+
+
+def body_shape(body):
+    p = body.pos[body.active]
+    ev = np.sort(np.linalg.eigvalsh(np.cov(p.T)))
+    aspect = float(np.sqrt(ev[1] / max(ev[0], 1e-6)))
+    return int(body.active.sum()), aspect
+
+
+# ── Stage 1: grower search ───────────────────────────────────────────────────
+
+N_BINS = np.geomspace(16, N, 11)
+ASPECT_BINS = np.geomspace(1.0, 6.0, 9)
+
+
+def cell_of(n, aspect):
+    i = int(np.clip(np.searchsorted(N_BINS, n) - 1, 0, len(N_BINS) - 2))
+    j = int(np.clip(np.searchsorted(ASPECT_BINS, aspect) - 1, 0, len(ASPECT_BINS) - 2))
+    return i, j
+
+
+def run_grow(args):
+    OUT.mkdir(parents=True, exist_ok=True)
+    B, blocks = args.batch, args.blocks
+    steady_blocks = args.steady_blocks
+    rng = jax.random.PRNGKey(args.seed)
+    grow_b = jax.jit(jax.vmap(lambda p, s, k: grow(p, s, k, blocks)[:3]))
+
+    archive = {}  # cell -> dict(fitness, params, seed, graph, body)
+    t0 = time.time()
+    for gen in range(args.gens):
+        rng, kp, ks, kg, km = jax.random.split(rng, 5)
+        elites = list(archive.values())
+        if gen < 2 or not elites:
+            params = jax.vmap(sim.sample_params)(jax.random.split(kp, B))
+            seeds = np.array(jax.random.randint(ks, (B,), 0, 2**30))
+            graph = np.array(jax.random.randint(kg, (B,), 0, 14))
+        else:
+            pick = np.random.default_rng(gen).integers(0, len(elites), B)
+            parents = jax.tree.map(lambda *x: jnp.stack(x), *[elites[i]["params"] for i in pick])
+            params = jax.vmap(mutate_params)(parents, jax.random.split(km, B))
+            seeds = np.array([elites[i]["seed"] for i in pick])
+            graph = np.array([elites[i]["graph"] for i in pick])
+            reseed = np.random.default_rng(gen + 1).random(B) < 0.3
+            seeds = np.where(reseed, np.array(jax.random.randint(ks, (B,), 0, 2**30)), seeds)
+        keys = jax.vmap(jax.random.PRNGKey)(jnp.array(seeds))
+        states = init_states(keys, graph)
+        state, pos, last_change = grow_b(params, states, keys)
+        state, pos, last_change = jax.device_get((state, pos, last_change))
+
+        n_new = 0
+        for b in range(B):
+            n_raw = int(state.num_active[b])
+            if n_raw < 16 or n_raw > N - 8:
+                continue
+            body = extract_body(pos[b], state.node_active[b], state.neighbors[b],
+                                state.num_neighbors[b], state.node_states[b])
+            if body is None or body.active.sum() < 16:
+                continue
+            n, aspect = body_shape(body)
+            steady = blocks - 1 - int(last_change[b])
+            fitness = min(steady / steady_blocks, 1.0) + 0.001 * n
+            cell = cell_of(n, aspect)
+            if cell not in archive or archive[cell]["fitness"] < fitness:
+                archive[cell] = dict(
+                    fitness=fitness, steady=steady >= steady_blocks,
+                    params=jax.tree.map(lambda x: np.asarray(x[b]), params),
+                    seed=int(seeds[b]), graph=int(graph[b]), body=body._asdict(), n=n, aspect=aspect)
+                n_new += 1
+        n_steady = sum(e["steady"] for e in archive.values())
+        print(f"gen {gen:3d}  cells {len(archive):3d}  steady {n_steady:3d}  "
+              f"new {n_new:3d}  {time.time() - t0:6.0f}s", flush=True)
+        with open(OUT / "growers.pkl", "wb") as f:
+            pickle.dump(dict(archive=archive, blocks=blocks), f)
+
+
+# ── Stage 2: a continuous CA drives the muscles ──────────────────────────────
+
+K = 4  # channels of the muscle CA
+
+
+class Genome(NamedTuple):
+    A: jnp.ndarray       # (K, K) neighbour channel -> channel (the only cross-channel path)
+    a_self: jnp.ndarray  # (K,)   per-channel self feedback within a node
+    U: jnp.ndarray       # (K, 3) frozen GRA channels -> bias
+    b: jnp.ndarray       # (K,)
+    log_tau: jnp.ndarray # (K,)
+    r: jnp.ndarray       # (K,)   channels -> muscle drive
+    r0: jnp.ndarray      # ()
+    amp: jnp.ndarray     # ()     max fractional change of rest length
+
+
+def sample_genome(key):
+    k = jax.random.split(key, 8)
+    u = lambda kk, shape, lo, hi: lo + (hi - lo) * jax.random.uniform(kk, shape)
+    return Genome(
+        A=u(k[0], (K, K), -12.0, 12.0),
+        a_self=u(k[1], (K,), -6.0, 6.0),
+        U=u(k[2], (K, 3), -6.0, 6.0),
+        b=u(k[3], (K,), -6.0, 3.0),
+        log_tau=u(k[4], (K,), -1.0, 1.0),
+        r=u(k[5], (K,), -1.0, 1.0),
+        r0=u(k[6], (), -1.0, 1.0),
+        amp=u(k[7], (), 0.1, 0.4),
+    )
+
+
+def mutate_genome(g, key, scale=0.15):
+    leaves, tree = jax.tree.flatten(g)
+    ks = jax.random.split(key, len(leaves))
+    leaves = [v + jax.random.normal(k, v.shape) * scale * jnp.maximum(jnp.abs(v).mean(), 0.3)
+              for v, k in zip(leaves, ks)]
+    g = jax.tree.unflatten(tree, leaves)
+    return g._replace(log_tau=jnp.clip(g.log_tau, -1.5, 1.5), amp=jnp.clip(g.amp, 0.02, 0.45))
+
+
+DT = 0.02
+K_SPRING = 30.0
+C_INT = 1.0      # internal damping along springs
+# growth forces scaled up together, so the grown shape stays the rest shape
+CHARGE = K_SPRING * 0.3 / 2.0
+C_T, C_N, C_Q = 0.1, 1.0, 1.0  # tangential, normal linear, normal quadratic drag
+
+
+def swim(body, g, key, steps, record_every=0):
+    """Integrate the muscle CA + mass-spring body. Returns (com trace, recordings).
+
+    Every node runs the same rate rule. Channels only mix across edges, so a
+    lone node relaxes to a fixed point and any rhythm needs a loop through
+    neighbours.
+    """
+    active = body.active
+    af = active.astype(jnp.float32)
+    safe, valid = _gather(body.nbrs, body.deg, active)
+    vf = valid.astype(jnp.float32)
+    L0 = 1.0
+    bias = body.gra @ g.U.T + g.b            # (N, K)
+    tau = jnp.exp(g.log_tau)
+    deg = jnp.maximum(vf.sum(1), 1.0)
+    pair = (active[:, None] & active[None]).astype(jnp.float32)
+
+    def repulsion(p):
+        diff = p[:, None] - p[None]
+        return CHARGE * ((pair / (1.0 + (diff ** 2).sum(-1)))[..., None] * diff).sum(1)
+
+
+    def step(carry, t):
+        pos, vel, x = carry
+        nb = (x[safe] * vf[..., None]).sum(1) / deg[:, None]
+        h = nb @ g.A.T + g.a_self * x + bias
+        x = x + DT * (-x + jax.nn.sigmoid(h)) / tau
+        m = jnp.tanh(4.0 * (x - 0.5) @ g.r + g.r0)
+        act = 0.5 * (m[:, None] + m[safe])
+        rest = L0 * (1.0 + g.amp * act)
+
+        d = pos[safe] - pos[:, None]
+        dist = jnp.sqrt((d ** 2).sum(-1) + 1e-6)
+        u = d / dist[..., None]
+        dv = vel[safe] - vel[:, None]
+        f_mag = K_SPRING * (dist - rest) + C_INT * (dv * u).sum(-1)
+        f = ((vf * f_mag)[..., None] * u).sum(1) + repulsion(pos)
+
+        # resistive drag on each node from its incident edge segments
+        vt = (vel[:, None] * u).sum(-1, keepdims=True) * u
+        vn = vel[:, None] - vt
+        vn_mag = jnp.sqrt((vn ** 2).sum(-1, keepdims=True) + 1e-9)
+        drag = -(0.5 * dist * vf)[..., None] * (C_T * vt + C_N * vn + C_Q * vn_mag * vn)
+        f = f + drag.sum(1)
+
+        vel = (vel + DT * f) * af[:, None]
+        pos = pos + DT * vel
+        com = (pos * af[:, None]).sum(0) / af.sum()
+        rec = (pos, x[:, :3], act) if record_every else None
+        return (pos, vel, x), (com, rec)
+
+    x0 = jax.random.uniform(key, (N, K))
+    init = (jnp.asarray(body.pos), jnp.zeros((N, 2)), x0)
+    (pos, _, _), (com, rec) = jax.lax.scan(step, init, jnp.arange(steps))
+    return com, rec, pos
+
+
+def swim_score(com):
+    """Distance travelled after the transient, penalised for blowups."""
+    T = com.shape[0]
+    start = com[T // 5]
+    dist = jnp.sqrt(((com[-1] - start) ** 2).sum())
+    ok = jnp.all(jnp.isfinite(com))
+    return jnp.where(ok, dist, -1.0)
+
+
+def settle(growers, steps=4000):
+    """Relax each body under swim physics with muscles off; that is its rest shape."""
+    bodies = stack_bodies([g["body"] for g in growers])
+    off = jax.vmap(sample_genome)(jax.random.split(jax.random.PRNGKey(0), len(growers)))
+    off = off._replace(amp=jnp.zeros(len(growers)))
+    keys = jax.random.split(jax.random.PRNGKey(0), len(growers))
+    _, _, pos = jax.jit(jax.vmap(lambda b, g, k: swim(b, g, k, steps)))(bodies, off, keys)
+    pos = np.asarray(pos)
+    for g, p in zip(growers, pos):
+        a = g["body"]["active"]
+        g["body"] = dict(g["body"], pos=np.where(a[:, None], p - p[a].mean(0), 0.0).astype(np.float32))
+    return growers
+
+
+def stack_bodies(bodies):
+    return Body(*[jnp.asarray(np.stack([b[f] for b in bodies])) for f in Body._fields])
+
+
+def load_growers(path, min_n=16):
+    with open(path, "rb") as f:
+        arch = pickle.load(f)["archive"]
+    return [e for e in arch.values() if e["steady"] and e["n"] >= min_n]
+
+
+def run_swim(args):
+    growers = load_growers(OUT / args.growers)
+    growers.sort(key=lambda e: e["n"])
+    if args.max_bodies and len(growers) > args.max_bodies:
+        sel = np.linspace(0, len(growers) - 1, args.max_bodies).round().astype(int)
+        growers = [growers[i] for i in sel]
+    growers = settle(growers)
+    nb = len(growers)
+    per = max(args.batch // nb, 2)
+    B = nb * per
+    print(f"{nb} bodies x {per} genomes = {B} sims, {args.steps} steps each", flush=True)
+    bodies = stack_bodies([growers[i // per]["body"] for i in range(B)])
+
+    rng = jax.random.PRNGKey(args.seed)
+    rng, k = jax.random.split(rng)
+    genomes = jax.vmap(sample_genome)(jax.random.split(k, B))
+
+    @jax.jit
+    def evaluate(bodies, genomes, key):
+        keys = jax.random.split(key, B)
+        com, _, _ = jax.vmap(lambda b, g, k: swim(b, g, k, args.steps))(bodies, genomes, keys)
+        return jax.vmap(swim_score)(com)
+
+    best = [None] * nb  # (score, genome)
+    t0 = time.time()
+    for gen in range(args.gens):
+        rng, ke, km = jax.random.split(rng, 3)
+        scores = np.asarray(evaluate(bodies, genomes, ke))
+        gnp = jax.device_get(genomes)
+        for i in range(nb):
+            sl = slice(i * per, (i + 1) * per)
+            j = i * per + int(np.argmax(scores[sl]))
+            if best[i] is None or scores[j] > best[i][0]:
+                best[i] = (float(scores[j]), jax.tree.map(lambda x: x[j], gnp))
+        # next population: per body, mutate from the top quarter (elitist)
+        new = []
+        kk = jax.random.split(km, B)
+        for i in range(nb):
+            sl_scores = scores[i * per:(i + 1) * per]
+            order = np.argsort(-sl_scores)[:max(per // 4, 1)] + i * per
+            for r in range(per):
+                if r == 0:
+                    new.append(best[i][1])
+                else:
+                    src = jax.tree.map(lambda x: x[order[r % len(order)]], gnp)
+                    new.append(src)
+        genomes = jax.tree.map(lambda *x: jnp.stack(x), *new)
+        mutated = jax.vmap(mutate_genome)(genomes, kk)
+        keep = jnp.arange(B) % per == 0
+        genomes = jax.tree.map(
+            lambda a, b: jnp.where(keep.reshape((-1,) + (1,) * (a.ndim - 1)), a, b),
+            genomes, mutated)
+        top = sorted(b[0] for b in best)[::-1][:5]
+        print(f"gen {gen:3d}  best {top[0]:7.2f}  top5 {np.round(top, 1)}  "
+              f"median {np.median([b[0] for b in best]):6.2f}  {time.time() - t0:6.0f}s",
+              flush=True)
+        with open(OUT / args.out, "wb") as f:
+            pickle.dump(dict(growers=growers, best=best, steps=args.steps), f)
+
+
+# ── Rendering ────────────────────────────────────────────────────────────────
+
+def _edges(body_nbrs, body_deg, active):
+    e = []
+    for i in np.nonzero(active)[0]:
+        for s in range(body_deg[i]):
+            j = body_nbrs[i, s]
+            if j > i:
+                e.append((i, s, j))
+    return np.array(e, dtype=int).reshape(-1, 3)
+
+
+BG = "#0b0f14"
+
+
+def _simulate(grower, genome, steps):
+    body = Body(**{k: jnp.asarray(v) for k, v in grower["body"].items()})
+    g = jax.tree.map(jnp.asarray, genome)
+    com, (pos, x, act), _ = jax.jit(
+        lambda b, g: swim(b, g, jax.random.PRNGKey(0), steps, 1))(body, g)
+    active = np.asarray(body.active)
+    p0 = np.asarray(pos[0])[active]
+    return dict(com=np.asarray(com), pos=np.asarray(pos), x=np.asarray(x),
+                act=np.asarray(act), active=active,
+                edges=_edges(np.asarray(body.nbrs), np.asarray(body.deg), active),
+                extent=max(np.ptp(p0[:, 0]), np.ptp(p0[:, 1])) * 0.9 + 3.0)
+
+
+def _draw_swimmer(ax, sd, t, every, label=None):
+    """Camera follows the body; the grid is fixed in the fluid."""
+    from matplotlib.collections import LineCollection
+    import matplotlib.pyplot as plt
+    ax.clear()
+    ax.set_facecolor(BG)
+    com, pos, extent, edges, active = sd["com"], sd["pos"], sd["extent"], sd["edges"], sd["active"]
+    cx, cy = com[t]
+    ax.set_xlim(cx - extent, cx + extent)
+    ax.set_ylim(cy - extent, cy + extent)
+    gs = max(round(extent / 4), 1)
+    for gx in np.arange(np.floor((cx - extent) / gs) * gs, cx + extent, gs):
+        ax.axvline(gx, color="#1b2430", lw=0.6, zorder=0)
+    for gy in np.arange(np.floor((cy - extent) / gs) * gs, cy + extent, gs):
+        ax.axhline(gy, color="#1b2430", lw=0.6, zorder=0)
+    ax.plot(com[:t + 1:every, 0], com[:t + 1:every, 1], color="#e8c547", lw=1.0,
+            alpha=0.6, zorder=1)
+    # colour = CA channels 0-2 as RGB; edge width = muscle contraction
+    p, rgb = pos[t], 0.25 + 0.75 * np.clip(sd["x"][t], 0, 1)
+    segs = np.stack([p[edges[:, 0]], p[edges[:, 2]]], 1)
+    a = sd["act"][t][edges[:, 0], edges[:, 1]]
+    ax.add_collection(LineCollection(
+        segs, colors=0.5 * (rgb[edges[:, 0]] + rgb[edges[:, 2]]),
+        linewidths=0.5 + 2.5 * np.clip(-a, 0, 1), zorder=2))
+    ax.scatter(p[active, 0], p[active, 1], s=12, c=rgb[active], zorder=3, linewidths=0)
+    if label:
+        ax.text(0.03, 0.96, label, transform=ax.transAxes, color="#aab", fontsize=8, va="top")
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+
+def _write_video(fig, draw, frames, path, fps):
+    import imageio.v2 as imageio
+    import matplotlib.pyplot as plt
+    writer = imageio.get_writer(path, fps=fps, codec="libx264", quality=8,
+                                macro_block_size=1)
+    for t in frames:
+        draw(t)
+        fig.canvas.draw()
+        writer.append_data(np.asarray(fig.canvas.buffer_rgba())[..., :3])
+    writer.close()
+    plt.close(fig)
+
+
+def render_swimmer(grower, genome, path, steps, every=4, fps=30, size=6):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    sd = _simulate(grower, genome, steps)
+    fig, ax = plt.subplots(figsize=(size, size), dpi=120)
+    fig.patch.set_facecolor(BG)
+    fig.subplots_adjust(0, 0, 1, 1)
+    _write_video(fig, lambda t: _draw_swimmer(ax, sd, t, every),
+                 range(0, steps, every), path, fps)
+
+
+def render_gallery(entries, path, steps, cols=3, every=4, fps=30, cell=3.2):
+    """entries: list of (grower, genome, label)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    sds = [(_simulate(g, gn, steps), lab) for g, gn, lab in entries]
+    rows = (len(sds) + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(cell * cols, cell * rows), dpi=110)
+    fig.patch.set_facecolor(BG)
+    fig.subplots_adjust(0, 0, 1, 1, 0.01, 0.01)
+    axes = np.atleast_1d(axes).ravel()
+    for ax in axes[len(sds):]:
+        ax.set_facecolor(BG)
+        ax.axis("off")
+
+    def draw(t):
+        for ax, (sd, lab) in zip(axes, sds):
+            _draw_swimmer(ax, sd, t, every, lab)
+
+    _write_video(fig, draw, range(0, steps, every), path, fps)
+
+
+def render_growth(grower, blocks, path, fps=30, size=6):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+
+    params = jax.tree.map(jnp.asarray, grower["params"])
+    key = jax.random.PRNGKey(grower["seed"])
+    state = jax.tree.map(lambda x: x[0], init_states(key[None], [grower["graph"]]))
+    _, _, last_change, (n, pos, active, gra, nbrs, deg) = jax.jit(
+        lambda p, s, k: grow(p, s, k, blocks, record=True))(params, state, key)
+    pos, active, gra, nbrs, deg = map(np.asarray, (pos, active, gra, nbrs, deg))
+
+    stop = min(int(last_change) + 40, blocks)
+    pf = pos[stop - 1][active[stop - 1]]
+    c = pf.mean(0)
+    extent = max(np.ptp(pf[:, 0]), np.ptp(pf[:, 1])) * 0.6 + 2.0
+    fig, ax = plt.subplots(figsize=(size, size), dpi=120)
+    fig.patch.set_facecolor(BG)
+    fig.subplots_adjust(0, 0, 1, 1)
+
+    def draw(t):
+        ax.clear()
+        ax.set_facecolor(BG)
+        a, p = active[t], pos[t]
+        e = _edges(nbrs[t], deg[t], a)
+        e = e[active[t][nbrs[t][e[:, 0], e[:, 1]]]]
+        segs = np.stack([p[e[:, 0]], p[e[:, 2]]], 1)
+        ax.add_collection(LineCollection(segs, colors="#56657a", linewidths=0.8, zorder=1))
+        ax.scatter(p[a, 0], p[a, 1], s=14, c=np.clip(gra[t][a], 0, 1), linewidths=0, zorder=2)
+        ax.set_xlim(c[0] - extent, c[0] + extent)
+        ax.set_ylim(c[1] - extent, c[1] + extent)
+        ax.set_aspect("equal")
+        ax.axis("off")
+        ax.text(0.03, 0.96, f"step {t * TOPO_EVERY}   nodes {int(a.sum())}",
+                transform=ax.transAxes, color="#aab", fontsize=9, va="top")
+
+    frames = list(range(0, stop)) + [stop - 1] * fps
+    _write_video(fig, draw, frames, path, fps)
+
+
+def run_render(args):
+    with open(OUT / args.swimmers, "rb") as f:
+        res = pickle.load(f)
+    with open(OUT / "growers.pkl", "rb") as f:
+        blocks = pickle.load(f)["blocks"]
+    vid = OUT / "videos" / Path(args.swimmers).stem
+    vid.mkdir(parents=True, exist_ok=True)
+    order = np.argsort([-b[0] for b in res["best"]])[:args.top]
+    entries = [(res["growers"][i], res["best"][i][1],
+                f"n={res['growers'][i]['n']}  d={res['best'][i][0]:.1f}") for i in order]
+    print("rendering gallery", flush=True)
+    render_gallery(entries[:9], vid / "gallery.mp4", args.steps)
+    for rank, i in enumerate(order):
+        score, genome = res["best"][i]
+        grower = res["growers"][i]
+        name = f"{rank:02d}_n{grower['n']}_d{score:.0f}"
+        print(f"rendering {name}", flush=True)
+        render_swimmer(grower, genome, vid / f"{name}_swim.mp4", args.steps)
+        if args.growth:
+            render_growth(grower, blocks, vid / f"{name}_grow.mp4")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    g = sub.add_parser("grow")
+    g.add_argument("--gens", type=int, default=30)
+    g.add_argument("--batch", type=int, default=256)
+    g.add_argument("--blocks", type=int, default=400)
+    g.add_argument("--steady-blocks", type=int, default=150)
+    g.add_argument("--seed", type=int, default=0)
+    s = sub.add_parser("swim")
+    s.add_argument("--gens", type=int, default=60)
+    s.add_argument("--batch", type=int, default=1024)
+    s.add_argument("--steps", type=int, default=2500)
+    s.add_argument("--max-bodies", type=int, default=32)
+    s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--growers", default="growers.pkl")
+    s.add_argument("--out", default="swimmers.pkl")
+    r = sub.add_parser("render")
+    r.add_argument("--top", type=int, default=6)
+    r.add_argument("--steps", type=int, default=4000)
+    r.add_argument("--growth", action="store_true")
+    r.add_argument("--swimmers", default="swimmers.pkl")
+    args = ap.parse_args()
+    {"grow": run_grow, "swim": run_swim, "render": run_render}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()

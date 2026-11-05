@@ -9,10 +9,18 @@ JAX implementation of a Lenia-style graph cellular automaton with Chebyshev spec
 - `viz.py` — Post-search visualization: archive heatmaps, graph snapshots with networkx, metric time series.
 - `run.py` — Hydra entry point. Config in `conf/config.yaml`.
 - `graphs.json` — Seed graphs (10-12 node small graphs from the Rust implementation).
+- `swim.py` — Grown swimmers: GRAs grow until their topology stops changing, then a continuous CA on the nodes (channels mix only across edges) drives edge rest lengths in a drag fluid. Subcommands `grow`, `swim`, `render`; outputs in `outputs/swim/`.
 
 ## Running
 
+The environment is managed by uv (`uv sync`), so prefix commands with `uv run`.
+
 ```bash
+# Grown swimmers
+uv run python swim.py grow --gens 40 --batch 768
+uv run python swim.py swim --gens 100 --batch 1024
+uv run python swim.py render --top 6 --growth
+
 # Default search
 python run.py
 

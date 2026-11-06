@@ -60,7 +60,7 @@ judged from renders by image models.
   paying for finished meshes; render the scored views + top. `grow_reps` grows each genome several times (QD
   `reps`, imitation `--reps`) and searches score the mean, since NCA forms
   can depend on the random draw.
-- `judge.py` — DINOv2-small embeddings (descriptors) and CLIP ViT-L/14
+- `judge.py` — SigLIP 2 (so400m) image embeddings (descriptors) and
   organism-vs-decoy probabilities (fitness, imitation targets).
 
 Units: lengths are in initial edge lengths (split at 1.4, floor 0.4).
@@ -109,7 +109,7 @@ quota: `uv cache prune` frees space. Models download from Hugging Face on first 
 - Positive curvature feedback (`g_curv`) needs `curv_smooth` / `g_smooth`
   diffusion or it spikes at mesh scale.
 - Remeshing dominates step cost; `SimConfig.remesh_every` trades it off.
-- CLIP fitness favours clay-coloured wrinkled forms (brain, walnut); colour
+- The judge (CLIP, at least) favours clay-coloured wrinkled forms (brain, walnut); colour
   matters to it, which is why green targets like lettuce score badly on clay.
 
 Keep a minimal set of scripts; parameterize via hydra/argparse, use git for

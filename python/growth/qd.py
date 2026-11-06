@@ -1,12 +1,12 @@
 """MAP-Elites over growth genomes on a 2-D UMAP of image embeddings.
 
-Descriptor = UMAP of the DINOv2 embeddings of the angled + top renders, cut
+Descriptor = UMAP of the SigLIP 2 image embeddings of the angled + top renders, cut
 into a `grid` x `grid` lattice whose axes span the 1st-99th percentile of the
 fitted points (outliers land in the edge cells). UMAP is refit on the whole
 history every `refit_every` evaluations and the archive rebuilt; in between,
 new forms are placed with UMAP's transform. Neighbouring cells hold forms that
 look alike, so niches follow visual kinds rather than PCA's colour/size axes.
-Fitness = how specifically the judge (CLIP × SigLIP 2, dgrow.judge) thinks the
+Fitness = how specifically the judge (SigLIP 2, dgrow.judge) thinks the
 renders are a real organism (mean over the floored x, y and angled views that
 imitation scores), discounted for limbs thinner than the mesh resolves
 (evaluate.thin_factor). Its label term is relative: the judge's confidence in a
@@ -207,7 +207,7 @@ def main(cfg: DictConfig):
         ids = sorted(embs)
         if not ids:
             return
-        np.savez_compressed(f"{run}/embeddings.npz", ids=np.array(ids), dino=np.stack([embs[i] for i in ids]))
+        np.savez_compressed(f"{run}/embeddings.npz", ids=np.array(ids), emb=np.stack([embs[i] for i in ids]))
         with open(f"{run}/archive.json", "w") as fh:
             json.dump({str(c): v for c, v in elite.items()}, fh)
         with open(f"{run}/label_refs.json", "w") as fh:
@@ -239,7 +239,7 @@ def main(cfg: DictConfig):
                        reps=[{k: x.get(k, 0.0) for k in SCORES} for x in reps])
             row["fitness"], row["fitness_reps"] = fit, fits
             if not r["dead"]:
-                embs[i] = r["dino"]
+                embs[i] = r["emb"]
                 # x | y | angled | top, the first three as scored.
                 Image.fromarray(np.concatenate(r["views"] + [r["top"]], 1)).save(f"{run}/imgs/{i}.jpg", quality=88)
                 np.savez_compressed(f"{run}/meshes/{i}.npz", pos=r["pos"], faces=r["faces"],

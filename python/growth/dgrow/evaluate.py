@@ -138,7 +138,7 @@ def thin_fraction(pos, faces, max_d=1.5):
 
 def thin_factor(thin, free=0.15, scale=0.15):
     """Fitness multiplier for wire limbs. Search otherwise maxes surface tension
-    until every limb is one edge wide: a wire silhouette reads as twigs to CLIP.
+    until every limb is one edge wide: a wire silhouette reads as twigs to the judge.
     Brain-coral ridge crests come to ~0.14, wire trees to 0.4-0.7."""
     return float(np.exp(-max(0.0, thin - free) / scale))
 
@@ -225,7 +225,7 @@ def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
             # Along x and y near the horizon, plus angled from above, all on a floor at
             # the seed's base that hides anything grown below it (an ungrounded seed
             # can't pass a mirrored double as a tree). Straight down reads as nothing
-            # to CLIP, so `top` is only for DINO descriptors and contact sheets.
+            # to the judge, so `top` is only for descriptors and contact sheets.
             fz = float(meshes[i]["pos"][:, 2].min())
             res["views"] = [render.render(pos, faces, W=size, H=size, azim=a, elev=e, spp=8, ao_n=3, color=col,
                                           floor=fz, material=mat) for a, e in ((0, 5), (90, 5), (35, 30))]

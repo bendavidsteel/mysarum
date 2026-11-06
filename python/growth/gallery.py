@@ -36,7 +36,7 @@ def qd_picks(run, top, diverse):
     if diverse and len(rest):
         emb = np.load(f"{run}/embeddings.npz")
         row = {int(i): k for k, i in enumerate(emb["ids"])}
-        z = emb["dino"][[row[i] for i in rest["id"]]]
+        z = emb["emb" if "emb" in emb else "dino"][[row[i] for i in rest["id"]]]
         picks += [rest["id"][k] for k in farthest(z, diverse, np.random.default_rng(0))]
     labels = dict(zip(el["id"], [f"#{i} {l} {f:.2f}" for i, l, f in zip(el["id"], el["label"], el["fitness"])]))
     return [(f"{run}/meshes/{i}.npz", labels[i]) for i in picks]

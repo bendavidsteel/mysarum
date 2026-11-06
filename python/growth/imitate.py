@@ -1,4 +1,4 @@
-"""Evolve a growth genome to look like a target organism (CLIP-guided CMA-ES).
+"""Evolve a growth genome to look like a target organism (SigLIP-guided CMA-ES).
 
 Target is a text prompt or a folder of reference photos. CMA-ES starts from the
 best of a seed tournament: the `--seed_k` QD-archive members that already best

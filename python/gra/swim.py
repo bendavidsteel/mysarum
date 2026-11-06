@@ -324,7 +324,7 @@ def run_grow(args):
 
 # ── Stage 2: a continuous CA drives the muscles ──────────────────────────────
 
-K = 4  # channels of the muscle CA
+K = 4  # default channels of the muscle CA; a genome's own shape sets its count
 
 
 class Genome(NamedTuple):
@@ -336,21 +336,40 @@ class Genome(NamedTuple):
     r: jnp.ndarray       # (K,)   channels -> muscle drive
     r0: jnp.ndarray      # ()
     amp: jnp.ndarray     # ()     max fractional change of rest length
+    P: jnp.ndarray = None  # (K, 2) node position along / across the body axis -> bias
 
 
-def sample_genome(key):
-    k = jax.random.split(key, 8)
+def sample_genome(key, k_channels=K):
+    c = k_channels
+    k = jax.random.split(key, 9)
     u = lambda kk, shape, lo, hi: lo + (hi - lo) * jax.random.uniform(kk, shape)
     return Genome(
-        A=u(k[0], (K, K), -12.0, 12.0),
-        a_self=u(k[1], (K,), -6.0, 6.0),
-        U=u(k[2], (K, 3), -6.0, 6.0),
-        b=u(k[3], (K,), -6.0, 3.0),
-        log_tau=u(k[4], (K,), -1.0, 1.0),
-        r=u(k[5], (K,), -1.0, 1.0),
+        A=u(k[0], (c, c), -12.0, 12.0),
+        a_self=u(k[1], (c,), -6.0, 6.0),
+        U=u(k[2], (c, 3), -6.0, 6.0),
+        b=u(k[3], (c,), -6.0, 3.0),
+        log_tau=u(k[4], (c,), -1.0, 1.0),
+        r=u(k[5], (c,), -1.0, 1.0),
         r0=u(k[6], (), -1.0, 1.0),
         amp=u(k[7], (), 0.1, 0.4),
+        P=u(k[8], (c, 2), -3.0, 3.0),
     )
+
+
+def upgrade_genome(g, k_channels=K):
+    """Pad a genome to k_channels and add a zero position input (P), as numpy.
+
+    The new channels have no coupling and no readout and P is zero, so the
+    muscles behave as before apart from the random initial CA state.
+    """
+    g = jax.tree.map(np.asarray, g)
+    k0 = g.b.shape[0]
+    pad = k_channels - k0
+    p1 = lambda v: np.pad(v, (0, pad))
+    P = np.zeros((k0, 2), np.float32) if g.P is None else g.P
+    return Genome(A=np.pad(g.A, ((0, pad), (0, pad))), a_self=p1(g.a_self),
+                  U=np.pad(g.U, ((0, pad), (0, 0))), b=p1(g.b), log_tau=p1(g.log_tau),
+                  r=p1(g.r), r0=g.r0, amp=g.amp, P=np.pad(P, ((0, pad), (0, 0))))
 
 
 def mutate_genome(g, key, scale=0.15):
@@ -376,7 +395,21 @@ def set_drag(drag):
     C_T, C_N, C_Q = (float(v) for v in drag)
 
 
-def swim(body, g, key, steps, record_every=0):
+def body_axes(rest, af):
+    """(n, 2) node coordinates along and across the rest shape's long axis, in [-1, 1].
+
+    The axis sign is fixed by shape skew, so head and tail are consistent.
+    """
+    w = af / af.sum()
+    c = rest - (rest * w[:, None]).sum(0)
+    _, vec = jnp.linalg.eigh((c * w[:, None]).T @ c)
+    proj = c @ vec[:, ::-1]                              # long axis first
+    sign = jnp.sign((proj ** 3 * w[:, None]).sum(0) + 1e-12)
+    proj = proj * sign * af[:, None]
+    return proj / (jnp.abs(proj).max(0) + 1e-6)
+
+
+def swim(body, g, key, steps, record_every=0, drag=None, truncate_at=None):
     """Integrate the muscle CA + mass-spring body.
 
     Returns (trace, recordings, final pos); trace is (steps, 3) of centre of
@@ -385,14 +418,17 @@ def swim(body, g, key, steps, record_every=0):
 
     Every node runs the same rate rule. Channels only mix across edges, so a
     lone node relaxes to a fixed point and any rhythm needs a loop through
-    neighbours.
+    neighbours. drag (CT, CN, CQ) defaults to the module fluid; passing it lets
+    one batch mix fluids. truncate_at cuts gradients through the state at that
+    step (truncated backprop through time).
     """
+    c_t, c_n, c_q = (C_T, C_N, C_Q) if drag is None else drag
     active = body.active
     af = active.astype(jnp.float32)
     safe, valid = _gather(body.nbrs, body.deg, active)
     vf = valid.astype(jnp.float32)
     L0 = 1.0
-    bias = body.gra @ g.U.T + g.b            # (N, K)
+    bias = body.gra @ g.U.T + g.b + body_axes(body.pos, af) @ g.P.T  # (N, K)
     tau = jnp.exp(g.log_tau)
     deg = jnp.maximum(vf.sum(1), 1.0)
     pair = (active[:, None] & active[None]).astype(jnp.float32)
@@ -403,6 +439,9 @@ def swim(body, g, key, steps, record_every=0):
 
 
     def step(carry, t):
+        if truncate_at is not None:
+            carry = jax.tree.map(
+                lambda c: jnp.where(t == truncate_at, jax.lax.stop_gradient(c), c), carry)
         pos, vel, x = carry
         nb = (x[safe] * vf[..., None]).sum(1) / deg[:, None]
         h = nb @ g.A.T + g.a_self * x + bias
@@ -422,7 +461,7 @@ def swim(body, g, key, steps, record_every=0):
         vt = (vel[:, None] * u).sum(-1, keepdims=True) * u
         vn = vel[:, None] - vt
         vn_mag = jnp.sqrt((vn ** 2).sum(-1, keepdims=True) + 1e-9)
-        drag = -(0.5 * dist * vf)[..., None] * (C_T * vt + C_N * vn + C_Q * vn_mag * vn)
+        drag = -(0.5 * dist * vf)[..., None] * (c_t * vt + c_n * vn + c_q * vn_mag * vn)
         f = f + drag.sum(1)
 
         vel = (vel + DT * f) * af[:, None]
@@ -436,7 +475,7 @@ def swim(body, g, key, steps, record_every=0):
 
     n = body.pos.shape[0]
     rest0 = jnp.asarray(body.pos) * af[:, None]
-    x0 = jax.random.uniform(key, (N, K))[:n]  # same init whatever the buffer size
+    x0 = jax.random.uniform(key, (N, g.b.shape[-1]))[:n]  # same init whatever the buffer size
     init = (jnp.asarray(body.pos), jnp.zeros((n, 2)), x0)
     (pos, _, _), (com, rec) = jax.lax.scan(step, init, jnp.arange(steps))
     return com, rec, pos
@@ -562,17 +601,18 @@ def _edges(body_nbrs, body_deg, active):
 
 
 @partial(jax.jit, static_argnums=3)
-def _record(body, g, key, steps):
-    return swim(body, g, key, steps, 1)
+def _record(body, g, key, steps, drag):
+    return swim(body, g, key, steps, 1, drag)
 
 
-def _simulate(grower, genome, steps, key=None):
+def _simulate(grower, genome, steps, key=None, drag=None):
     """Re-run one swimmer with per-step recording, on its bucket-sized buffer."""
     size = next(b for b in BUCKETS if grower["body"]["active"].sum() <= b)
     body = Body(**{k: jnp.asarray(v[:size]) for k, v in grower["body"].items()})
     g = jax.tree.map(jnp.asarray, genome)
     key = jax.random.PRNGKey(0) if key is None else jnp.asarray(key)
-    com, (pos, x, act), _ = _record(body, g, key, steps)
+    drag = jnp.asarray((C_T, C_N, C_Q) if drag is None else drag, jnp.float32)
+    com, (pos, x, act), _ = _record(body, g, key, steps, drag)
     active = np.asarray(body.active)
     p0 = np.asarray(pos[0])[active]
     return dict(com=np.asarray(com[:, :2]), pos=np.asarray(pos), x=np.asarray(x),

@@ -11,6 +11,8 @@ JAX implementation of a Lenia-style graph cellular automaton with Chebyshev spec
 - `graphs.json` — Seed graphs (10-12 node small graphs from the Rust implementation).
 - `swim.py` — Grown swimmers: GRAs grow until their topology stops changing, then a continuous CA on the nodes (channels mix only across edges) drives edge rest lengths in a drag fluid. Subcommands `grow`, `swim`, `render`; outputs in `outputs/swim/`. Runs on GPU (jit+vmap) or CPU (batch sharded across every core with pmap). Swim sims are grouped by body size and run on a node buffer trimmed to 32/64/128/256, since O(n²) repulsion dominates (~3x faster on a mixed batch). `--drag CT CN CQ` sets the fluid.
 - `swim_render.py` — Video rendering without JAX: matplotlib artists built once per panel and updated per frame; every video is split into frame chunks rendered across all cores and joined with ffmpeg concat (~10x faster than redrawing serially).
+- `swim_opt.py` — CMA-ES speed optimisation of the controllers of the fastest `swim_qd` elites, all problems in one batch (drag is per sim). Arms: `base` (original controller), `pos` (+ node position along/across the body axis, `Genome.P`), `pos8` (+ 8 channels). On 8 seeds x 150 gens: mean speed 3.7 -> 5.0 (base), 5.6 (pos), 5.7 (pos8); position input helps most on 34-36 node bodies (2.5-3.4x).
+- `swim_grad.py` — Trial of gradient refinement through the simulation (truncated BPTT via `swim(..., truncate_at=)`). Negative result from CMA-ES optima: gradients agree across CA initial states but not with finite differences (the speed landscape is rough), and Adam over 100-step windows always lowered true speed; 400-step windows gave at most +3%.
 - `swim_qd.py` — Swimming-style search on the grown bodies: MAP-Elites over body size × path straightness × spin rate, fitness = windowed speed, genomes hop between bodies. Renders a gallery, per-swimmer mp4s and a map per run.
 
 ## Running
@@ -24,6 +26,8 @@ uv run python swim.py swim --gens 100 --batch 1024
 uv run python swim.py render --top 6 --growth
 uv run python swim_qd.py search --tag stokes --drag 0.5 1.0 0.0
 uv run python swim_qd.py render --tag stokes
+uv run python swim_opt.py search --fluids water_sized stokes --per-fluid 2
+uv run python swim_opt.py render
 
 # Default search
 python run.py

@@ -9,7 +9,8 @@ JAX implementation of a Lenia-style graph cellular automaton with Chebyshev spec
 - `viz.py` — Post-search visualization: archive heatmaps, graph snapshots with networkx, metric time series.
 - `run.py` — Hydra entry point. Config in `conf/config.yaml`.
 - `graphs.json` — Seed graphs (10-12 node small graphs from the Rust implementation).
-- `swim.py` — Grown swimmers: GRAs grow until their topology stops changing, then a continuous CA on the nodes (channels mix only across edges) drives edge rest lengths in a drag fluid. Subcommands `grow`, `swim`, `render`; outputs in `outputs/swim/`.
+- `swim.py` — Grown swimmers: GRAs grow until their topology stops changing, then a continuous CA on the nodes (channels mix only across edges) drives edge rest lengths in a drag fluid. Subcommands `grow`, `swim`, `render`; outputs in `outputs/swim/`. Runs on GPU (jit+vmap) or CPU (batch sharded across every core with pmap). Swim sims are grouped by body size and run on a node buffer trimmed to 32/64/128/256, since O(n²) repulsion dominates (~3x faster on a mixed batch). `--drag CT CN CQ` sets the fluid.
+- `swim_qd.py` — Swimming-style search on the grown bodies: MAP-Elites over body size × path straightness × spin rate, fitness = windowed speed, genomes hop between bodies. Renders a gallery, per-swimmer mp4s and a map per run.
 
 ## Running
 
@@ -20,6 +21,8 @@ The environment is managed by uv (`uv sync`), so prefix commands with `uv run`.
 uv run python swim.py grow --gens 40 --batch 768
 uv run python swim.py swim --gens 100 --batch 1024
 uv run python swim.py render --top 6 --growth
+uv run python swim_qd.py search --tag stokes --drag 0.5 1.0 0.0
+uv run python swim_qd.py render --tag stokes
 
 # Default search
 python run.py

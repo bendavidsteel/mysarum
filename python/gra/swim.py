@@ -8,16 +8,26 @@ swim:  topology and GRA states are frozen. A K-channel continuous CA runs on the
        centre-of-mass travel.
 render: mp4s of growth and swimming.
 
+Runs on GPU or CPU. On CPU every core is exposed as a JAX device and batches
+are sharded across them with pmap.
+
     uv run python swim.py grow --gens 30
     uv run python swim.py swim --gens 60
     uv run python swim.py render
+    uv run python swim.py swim --drag 0.5 1.0 0.0 --out-dir outputs/swim_stokes
 """
 
 import argparse
+import os
 import pickle
 import time
 from pathlib import Path
 from typing import NamedTuple
+
+# XLA's CPU backend runs a vmapped batch on only a couple of threads, so expose
+# each core as a device for pmap. Must be set before jax is imported; it does
+# nothing on GPU.
+os.environ.setdefault("XLA_FLAGS", f"--xla_force_host_platform_device_count={os.cpu_count()}")
 
 import jax
 import jax.numpy as jnp
@@ -31,12 +41,30 @@ D = sim.MAX_DEGREE
 TOPO_EVERY = sim.TOPO_EVERY
 
 OUT = Path(__file__).parent / "outputs" / "swim"
+ON_CPU = jax.default_backend() == "cpu"
+
+
+def batched(fn):
+    """vmap fn over a leading batch axis: jit on GPU, sharded across cores on CPU."""
+    if not ON_CPU:
+        return jax.jit(jax.vmap(fn))
+    P = jax.local_device_count()
+    f = jax.pmap(jax.vmap(fn))
+
+    def call(*args):
+        B = jax.tree.leaves(args)[0].shape[0]
+        pad = (-B) % P
+        if pad:
+            args = jax.tree.map(lambda x: jnp.concatenate([x, jnp.repeat(x[-1:], pad, 0)]), args)
+        args = jax.tree.map(lambda x: x.reshape((P, -1) + x.shape[1:]), args)
+        return jax.tree.map(lambda x: x.reshape((-1,) + x.shape[2:])[:B], f(*args))
+    return call
 
 
 # ── Growth with layout ───────────────────────────────────────────────────────
 
 def _gather(nbrs, deg, active):
-    safe = jnp.clip(nbrs, 0, N - 1)
+    safe = jnp.clip(nbrs, 0, nbrs.shape[0] - 1)
     valid = ((jnp.arange(D)[None] < deg[:, None]) & (nbrs >= 0)
              & active[safe] & active[:, None])
     return safe, valid
@@ -181,6 +209,43 @@ def extract_body(pos, active, nbrs, deg, gra):
     return Body(b_pos, np.arange(N) < n, b_nbrs, b_deg, b_gra)
 
 
+# Swim cost is dominated by O(n^2) repulsion over the node buffer, so sims run
+# on a buffer trimmed to the smallest bucket that holds their body.
+BUCKETS = (32, 64, 128, N)
+
+
+def run_bucketed(fn, bodies, *args):
+    """Apply fn(body, *args) per sim, grouping sims by body size.
+
+    bodies is a stacked Body of numpy arrays with buffer N; args are batched
+    pytrees. fn must return fixed-shape outputs (independent of buffer size).
+    """
+    n = bodies.active.sum(1)
+    out = None
+    lo = 0
+    for size in BUCKETS:
+        idx = np.nonzero((n > lo) & (n <= size))[0]
+        lo = size
+        if len(idx) == 0:
+            continue
+        sub = Body(*(jnp.asarray(x[idx][:, :size]) for x in bodies))
+        sub_args = jax.tree.map(lambda x: jnp.asarray(x)[idx], args)
+        res = jax.device_get(_batched_cache(fn)(sub, *sub_args))
+        if out is None:
+            out = jax.tree.map(lambda r: np.zeros((len(n),) + r.shape[1:], r.dtype), res)
+        jax.tree.map(lambda o, r: o.__setitem__(idx, r), out, res)
+    return out
+
+
+_BATCHED = {}
+
+
+def _batched_cache(fn):
+    if fn not in _BATCHED:
+        _BATCHED[fn] = batched(fn)
+    return _BATCHED[fn]
+
+
 def body_shape(body):
     p = body.pos[body.active]
     ev = np.sort(np.linalg.eigvalsh(np.cov(p.T)))
@@ -205,7 +270,7 @@ def run_grow(args):
     B, blocks = args.batch, args.blocks
     steady_blocks = args.steady_blocks
     rng = jax.random.PRNGKey(args.seed)
-    grow_b = jax.jit(jax.vmap(lambda p, s, k: grow(p, s, k, blocks)[:3]))
+    grow_b = batched(lambda p, s, k: grow(p, s, k, blocks)[:3])
 
     archive = {}  # cell -> dict(fitness, params, seed, graph, body)
     t0 = time.time()
@@ -303,8 +368,18 @@ CHARGE = K_SPRING * 0.3 / 2.0
 C_T, C_N, C_Q = 0.1, 1.0, 1.0  # tangential, normal linear, normal quadratic drag
 
 
+def set_drag(drag):
+    """Set the fluid before anything is traced; swim() reads these at trace time."""
+    global C_T, C_N, C_Q
+    C_T, C_N, C_Q = (float(v) for v in drag)
+
+
 def swim(body, g, key, steps, record_every=0):
-    """Integrate the muscle CA + mass-spring body. Returns (com trace, recordings).
+    """Integrate the muscle CA + mass-spring body.
+
+    Returns (trace, recordings, final pos); trace is (steps, 3) of centre of
+    mass and body orientation (best-fit rotation from the rest shape). The
+    buffer size comes from the body arrays, so a trimmed body runs cheaper.
 
     Every node runs the same rate rule. Channels only mix across edges, so a
     lone node relaxes to a fixed point and any rhythm needs a loop through
@@ -351,11 +426,16 @@ def swim(body, g, key, steps, record_every=0):
         vel = (vel + DT * f) * af[:, None]
         pos = pos + DT * vel
         com = (pos * af[:, None]).sum(0) / af.sum()
+        rel = (pos - com) * af[:, None]
+        theta = jnp.arctan2((rest0[:, 0] * rel[:, 1] - rest0[:, 1] * rel[:, 0]).sum(),
+                            (rest0 * rel).sum())
         rec = (pos, x[:, :3], act) if record_every else None
-        return (pos, vel, x), (com, rec)
+        return (pos, vel, x), (jnp.concatenate([com, theta[None]]), rec)
 
-    x0 = jax.random.uniform(key, (N, K))
-    init = (jnp.asarray(body.pos), jnp.zeros((N, 2)), x0)
+    n = body.pos.shape[0]
+    rest0 = jnp.asarray(body.pos) * af[:, None]
+    x0 = jax.random.uniform(key, (N, K))[:n]  # same init whatever the buffer size
+    init = (jnp.asarray(body.pos), jnp.zeros((n, 2)), x0)
     (pos, _, _), (com, rec) = jax.lax.scan(step, init, jnp.arange(steps))
     return com, rec, pos
 
@@ -363,6 +443,7 @@ def swim(body, g, key, steps, record_every=0):
 def swim_score(com):
     """Distance travelled after the transient, penalised for blowups."""
     T = com.shape[0]
+    com = com[:, :2]
     start = com[T // 5]
     dist = jnp.sqrt(((com[-1] - start) ** 2).sum())
     ok = jnp.all(jnp.isfinite(com))
@@ -375,16 +456,28 @@ def settle(growers, steps=4000):
     off = jax.vmap(sample_genome)(jax.random.split(jax.random.PRNGKey(0), len(growers)))
     off = off._replace(amp=jnp.zeros(len(growers)))
     keys = jax.random.split(jax.random.PRNGKey(0), len(growers))
-    _, _, pos = jax.jit(jax.vmap(lambda b, g, k: swim(b, g, k, steps)))(bodies, off, keys)
-    pos = np.asarray(pos)
+    pos = run_bucketed(_settle_fn(steps), bodies, off, keys)
     for g, p in zip(growers, pos):
         a = g["body"]["active"]
         g["body"] = dict(g["body"], pos=np.where(a[:, None], p - p[a].mean(0), 0.0).astype(np.float32))
     return growers
 
 
+_SETTLE = {}
+
+
+def _settle_fn(steps):
+    if steps not in _SETTLE:
+        def fn(b, g, k):
+            pos = swim(b, g, k, steps)[2]
+            return jnp.pad(pos, ((0, N - pos.shape[0]), (0, 0)))
+        _SETTLE[steps] = fn
+    return _SETTLE[steps]
+
+
 def stack_bodies(bodies):
-    return Body(*[jnp.asarray(np.stack([b[f] for b in bodies])) for f in Body._fields])
+    """Stack body dicts into a Body of numpy arrays (buffer N)."""
+    return Body(*[np.stack([b[f] for b in bodies]) for f in Body._fields])
 
 
 def load_growers(path, min_n=16):
@@ -410,11 +503,11 @@ def run_swim(args):
     rng, k = jax.random.split(rng)
     genomes = jax.vmap(sample_genome)(jax.random.split(k, B))
 
-    @jax.jit
+    def score(b, g, k):
+        return swim_score(swim(b, g, k, args.steps)[0])
+
     def evaluate(bodies, genomes, key):
-        keys = jax.random.split(key, B)
-        com, _, _ = jax.vmap(lambda b, g, k: swim(b, g, k, args.steps))(bodies, genomes, keys)
-        return jax.vmap(swim_score)(com)
+        return run_bucketed(score, bodies, genomes, jax.random.split(key, B))
 
     best = [None] * nb  # (score, genome)
     t0 = time.time()
@@ -427,19 +520,19 @@ def run_swim(args):
             j = i * per + int(np.argmax(scores[sl]))
             if best[i] is None or scores[j] > best[i][0]:
                 best[i] = (float(scores[j]), jax.tree.map(lambda x: x[j], gnp))
-        # next population: per body, mutate from the top quarter (elitist)
-        new = []
+        # next population: per body, mutate from the top quarter (elitist);
+        # slot 0 of each body is replaced by its best-ever genome below
+        top = max(per // 4, 1)
+        order = np.argsort(-scores.reshape(nb, per), 1)[:, :top] + np.arange(nb)[:, None] * per
+        src = order[:, np.arange(per) % top].ravel()
+        genomes = jax.tree.map(lambda x: x[src], gnp)
+        bests = jax.tree.map(lambda *x: np.stack(x), *[b[1] for b in best])
+
+        def put_best(g, b):
+            g[::per] = b
+            return g
+        genomes = jax.tree.map(put_best, genomes, bests)
         kk = jax.random.split(km, B)
-        for i in range(nb):
-            sl_scores = scores[i * per:(i + 1) * per]
-            order = np.argsort(-sl_scores)[:max(per // 4, 1)] + i * per
-            for r in range(per):
-                if r == 0:
-                    new.append(best[i][1])
-                else:
-                    src = jax.tree.map(lambda x: x[order[r % len(order)]], gnp)
-                    new.append(src)
-        genomes = jax.tree.map(lambda *x: jnp.stack(x), *new)
         mutated = jax.vmap(mutate_genome)(genomes, kk)
         keep = jnp.arange(B) % per == 0
         genomes = jax.tree.map(
@@ -450,7 +543,8 @@ def run_swim(args):
               f"median {np.median([b[0] for b in best]):6.2f}  {time.time() - t0:6.0f}s",
               flush=True)
         with open(OUT / args.out, "wb") as f:
-            pickle.dump(dict(growers=growers, best=best, steps=args.steps), f)
+            pickle.dump(dict(growers=growers, best=best, steps=args.steps,
+                             drag=(C_T, C_N, C_Q)), f)
 
 
 # ── Rendering ────────────────────────────────────────────────────────────────
@@ -468,11 +562,14 @@ def _edges(body_nbrs, body_deg, active):
 BG = "#0b0f14"
 
 
-def _simulate(grower, genome, steps):
-    body = Body(**{k: jnp.asarray(v) for k, v in grower["body"].items()})
+def _simulate(grower, genome, steps, key=None):
+    size = next(b for b in BUCKETS if grower["body"]["active"].sum() <= b)
+    body = Body(**{k: jnp.asarray(v[:size]) for k, v in grower["body"].items()})
     g = jax.tree.map(jnp.asarray, genome)
+    key = jax.random.PRNGKey(0) if key is None else jnp.asarray(key)
     com, (pos, x, act), _ = jax.jit(
-        lambda b, g: swim(b, g, jax.random.PRNGKey(0), steps, 1))(body, g)
+        lambda b, g: swim(b, g, key, steps, 1))(body, g)
+    com = com[:, :2]
     active = np.asarray(body.active)
     p0 = np.asarray(pos[0])[active]
     return dict(com=np.asarray(com), pos=np.asarray(pos), x=np.asarray(x),
@@ -603,6 +700,7 @@ def render_growth(grower, blocks, path, fps=30, size=6):
 def run_render(args):
     with open(OUT / args.swimmers, "rb") as f:
         res = pickle.load(f)
+    set_drag(res.get("drag", (C_T, C_N, C_Q)))
     with open(OUT / "growers.pkl", "rb") as f:
         blocks = pickle.load(f)["blocks"]
     vid = OUT / "videos" / Path(args.swimmers).stem
@@ -622,16 +720,33 @@ def run_render(args):
             render_growth(grower, blocks, vid / f"{name}_grow.mp4")
 
 
+def common_args():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--out-dir", type=Path, default=OUT)
+    ap.add_argument("--drag", type=float, nargs=3, default=(C_T, C_N, C_Q),
+                    metavar=("CT", "CN", "CQ"),
+                    help="tangential, normal linear, normal quadratic drag")
+    return ap
+
+
+def configure(args):
+    global OUT
+    OUT = args.out_dir
+    set_drag(args.drag)
+    print(f"backend {jax.default_backend()} ({jax.local_device_count()} devices)", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
-    g = sub.add_parser("grow")
+    common = common_args()
+    g = sub.add_parser("grow", parents=[common])
     g.add_argument("--gens", type=int, default=30)
     g.add_argument("--batch", type=int, default=256)
     g.add_argument("--blocks", type=int, default=400)
     g.add_argument("--steady-blocks", type=int, default=150)
     g.add_argument("--seed", type=int, default=0)
-    s = sub.add_parser("swim")
+    s = sub.add_parser("swim", parents=[common])
     s.add_argument("--gens", type=int, default=60)
     s.add_argument("--batch", type=int, default=1024)
     s.add_argument("--steps", type=int, default=2500)
@@ -639,12 +754,13 @@ def main():
     s.add_argument("--seed", type=int, default=0)
     s.add_argument("--growers", default="growers.pkl")
     s.add_argument("--out", default="swimmers.pkl")
-    r = sub.add_parser("render")
+    r = sub.add_parser("render", parents=[common])
     r.add_argument("--top", type=int, default=6)
     r.add_argument("--steps", type=int, default=4000)
     r.add_argument("--growth", action="store_true")
     r.add_argument("--swimmers", default="swimmers.pkl")
     args = ap.parse_args()
+    configure(args)
     {"grow": run_grow, "swim": run_swim, "render": run_render}[args.cmd](args)
 
 

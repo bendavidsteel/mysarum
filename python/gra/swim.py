@@ -21,6 +21,7 @@ import argparse
 import os
 import pickle
 import time
+from functools import partial
 from pathlib import Path
 from typing import NamedTuple
 
@@ -34,6 +35,7 @@ import jax.numpy as jnp
 import numpy as np
 
 import sim
+from swim_render import BG, render_videos
 
 N = 256
 sim.MAX_NODES = N
@@ -559,54 +561,35 @@ def _edges(body_nbrs, body_deg, active):
     return np.array(e, dtype=int).reshape(-1, 3)
 
 
-BG = "#0b0f14"
+@partial(jax.jit, static_argnums=3)
+def _record(body, g, key, steps):
+    return swim(body, g, key, steps, 1)
 
 
 def _simulate(grower, genome, steps, key=None):
+    """Re-run one swimmer with per-step recording, on its bucket-sized buffer."""
     size = next(b for b in BUCKETS if grower["body"]["active"].sum() <= b)
     body = Body(**{k: jnp.asarray(v[:size]) for k, v in grower["body"].items()})
     g = jax.tree.map(jnp.asarray, genome)
     key = jax.random.PRNGKey(0) if key is None else jnp.asarray(key)
-    com, (pos, x, act), _ = jax.jit(
-        lambda b, g: swim(b, g, key, steps, 1))(body, g)
-    com = com[:, :2]
+    com, (pos, x, act), _ = _record(body, g, key, steps)
     active = np.asarray(body.active)
     p0 = np.asarray(pos[0])[active]
-    return dict(com=np.asarray(com), pos=np.asarray(pos), x=np.asarray(x),
+    return dict(com=np.asarray(com[:, :2]), pos=np.asarray(pos), x=np.asarray(x),
                 act=np.asarray(act), active=active,
                 edges=_edges(np.asarray(body.nbrs), np.asarray(body.deg), active),
                 extent=max(np.ptp(p0[:, 0]), np.ptp(p0[:, 1])) * 0.9 + 3.0)
 
 
-def _draw_swimmer(ax, sd, t, every, label=None):
-    """Camera follows the body; the grid is fixed in the fluid."""
-    from matplotlib.collections import LineCollection
-    import matplotlib.pyplot as plt
-    ax.clear()
-    ax.set_facecolor(BG)
-    com, pos, extent, edges, active = sd["com"], sd["pos"], sd["extent"], sd["edges"], sd["active"]
-    cx, cy = com[t]
-    ax.set_xlim(cx - extent, cx + extent)
-    ax.set_ylim(cy - extent, cy + extent)
-    gs = max(round(extent / 4), 1)
-    for gx in np.arange(np.floor((cx - extent) / gs) * gs, cx + extent, gs):
-        ax.axvline(gx, color="#1b2430", lw=0.6, zorder=0)
-    for gy in np.arange(np.floor((cy - extent) / gs) * gs, cy + extent, gs):
-        ax.axhline(gy, color="#1b2430", lw=0.6, zorder=0)
-    ax.plot(com[:t + 1:every, 0], com[:t + 1:every, 1], color="#e8c547", lw=1.0,
-            alpha=0.6, zorder=1)
-    # colour = CA channels 0-2 as RGB; edge width = muscle contraction
-    p, rgb = pos[t], 0.25 + 0.75 * np.clip(sd["x"][t], 0, 1)
-    segs = np.stack([p[edges[:, 0]], p[edges[:, 2]]], 1)
-    a = sd["act"][t][edges[:, 0], edges[:, 1]]
-    ax.add_collection(LineCollection(
-        segs, colors=0.5 * (rgb[edges[:, 0]] + rgb[edges[:, 2]]),
-        linewidths=0.5 + 2.5 * np.clip(-a, 0, 1), zorder=2))
-    ax.scatter(p[active, 0], p[active, 1], s=12, c=rgb[active], zorder=3, linewidths=0)
-    if label:
-        ax.text(0.03, 0.96, label, transform=ax.transAxes, color="#aab", fontsize=8, va="top")
-    ax.set_aspect("equal")
-    ax.axis("off")
+def swimmer_spec(path, sd, steps, label=None, every=4, fps=30, size=6):
+    return dict(path=path, panels=[(sd, label)], cols=1, cell=size, dpi=120,
+                steps=steps, every=every, fps=fps)
+
+
+def gallery_spec(path, panels, steps, cols=3, every=4, fps=30, cell=3.2):
+    """panels: list of (sd, label)."""
+    return dict(path=path, panels=panels, cols=cols, cell=cell, dpi=110,
+                steps=steps, every=every, fps=fps)
 
 
 def _write_video(fig, draw, frames, path, fps):
@@ -620,40 +603,6 @@ def _write_video(fig, draw, frames, path, fps):
         writer.append_data(np.asarray(fig.canvas.buffer_rgba())[..., :3])
     writer.close()
     plt.close(fig)
-
-
-def render_swimmer(grower, genome, path, steps, every=4, fps=30, size=6):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    sd = _simulate(grower, genome, steps)
-    fig, ax = plt.subplots(figsize=(size, size), dpi=120)
-    fig.patch.set_facecolor(BG)
-    fig.subplots_adjust(0, 0, 1, 1)
-    _write_video(fig, lambda t: _draw_swimmer(ax, sd, t, every),
-                 range(0, steps, every), path, fps)
-
-
-def render_gallery(entries, path, steps, cols=3, every=4, fps=30, cell=3.2):
-    """entries: list of (grower, genome, label)."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    sds = [(_simulate(g, gn, steps), lab) for g, gn, lab in entries]
-    rows = (len(sds) + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(cell * cols, cell * rows), dpi=110)
-    fig.patch.set_facecolor(BG)
-    fig.subplots_adjust(0, 0, 1, 1, 0.01, 0.01)
-    axes = np.atleast_1d(axes).ravel()
-    for ax in axes[len(sds):]:
-        ax.set_facecolor(BG)
-        ax.axis("off")
-
-    def draw(t):
-        for ax, (sd, lab) in zip(axes, sds):
-            _draw_swimmer(ax, sd, t, every, lab)
-
-    _write_video(fig, draw, range(0, steps, every), path, fps)
 
 
 def render_growth(grower, blocks, path, fps=30, size=6):
@@ -706,18 +655,19 @@ def run_render(args):
     vid = OUT / "videos" / Path(args.swimmers).stem
     vid.mkdir(parents=True, exist_ok=True)
     order = np.argsort([-b[0] for b in res["best"]])[:args.top]
-    entries = [(res["growers"][i], res["best"][i][1],
-                f"n={res['growers'][i]['n']}  d={res['best'][i][0]:.1f}") for i in order]
-    print("rendering gallery", flush=True)
-    render_gallery(entries[:9], vid / "gallery.mp4", args.steps)
-    for rank, i in enumerate(order):
-        score, genome = res["best"][i]
-        grower = res["growers"][i]
-        name = f"{rank:02d}_n{grower['n']}_d{score:.0f}"
-        print(f"rendering {name}", flush=True)
-        render_swimmer(grower, genome, vid / f"{name}_swim.mp4", args.steps)
-        if args.growth:
-            render_growth(grower, blocks, vid / f"{name}_grow.mp4")
+    print("simulating", flush=True)
+    sds = [_simulate(res["growers"][i], res["best"][i][1], args.steps) for i in order]
+    labels = [f"n={res['growers'][i]['n']}  d={res['best'][i][0]:.1f}" for i in order]
+    names = [f"{rank:02d}_n{res['growers'][i]['n']}_d{res['best'][i][0]:.0f}"
+             for rank, i in enumerate(order)]
+    specs = [gallery_spec(vid / "gallery.mp4", list(zip(sds, labels))[:9], args.steps)]
+    specs += [swimmer_spec(vid / f"{name}_swim.mp4", sd, args.steps) for sd, name in zip(sds, names)]
+    print(f"rendering {len(specs)} videos", flush=True)
+    render_videos(specs)
+    if args.growth:
+        for name, i in zip(names, order):
+            print(f"rendering {name} growth", flush=True)
+            render_growth(res["growers"][i], blocks, vid / f"{name}_grow.mp4")
 
 
 def common_args():

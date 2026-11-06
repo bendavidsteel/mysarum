@@ -155,9 +155,6 @@ def heatmap(archive, path, title):
 
 
 def run_render(args):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
     with open(sw.OUT / f"qd_{args.tag}.pkl", "rb") as f:
         res = pickle.load(f)
     sw.set_drag(res["drag"])
@@ -175,30 +172,13 @@ def run_render(args):
 
     sds = [(sw._simulate(growers[e["body"]], e["genome"], args.steps, e["key"]),
             f"{style(e)}  n={growers[e['body']]['n']}  v={e['speed']:.1f}") for e in picks]
-    cols = 4 if len(sds) > 9 else 3
-    rows = (len(sds) + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(3.2 * cols, 3.2 * rows), dpi=110)
-    fig.patch.set_facecolor(sw.BG)
-    fig.subplots_adjust(0, 0, 1, 1, 0.01, 0.01)
-    axes = np.atleast_1d(axes).ravel()
-    for ax in axes[len(sds):]:
-        ax.set_facecolor(sw.BG)
-        ax.axis("off")
-
-    def draw(t):
-        for ax, (sd, lab) in zip(axes, sds):
-            sw._draw_swimmer(ax, sd, t, 4, lab)
-    print("gallery", flush=True)
-    sw._write_video(fig, draw, range(0, args.steps, 4), vid / "gallery.mp4", 30)
-
-    for rank, ((sd, lab), e) in enumerate(zip(sds, picks)):
-        name = f"{rank:02d}_{style(e).replace(' ', '_')}_n{growers[e['body']]['n']}_v{e['speed']:.0f}"
-        print(name, flush=True)
-        fig, ax = plt.subplots(figsize=(6, 6), dpi=120)
-        fig.patch.set_facecolor(sw.BG)
-        fig.subplots_adjust(0, 0, 1, 1)
-        sw._write_video(fig, lambda t: sw._draw_swimmer(ax, sd, t, 4, lab),
-                        range(0, args.steps, 4), vid / f"{name}.mp4", 30)
+    names = [f"{rank:02d}_{style(e).replace(' ', '_')}_n{growers[e['body']]['n']}_v{e['speed']:.0f}"
+             for rank, e in enumerate(picks)]
+    specs = [sw.gallery_spec(vid / "gallery.mp4", sds, args.steps, cols=4 if len(sds) > 9 else 3)]
+    specs += [sw.swimmer_spec(vid / f"{name}.mp4", sd, args.steps, lab)
+              for (sd, lab), name in zip(sds, names)]
+    print(f"rendering {len(specs)} videos", flush=True)
+    sw.render_videos(specs)
 
 
 def main():

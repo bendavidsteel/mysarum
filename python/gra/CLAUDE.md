@@ -10,6 +10,7 @@ JAX implementation of a Lenia-style graph cellular automaton with Chebyshev spec
 - `run.py` — Hydra entry point. Config in `conf/config.yaml`.
 - `graphs.json` — Seed graphs (10-12 node small graphs from the Rust implementation).
 - `swim.py` — Grown swimmers: GRAs grow until their topology stops changing, then a continuous CA on the nodes (channels mix only across edges) drives edge rest lengths in a drag fluid. Subcommands `grow`, `swim`, `render`; outputs in `outputs/swim/`. Runs on GPU (jit+vmap) or CPU (batch sharded across every core with pmap). Swim sims are grouped by body size and run on a node buffer trimmed to 32/64/128/256, since O(n²) repulsion dominates (~3x faster on a mixed batch). `--drag CT CN CQ` sets the fluid.
+- `swim_render.py` — Video rendering without JAX: matplotlib artists built once per panel and updated per frame; every video is split into frame chunks rendered across all cores and joined with ffmpeg concat (~10x faster than redrawing serially).
 - `swim_qd.py` — Swimming-style search on the grown bodies: MAP-Elites over body size × path straightness × spin rate, fitness = windowed speed, genomes hop between bodies. Renders a gallery, per-swimmer mp4s and a map per run.
 
 ## Running

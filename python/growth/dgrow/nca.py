@@ -18,7 +18,10 @@ across the polarity axis (tubes, funnels, scrolls), 11 modulates accretion,
 mesh), and the new rims count as boundary. 13–16 are surface material for the
 renderer: iridescence, thin-film thickness, translucency, gloss. The rest are hidden; they diffuse at a range of fixed rates so the CA has
 short- and long-range signals to pattern with. Cues also include ambient
-(hemisphere) exposure. New vertices from edge splits inherit the endpoint
+(hemisphere) exposure. Growth, polarity and the hidden channels are also
+perceived through spherical-harmonic filters (degrees 1 and 2, world frame, as
+in MeshNCA): their gradient and anisotropy around the vertex, so the CA can
+tell up from down and lay patterns along a direction. New vertices from edge splits inherit the endpoint
 mean like any vertex field.
 
 Genome = physics genes in [0,1] followed by raw MLP weights (unbounded).
@@ -35,7 +38,7 @@ from .sim import Params
 C = 20
 HID = 24
 N_CUE = 8
-P_IN = 2 * C + N_CUE
+N_SH = 8  # real spherical harmonics, degrees 1 and 2
 CH_GROW, CH_ANISO, CH_CURL, CH_TROPIC = 0, 1, 2, 6
 CH_POL, CH_PSTR, CH_STIFF, CH_ACURL, CH_ACC, CH_HOLE = 7, 8, 9, 10, 11, 12
 CH_MAT = slice(13, 17)  # iridescence, film thickness, translucency, gloss
@@ -43,6 +46,9 @@ N_OUT = 17  # channels with a fixed meaning; the rest are hidden
 CH_RGB = slice(3, 6)
 # The polarity channel diffuses faster so its gradient is smooth enough to steer by.
 DIFF = [0.05] * 7 + [0.2] + [0.05] * 9 + list(np.linspace(0.0, 0.5, C - N_OUT))
+SH_CH = [CH_GROW, CH_POL] + list(range(N_OUT, C))
+K_SH = len(SH_CH) * N_SH
+P_IN = 2 * C + N_CUE + K_SH
 SHAPES = [("W1", (P_IN, HID)), ("b1", (HID,)), ("W2", (HID, C)), ("b2", (C,))]
 N_W = sum(math.prod(s) for _, s in SHAPES)
 
@@ -90,6 +96,32 @@ class NCA:
             sim.ambient(),
         ], 1)
 
+    @staticmethod
+    def _sh_basis(sim):
+        """(E, 8) degree-1 and degree-2 real harmonics of each edge's unit direction."""
+        e = sim.topo.edges
+        d = torch.nn.functional.normalize(sim.pos[e[:, 1]] - sim.pos[e[:, 0]], dim=1)
+        x, y, z = d.unbind(1)
+        r3 = math.sqrt(3)
+        return torch.stack([x, y, z, r3 * x * y, r3 * y * z, 0.5 * (3 * z * z - 1), r3 * x * z,
+                            0.5 * r3 * (x * x - y * y)], 1)
+
+    @staticmethod
+    def _sh(sim, Y, S):
+        """Mean over neighbours of Y(direction) * (s_j - s_i) for the SH channels, taken
+        on the neighbour-smoothed state so mesh-scale noise isn't amplified.
+        Degree 1 is odd in the direction and degree 2 even, so an edge adds the same
+        degree-1 term to both ends and opposite degree-2 terms."""
+        e = sim.topo.edges
+        D = S[e[:, 1]][:, SH_CH] - S[e[:, 0]][:, SH_CH]
+        f = (Y[:, :, None] * D[:, None]).reshape(len(e), K_SH)
+        g = (Y * Y.new_tensor([1.0] * 3 + [-1.0] * 5))[:, :, None] * D[:, None]
+        out = torch.zeros(S.shape[0], K_SH, device=S.device)
+        out.index_add_(0, e[:, 0], f)
+        out.index_add_(0, e[:, 1], g.reshape(len(e), K_SH))
+        # Neighbour differences are ~30x smaller than the states; bring them to the same scale.
+        return torch.tanh(20.0 * out / sim.topo.valence.clamp(min=1).float()[:, None])
+
     def _mlp(self, x, ind):
         order = torch.argsort(ind, stable=True)
         row = ind[order]
@@ -111,9 +143,10 @@ class NCA:
         cue = self.cues(sim)
         rate = (self.dt * sim.active)[ind][:, None]
         S = sim.vf["nca"]
+        Y = self._sh_basis(sim)
         for _ in range(n):
             nb = S + sim._graph_lap(S)
-            y = self._mlp(torch.cat([S, nb, cue], 1), ind)
+            y = self._mlp(torch.cat([S, nb, cue, self._sh(sim, Y, nb)], 1), ind)
             S = S + rate * (y - S)
             S = (S + (rate > 0) * self.diff * sim._graph_lap(S)).clamp(-1, 1)
         sim.vf["nca"] = S
@@ -200,28 +233,29 @@ def decode(g):
     return seed, p, ctrl
 
 
-def _n_w(c):
-    return (2 * c + N_CUE) * HID + HID + HID * c + c
+def _n_w(c, k):
+    return (2 * c + N_CUE + k) * HID + HID + HID * c + c
 
 
 def upgrade(g):
-    """Genome from before later physics genes or state channels were added: new
-    genes off (0); weights into and out of new channels 0, so the old form grows,
-    and renders, unchanged."""
+    """Genome from before later physics genes, state channels or SH inputs were
+    added: new genes off (0); weights into and out of new channels and from the
+    SH inputs 0, so the old form grows, and renders, unchanged."""
     g = np.asarray(g, dtype=float)
-    c = next(c for c in (C, 16) if 0 < len(g) - _n_w(c) <= D_PHYS)
-    d = len(g) - _n_w(c)
+    c, k = next(ck for ck in ((C, K_SH), (C, 0), (16, 0)) if 0 < len(g) - _n_w(*ck) <= D_PHYS)
+    d = len(g) - _n_w(c, k)
     w = g[d:]
-    if c != C:
-        W1 = w[:(2 * c + N_CUE) * HID].reshape(2 * c + N_CUE, HID)
-        k = W1.size
-        b1, W2, b2 = w[k:k + HID], w[k + HID:k + HID + HID * c].reshape(HID, c), w[k + HID + HID * c:]
+    if (c, k) != (C, K_SH):
+        p = 2 * c + N_CUE
+        W1 = w[:p * HID].reshape(p, HID)
+        b1, W2, b2 = w[p * HID:p * HID + HID], w[p * HID + HID:p * HID + HID + HID * c].reshape(HID, c), \
+            w[p * HID + HID + HID * c:]
         # New channels slot in after the old fixed ones, ahead of the hidden ones.
         o, a = 13, C - c
         pad = lambda x, axis: np.insert(x, [o] * a, 0.0, axis=axis)
         # NCA scales W1 by 1/sqrt(inputs); keep the effective weights.
-        W1 = np.concatenate([pad(W1[:c], 0), pad(W1[c:2 * c], 0), W1[2 * c:]]) \
-            * math.sqrt(P_IN / (2 * c + N_CUE))
+        W1 = np.concatenate([pad(W1[:c], 0), pad(W1[c:2 * c], 0), W1[2 * c:], np.zeros((K_SH, HID))]) \
+            * math.sqrt(P_IN / p)
         w = np.concatenate([W1.ravel(), b1, pad(W2, 1).ravel(), pad(b2, 0)])
     return np.concatenate([g[:d], np.zeros(D_PHYS - d), w])
 

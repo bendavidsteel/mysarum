@@ -36,7 +36,9 @@ judged from renders by image models.
   2 → spontaneous curvature, 3–5 → surface RGB, 6 → phototropism (anisotropic
   growth along the light direction projected into each face), 7–12 polarity,
   stiffness, curl, accretion, perforation, 13–16 render material (iridescence,
-  film thickness, translucency, gloss). `nca.upgrade` pads older genomes. Attach with
+  film thickness, translucency, gloss). Growth, polarity and hidden channels are
+  also perceived through degree-1/2 spherical-harmonic filters in the world
+  frame (MeshNCA), so patterns can orient to up/down. `nca.upgrade` pads older genomes. Attach with
   `Sim.attach_nca`. Its genome is 17 physics genes in [0,1] + ~1.2k raw MLP
   weights; seeds add `stalk`.
 - `render.py` — Warp BVH ray tracer: AO, soft key-light shadow, two-tone

@@ -15,6 +15,7 @@ refit_every: 1024
 sigma: 0.08
 p_cross: 0.5
 max_verts: 20000
+branch_verts: 40000  # budget for stalk / field-fed accretion forms (evaluate.branching)
 max_ticks: 1000
 render_size: 384
 save_every: 4

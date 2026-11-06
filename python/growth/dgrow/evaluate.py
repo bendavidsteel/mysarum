@@ -143,19 +143,29 @@ def thin_factor(thin, free=0.15, scale=0.15):
     return float(np.exp(-max(0.0, thin - free) / scale))
 
 
+def branching(seed, p):
+    """Forms that grow limbs: the stalk seed, or accretion fed by the supply field.
+    Limbs are tubes of surface that take many vertices to resolve."""
+    return seed == "stalk" or (p.accrete > 0 and p.acc_field > 0)
+
+
 def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
                substeps=20, morph_steps=4, seed=0, size=384, kind="param", on_tick=None,
-               retire=True, on_end=None):
+               retire=True, on_end=None, branch_verts=None):
     """kind: 'param' (genome.py, hand-built growth fields) or 'nca' (nca.py, neural CA).
     on_tick(sim, tick) is called after every growth tick (film.py records with it).
     retire=False keeps settled individuals in the batch until everyone has settled;
-    then on_end(sim) runs before they are extracted (film.py animates them)."""
+    then on_end(sim) runs before they are extracted (film.py animates them).
+    branch_verts: vertex budget for `branching` forms (default max_verts)."""
     dec = [GENOMES[kind].decode(g) for g in genomes]
     seeds, params = [d[0] for d in dec], [d[1] for d in dec]
     meshes = [presets.seed_mesh(k, GENOMES[kind].SEED_RADIUS[k]) for k in seeds]
-    cfg = S.SimConfig(max_verts=max_verts, substeps=substeps,
+    budget = np.array([branch_verts if branch_verts and branching(k, p) else max_verts
+                       for k, p in zip(seeds, params)])
+    cfg = S.SimConfig(max_verts=int(budget.max()), substeps=substeps,
                       morph_steps=morph_steps if kind == "param" else 0, seed=seed)
     sim = S.Sim.from_meshes(meshes, list(params), cfg, spacing=1e4)
+    sim.budget = torch.as_tensor(budget, device=sim.dev)
     if any(p.g_morph for p in params):
         sim.seed_morphogens(preroll=1000)
     if kind == "nca":
@@ -177,7 +187,7 @@ def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
         if it % 10 == 0:
             # Growing meshes fragment torch's cache until Warp can't allocate; hand it back.
             torch.cuda.empty_cache()
-            full = torch.tensor(sim.counts(), device=sim.dev) >= int(0.97 * max_verts)
+            full = torch.tensor(sim.counts(), device=sim.dev) >= (0.97 * sim.budget).long()
             stopped = (full | sim.dead).cpu().numpy()
             for i in np.nonzero(stopped & (stop_tick == max_ticks))[0]:
                 stop_tick[i] = it

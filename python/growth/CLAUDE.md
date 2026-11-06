@@ -53,7 +53,9 @@ judged from renders by image models.
 - `genome.py` — 18 genes in [0,1] → (seed shape, `Params`); gated genes switch
   mechanisms fully off in the lower part of their range. `qd.py genome=nca` /
   `imitate.py --genome nca` use `nca.py`'s genome instead.
-- `evaluate.py` — grow a batch of genomes until each hits its vertex budget;
+- `evaluate.py` — grow a batch of genomes until each hits its vertex budget
+  (`branch_verts` for `branching` forms: stalk seed or field-fed accretion,
+  since limbs are tubes of surface that cost many vertices);
   each settles, then leaves the batch (`Sim.retire`) so stragglers don't keep
   paying for finished meshes; render the scored views + top. `grow_reps` grows each genome several times (QD
   `reps`, imitation `--reps`) and searches score the mean, since NCA forms

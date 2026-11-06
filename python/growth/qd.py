@@ -46,7 +46,7 @@ def worker(gpu, cfg, inq, outq):
         bid, ids, genomes = job
         try:
             res = evaluate.grow_reps(genomes, cfg.reps, max_verts=cfg.max_verts, max_ticks=cfg.max_ticks,
-                                     seed=bid, size=cfg.render_size, kind=cfg.genome)
+                                     branch_verts=cfg.branch_verts, seed=bid, size=cfg.render_size, kind=cfg.genome)
         except Exception as e:  # a bad batch must not kill the run
             res = [[dict(dead=True, error=repr(e), n_verts=0, seed="?")] * cfg.reps for _ in ids]
         outq.put((bid, ids, genomes, res))

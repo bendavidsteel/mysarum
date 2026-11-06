@@ -408,6 +408,7 @@ class Sim:
         self._bvh_tick = -1
         self.dead = torch.zeros(self.n_ind, dtype=torch.bool, device=self.dev)
         self.active = torch.ones(self.n_ind, device=self.dev)  # growth on/off per individual
+        self.budget = torch.full((self.n_ind,), cfg.max_verts, device=self.dev)  # vertex cap per individual
         self.nca = None
         self._cast_tick = {}
         self._rebuild(initial=True)
@@ -473,7 +474,7 @@ class Sim:
     def remesh(self):
         cfg = self.cfg
         counts = torch.bincount(self.ind, minlength=self.n_ind)
-        allow = (counts[self.ind] < cfg.max_verts) & (self.vf["pinned"] < 0.5)
+        allow = (counts[self.ind] < self.budget[self.ind]) & (self.vf["pinned"] < 0.5)
         keys, rest = self.topo.keys, self.rest
         sel = M.select_splits(self.topo, keys, rest, cfg.split_len, allow, self.gen)
         n_split = int(sel.sum())

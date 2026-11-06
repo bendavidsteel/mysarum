@@ -1,7 +1,8 @@
 """Growth time-lapse mp4s: regrow genomes, snapshot every few ticks, then spin the
 finished form. The camera zooms out as the form grows and orbits slowly. Each
-form is filmed until it leaves the batch (evaluate.grow_batch), so the film
-ends on the settled form that the search scored.
+form is filmed until it has settled, so the film ends on the form that the
+search scored. With --live, the closing turn keeps the NCA running on the still
+form (as MeshNCA textures do), so its colour, materials and bumps keep moving.
 
     uv run python film.py --qd outputs/qd_v2 --ids 87 305 158 --out outputs/films
     uv run python film.py --results outputs/imitate_v2/*/result.json --out outputs/films
@@ -42,11 +43,12 @@ def frame_box(pos, floor):
     return 0.5 * (lo + hi), 0.5 * (hi - lo).norm().item()
 
 
-def film(frames, floor, path, size, spp, deg_per_frame=0.8, spin=120, elev=22.0, fps=30):
-    """frames: snapshots (pos, faces, color, material). Camera radius only ever grows, eased."""
+def film(frames, floor, path, size, spp, deg_per_frame=0.8, spin=120, elev=22.0, fps=30, live=None):
+    """frames: snapshots (pos, faces, color, material); live: snapshots for the closing
+    turn (else the last frame held). Camera radius only ever grows, eased."""
     out, c_s, r_s, az = [], None, 0.0, 0.0
     with imageio.get_writer(path, fps=fps, quality=8, macro_block_size=8) as w:
-        for k, (pos, faces, col, mat) in enumerate(frames + [frames[-1]] * spin):
+        for k, (pos, faces, col, mat) in enumerate(frames + (live or [frames[-1]] * spin)):
             pos = pos.float().cuda()
             c, r = frame_box(pos, floor)
             r = max(r, 6.0)
@@ -74,6 +76,7 @@ def main():
     ap.add_argument("--spin", type=int, default=120, help="frames for the closing full turn")
     ap.add_argument("--elev", type=float, default=22.0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--live", type=int, default=2, help="NCA steps per closing-turn frame (0: hold still)")
     ap.add_argument("--out", default="outputs/films")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -91,22 +94,34 @@ def main():
         genomes.append(r["genome"])
     genomes = [G.upgrade(g) if len(g) != G.D else g for g in map(np.asarray, genomes)]
     shots = [[] for _ in genomes]
+    live = [[] for _ in genomes]
+    stopped = {}
+    settle = 200 // 20  # grow_batch's relax // substeps
 
     def record(sim, t):
         if t % a.every:
             return
         for i in range(len(genomes)):
-            # Until it has settled and left the batch (Sim.retire).
-            if bool((sim.ind == i).any()):
+            # Until it has settled (grow_batch keeps it in the batch when retire=False).
+            if not bool(sim.active[i] > 0):
+                stopped.setdefault(i, t)
+            if t <= stopped.get(i, t) + settle and bool((sim.ind == i).any()):
                 shots[i].append(snapshot(sim, i))
 
+    def animate(sim):
+        for _ in range(a.spin):
+            sim.nca.step(sim, a.live, live=True)
+            for i in range(len(genomes)):
+                live[i].append(snapshot(sim, i))
+
     res = evaluate.grow_batch(np.array(genomes), max_verts=a.max_verts, max_ticks=a.max_ticks,
-                              seed=a.seed, kind=a.genome, on_tick=record)
-    for name, fr, r in zip(names, shots, res):
+                              seed=a.seed, kind=a.genome, on_tick=record, retire=a.live == 0,
+                              on_end=animate if a.live and a.genome == "nca" else None)
+    for name, fr, lv, r in zip(names, shots, live, res):
         if r["dead"]:
             print(name, "died", flush=True)
             continue
-        film(fr, r["floor"], f"{a.out}/{name}.mp4", a.size, a.spp, a.deg, a.spin, a.elev)
+        film(fr, r["floor"], f"{a.out}/{name}.mp4", a.size, a.spp, a.deg, a.spin, a.elev, live=lv or None)
         print(name, len(fr), "frames", flush=True)
 
 

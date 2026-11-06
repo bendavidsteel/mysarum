@@ -189,6 +189,30 @@ def _vertex_normals(pos, faces):
     return torch.nn.functional.normalize(vn, dim=1)
 
 
+BUMP = 1.0  # surface height range (± initial edge lengths) at material height 0 / 1
+
+
+def _bump_normals(vn, pos, faces, h):
+    """Tilt vertex normals by the surface gradient of per-vertex height h: the
+    area-weighted mean of each face's (linear) gradient, so shading stays smooth."""
+    p0, p1, p2 = pos[faces[:, 0]], pos[faces[:, 1]], pos[faces[:, 2]]
+    e1, e2 = p1 - p0, p2 - p0
+    fn = torch.cross(e1, e2, dim=1)
+    a2 = (fn * fn).sum(1, keepdim=True).clamp(min=1e-12)
+    h0 = h[faces[:, 0]][:, None]
+    # Dual basis of (e1, e2) in the face plane: g·e1 = h1 - h0, g·e2 = h2 - h0.
+    g = ((h[faces[:, 1]][:, None] - h0) * torch.cross(e2, fn, dim=1)
+         + (h[faces[:, 2]][:, None] - h0) * torch.cross(fn, e1, dim=1)) / a2
+    w = a2.sqrt()
+    gv = torch.zeros_like(pos)
+    for k in range(3):
+        gv.index_add_(0, faces[:, k], g * w)
+    gv = gv / torch.zeros(len(pos), 1, device=pos.device).index_add_(0, faces[:, 0], w) \
+        .index_add_(0, faces[:, 1], w).index_add_(0, faces[:, 2], w).clamp(min=1e-12)
+    gv = gv - (gv * vn).sum(1, keepdim=True) * vn
+    return torch.nn.functional.normalize(vn - gv, dim=1)
+
+
 def _cmap(x, name="magma"):
     import matplotlib
     return torch.as_tensor(matplotlib.colormaps[name](x.cpu().numpy())[:, :3], dtype=torch.float32)
@@ -203,7 +227,8 @@ def render(pos, faces, W=768, H=768, azim=35.0, elev=30.0, spp=16, ao_n=4,
            radius=None, front=FRONT, back=BACK, light=(0.4, -0.3, 0.85), floor=None, material=None):
     """Render a mesh to an (H, W, 3) uint8 array. pos/faces are torch tensors on CUDA.
     `floor`: z of a ground plane that hides anything below it; framing ignores that part.
-    `material`: (N, 4) per-vertex iridescence, film thickness, translucency, gloss in [0, 1]."""
+    `material`: (N, 4) per-vertex iridescence, film thickness, translucency, gloss in [0, 1],
+    optionally a 5th column of surface height (0.5 = flat) shaded as bumps."""
     dev = pos.device
     wdev = wp.device_from_torch(dev)
     pos = pos.float().contiguous()
@@ -240,7 +265,10 @@ def render(pos, faces, W=768, H=768, azim=35.0, elev=30.0, spp=16, ao_n=4,
     else:
         vcol = torch.zeros_like(pos)
     mat = torch.zeros(1, 4, device=dev) if material is None else \
-        torch.as_tensor(material, device=dev).float().clamp(0, 1).contiguous()
+        torch.as_tensor(material, device=dev).float().clamp(0, 1)
+    if mat.shape[1] > 4:
+        vn = _bump_normals(vn, pos, faces.long(), (mat[:, 4] - 0.5) * 2 * BUMP)
+    mat = mat[:, :4].contiguous()
     img = wp.zeros(W * H, dtype=wp.vec3, device=wdev)
     lin = lambda c: wp.vec3(*[x**2.2 for x in c])
     L = torch.nn.functional.normalize(torch.tensor(light), dim=0).tolist()

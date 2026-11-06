@@ -144,9 +144,12 @@ def thin_factor(thin, free=0.15, scale=0.15):
 
 
 def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
-               substeps=20, morph_steps=4, seed=0, size=384, kind="param", on_tick=None):
+               substeps=20, morph_steps=4, seed=0, size=384, kind="param", on_tick=None,
+               retire=True, on_end=None):
     """kind: 'param' (genome.py, hand-built growth fields) or 'nca' (nca.py, neural CA).
-    on_tick(sim, tick) is called after every growth tick (film.py records with it)."""
+    on_tick(sim, tick) is called after every growth tick (film.py records with it).
+    retire=False keeps settled individuals in the batch until everyone has settled;
+    then on_end(sim) runs before they are extracted (film.py animates them)."""
     dec = [GENOMES[kind].decode(g) for g in genomes]
     seeds, params = [d[0] for d in dec], [d[1] for d in dec]
     meshes = [presets.seed_mesh(k, GENOMES[kind].SEED_RADIUS[k]) for k in seeds]
@@ -158,13 +161,14 @@ def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
     if kind == "nca":
         ctrl = [d[2] for d in dec]
         sim.attach_nca(NC.NCA(np.stack([c["weights"] for c in ctrl]), [c["dt"] for c in ctrl],
-                              [c["gain"] for c in ctrl], device=sim.dev))
+                              [c["gain"] for c in ctrl], [c["fire"] for c in ctrl],
+                              [c["sh_local"] for c in ctrl], device=sim.dev))
     n = len(genomes)
     stop_tick = np.full(n, max_ticks)
     # A stopped individual settles for `relax` substeps, then leaves the batch
     # (Sim.retire) so the stragglers don't keep paying for it.
     settle = max(1, relax // substeps)
-    retire_at, final = {}, {}
+    retire_at, final, settled = {}, {}, set()
     t0 = time.time()
     for it in range(max_ticks):
         sim.step(dt)
@@ -179,16 +183,21 @@ def grow_batch(genomes, max_verts=40000, max_ticks=1000, dt=0.01, relax=200,
                 stop_tick[i] = it
                 retire_at[int(i)] = it + settle
             sim.active = torch.where(torch.as_tensor(stopped, device=sim.dev), 0.0, sim.active)
-        due = [i for i, t in retire_at.items() if t <= it and i not in final]
-        if due:
+        due = [i for i, t in retire_at.items() if t <= it and i not in final and i not in settled]
+        if due and retire:
             final.update(sim.retire(due))
-        if len(final) == n:
+        settled.update(due)
+        if len(settled) == n:
             break
-    if len(final) < n:
+    if len(settled) < n:
         sim.active.zero_()
         for _ in range(settle):
             sim.step(dt)
-        final.update(sim.retire([i for i in range(n) if i not in final]))
+    if on_end is not None:
+        on_end(sim)
+    rest = [i for i in range(n) if i not in final]
+    if rest:
+        final.update(sim.retire(rest))
     secs = time.time() - t0
 
     out = []

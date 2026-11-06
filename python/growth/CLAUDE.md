@@ -36,14 +36,18 @@ judged from renders by image models.
   2 → spontaneous curvature, 3–5 → surface RGB, 6 → phototropism (anisotropic
   growth along the light direction projected into each face), 7–12 polarity,
   stiffness, curl, accretion, perforation, 13–16 render material (iridescence,
-  film thickness, translucency, gloss). Growth, polarity and hidden channels are
+  film thickness, translucency, gloss), 17 surface height (bump shading). Growth, polarity and hidden channels are
   also perceived through degree-1/2 spherical-harmonic filters in the world
-  frame (MeshNCA), so patterns can orient to up/down. `nca.upgrade` pads older genomes. Attach with
+  frame (MeshNCA), so patterns can orient to up/down; gene `sh_local` measures
+  them in a surface frame (normal, ∇distance) instead. Gene `nca_fire` makes
+  updates asynchronous (each vertex fires with probability < 1, as in MeshNCA).
+  `nca.upgrade` pads older genomes through each past layout (`LAYOUTS`). Attach with
   `Sim.attach_nca`. Its genome is 17 physics genes in [0,1] + ~1.2k raw MLP
   weights; seeds add `stalk`.
 - `render.py` — Warp BVH ray tracer: AO, soft key-light shadow, two-tone
   front/back faces; optional per-vertex material (thin-film iridescence,
-  transmitted light through thin tissue, gloss coat). `views()` = iso/side/top strip, `turntable()` = mp4/gif.
+  transmitted light through thin tissue, gloss coat, and height, which tilts
+  the shading normals by its surface gradient). `views()` = iso/side/top strip, `turntable()` = mp4/gif.
 - `presets.py` — seed meshes + hand-built presets after real organisms
   (lettuce, kale, saddle, hyperbolic, trumpet, brain, turing, coral).
 - `genome.py` — 18 genes in [0,1] → (seed shape, `Params`); gated genes switch

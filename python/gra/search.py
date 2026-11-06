@@ -100,6 +100,27 @@ class Archive:
                 results.append((r, c, f))
         return results
 
+    def diverse_cells(self, n=5, min_dist=3):
+        """Select top-fitness cells with minimum BD grid distance between them."""
+        flat = np.array(self.fitness.flatten())
+        order = np.argsort(-flat)
+        selected = []
+        for idx in order:
+            f = float(flat[idx])
+            if f <= -1e6:
+                break
+            r, c = divmod(int(idx), BD2_BINS)
+            too_close = False
+            for sr, sc, _ in selected:
+                if abs(r - sr) + abs(c - sc) < min_dist:
+                    too_close = True
+                    break
+            if not too_close:
+                selected.append((r, c, f))
+            if len(selected) >= n:
+                break
+        return selected
+
 
 # ── Fitness evaluation ───────────────────────────────────────────────────────
 

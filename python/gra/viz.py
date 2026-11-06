@@ -2,7 +2,7 @@
 Visualization for GRA search results.
 
 - MAP-Elites archive heatmap
-- Replay interesting simulations with spring layout
+- Replay interesting simulations with force-directed layout
 - Metric time series
 """
 
@@ -31,6 +31,84 @@ from sim import (
 from search import (
     Archive, BD1_MIN, BD1_MAX, BD2_MIN, BD2_MAX, BD1_BINS, BD2_BINS,
 )
+
+
+# ── Force-directed layout ───────────────────────────────────────────────────
+
+def force_layout(G, iterations=500, k_repel=1.5, k_spring=8.0, seed=42):
+    """Spring-electrical force-directed layout for organic graph structures.
+
+    Uses Coulomb repulsion (1/r²) between all nodes and Hooke spring attraction
+    on edges, with simulated annealing. Produces layouts matching the paper's
+    Mathematica-style organic visualizations.
+    """
+    n = G.number_of_nodes()
+    if n == 0:
+        return {}
+    if n == 1:
+        return {list(G.nodes())[0]: np.array([0.0, 0.0])}
+
+    rng_state = np.random.RandomState(seed)
+    nodes = list(G.nodes())
+    node_idx = {v: i for i, v in enumerate(nodes)}
+
+    pos = rng_state.randn(n, 2).astype(np.float64) * np.sqrt(n)
+    vel = np.zeros_like(pos)
+
+    edges = np.array([(node_idx[u], node_idx[v]) for u, v in G.edges()],
+                     dtype=np.int32) if G.number_of_edges() > 0 \
+            else np.empty((0, 2), dtype=np.int32)
+
+    rest_len = 1.0
+
+    for it in range(iterations):
+        forces = np.zeros_like(pos)
+        t = max(0.005, 1.0 - it / iterations)
+
+        # Repulsion: Coulomb 1/r²
+        dx = pos[:, 0:1] - pos[:, 0:1].T
+        dy = pos[:, 1:2] - pos[:, 1:2].T
+        dist2 = dx**2 + dy**2 + 0.01
+        dist = np.sqrt(dist2)
+
+        rep_f = k_repel / dist2
+        np.fill_diagonal(rep_f, 0)
+        forces[:, 0] += (dx / dist * rep_f).sum(axis=1)
+        forces[:, 1] += (dy / dist * rep_f).sum(axis=1)
+
+        # Spring attraction on edges
+        if len(edges) > 0:
+            ei, ej = edges[:, 0], edges[:, 1]
+            edx = pos[ej, 0] - pos[ei, 0]
+            edy = pos[ej, 1] - pos[ei, 1]
+            ed = np.sqrt(edx**2 + edy**2 + 1e-6)
+            f = k_spring * (ed - rest_len) / ed
+            np.add.at(forces[:, 0], ei, edx * f)
+            np.add.at(forces[:, 1], ei, edy * f)
+            np.add.at(forces[:, 0], ej, -edx * f)
+            np.add.at(forces[:, 1], ej, -edy * f)
+
+        # Damped velocity update
+        vel = vel * 0.8 + forces * 0.015 * t
+        disp = np.sqrt((vel**2).sum(axis=1, keepdims=True) + 1e-6)
+        max_d = t * 2.0
+        vel *= np.minimum(max_d / disp, 1.0)
+        pos += vel
+        pos -= pos.mean(axis=0)
+
+    return {nodes[i]: pos[i] for i in range(n)}
+
+
+def compute_layout(G, seed=42):
+    """Compute force-directed layout, falling back to spring for huge graphs."""
+    n = G.number_of_nodes()
+    if n == 0:
+        return {}
+    if n <= 800:
+        return force_layout(G, iterations=500, seed=seed)
+    # For large graphs, use spring_layout with tuned params
+    return nx.spring_layout(G, iterations=200, seed=seed,
+                            k=3.0 / max(np.sqrt(n), 1))
 
 
 # ── Archive heatmap ──────────────────────────────────────────────────────────
@@ -122,13 +200,10 @@ def state_to_networkx(state: SimState) -> tuple[nx.Graph, np.ndarray]:
 
 # ── Drawing helper ───────────────────────────────────────────────────────────
 
-def _draw_graph(ax, G, colors, pos, dark_bg=True):
-    """Draw a graph with nice styling on the given axes."""
+def _draw_graph(ax, G, colors, pos):
+    """Draw a graph in paper-matching style (white bg, thin edges, colored nodes)."""
     n = G.number_of_nodes()
     e = G.number_of_edges()
-
-    if dark_bg:
-        ax.set_facecolor("#0a0a14")
 
     if n == 0:
         ax.text(0.5, 0.5, "DEAD", ha="center", va="center",
@@ -137,30 +212,30 @@ def _draw_graph(ax, G, colors, pos, dark_bg=True):
 
     if not pos:
         ax.text(0.5, 0.5, f"{n} nodes\n{e} edges", ha="center", va="center",
-                fontsize=12, color="white" if dark_bg else "black",
-                transform=ax.transAxes)
+                fontsize=12, color="black", transform=ax.transAxes)
         return
 
-    # Edge styling: cyan-ish, thicker for small graphs
-    edge_width = np.clip(3.0 / np.sqrt(max(n, 1)), 0.3, 2.5)
-    edge_alpha = np.clip(1.5 / np.sqrt(max(n, 1)), 0.15, 0.6)
-    edge_color = "#1a8aaa" if dark_bg else "#006080"
+    # Thin edges colored by endpoint average
+    edge_width = max(0.4, min(1.5, 60.0 / n))
+    edge_alpha = max(0.2, min(0.6, 50.0 / n))
+
+    edge_colors = []
+    nodes_list = list(G.nodes())
+    for u, v in G.edges():
+        c = (colors[u] + colors[v]) / 2
+        c = np.clip(c * 0.7, 0, 1)  # darken for edge visibility
+        edge_colors.append(c)
 
     nx.draw_networkx_edges(G, pos, ax=ax, alpha=edge_alpha,
-                           edge_color=edge_color, width=edge_width)
+                           edge_color=edge_colors if edge_colors else "#888",
+                           width=edge_width)
 
-    # Node sizing: bigger for small graphs, minimum visible size
-    node_size = np.clip(2000 / max(n, 1), 15, 300)
-
-    # Brighten colors for visibility on dark background
-    if dark_bg:
-        bright = colors * 0.6 + 0.4  # lift towards white
-    else:
-        bright = colors
+    # Small colored nodes, no border
+    node_size = max(8, min(80, 6000.0 / n))
 
     nx.draw_networkx_nodes(G, pos, ax=ax, node_size=node_size,
-                           node_color=bright, edgecolors="white" if dark_bg else "gray",
-                           linewidths=0.3)
+                           node_color=colors, edgecolors="none",
+                           linewidths=0)
 
 
 # ── Replay a simulation ─────────────────────────────────────────────────────
@@ -196,14 +271,12 @@ def replay_simulation(params: Params, graph_idx: int = 0,
         metrics_list.append(chunk_metrics)
         snapshots.append((chunk_start + chunk_size, state))
 
-    # Determine layout: use consistent spring layout seeded from the largest graph
-    # to keep spatial coherence across snapshots
     n_snaps = len(snapshots)
     cols = min(5, n_snaps)
     rows = (n_snaps + cols - 1) // cols
 
     fig, axes = plt.subplots(rows, cols, figsize=(4.5 * cols, 4.5 * rows),
-                              facecolor="#0a0a14")
+                              facecolor="white")
     if rows == 1:
         axes = [axes] if cols == 1 else list(axes)
     else:
@@ -216,25 +289,24 @@ def replay_simulation(params: Params, graph_idx: int = 0,
         G, colors = state_to_networkx(snap_state)
         n_nodes = G.number_of_nodes()
 
-        if n_nodes > 0 and n_nodes <= 1000:
-            pos = nx.spring_layout(G, iterations=80, seed=42, k=1.5/max(np.sqrt(n_nodes), 1))
+        if n_nodes > 0 and n_nodes <= 1500:
+            pos = compute_layout(G, seed=42)
         else:
             pos = {}
 
-        _draw_graph(ax, G, colors, pos, dark_bg=True)
+        _draw_graph(ax, G, colors, pos)
         ax.set_title(f"t={step}  n={n_nodes}  e={G.number_of_edges()}",
-                     color="white", fontsize=10)
+                     fontsize=10)
         ax.axis("off")
 
     for i in range(len(snapshots), len(axes)):
-        axes[i].set_facecolor("#0a0a14")
         axes[i].axis("off")
 
-    plt.suptitle("GRA Simulation Replay", fontsize=14, color="white")
+    plt.suptitle("GRA Simulation Replay", fontsize=14)
     plt.tight_layout()
 
     path = save_path or "replay.png"
-    plt.savefig(path, dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.savefig(path, dpi=200, bbox_inches="tight")
     print(f"Saved replay to {path}")
     plt.close(fig)
 
@@ -289,8 +361,8 @@ def show_top_results(archive: Archive, n: int = 5, graph_idx: int = 0,
     import os
     os.makedirs(save_dir, exist_ok=True)
 
-    top = archive.best_cells(n)
-    print(f"Replaying top {len(top)} results (saving to {save_dir}/)...")
+    top = archive.diverse_cells(n)
+    print(f"Replaying top {len(top)} diverse results (saving to {save_dir}/)...")
 
     for rank, (r, c, fitness) in enumerate(top):
         bd1_val = BD1_MIN + (r + 0.5) / BD1_BINS * (BD1_MAX - BD1_MIN)
@@ -353,9 +425,8 @@ def animate_simulation(params: Params, graph_idx: int = 0,
         state, _ = run_simulation(params, state, step_per_frame)
         G, colors = state_to_networkx(state)
         n = G.number_of_nodes()
-        if n > 0 and n <= 500:
-            pos = nx.spring_layout(G, iterations=50, seed=42,
-                                   k=1.5/max(np.sqrt(n), 1))
+        if n > 0 and n <= 800:
+            pos = compute_layout(G, seed=42)
         else:
             pos = {}
         frames.append((G, colors, pos, i + step_per_frame, n))
@@ -364,13 +435,13 @@ def animate_simulation(params: Params, graph_idx: int = 0,
         print("No frames generated.")
         return
 
-    fig, ax = plt.subplots(1, 1, figsize=(8, 8), facecolor="#0a0a14")
+    fig, ax = plt.subplots(1, 1, figsize=(8, 8), facecolor="white")
 
     def draw_frame(frame_idx):
         ax.clear()
         G, colors, pos, step, n = frames[frame_idx]
-        _draw_graph(ax, G, colors, pos, dark_bg=True)
-        ax.set_title(f"t={step}  nodes={n}", color="white", fontsize=14)
+        _draw_graph(ax, G, colors, pos)
+        ax.set_title(f"t={step}  nodes={n}", fontsize=14)
         ax.axis("off")
 
     anim = animation.FuncAnimation(fig, draw_frame, frames=len(frames),

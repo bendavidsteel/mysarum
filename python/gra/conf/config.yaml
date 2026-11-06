@@ -1,0 +1,41 @@
+sim:
+  type: continuous    # continuous | discrete | discrete_merge
+  max_nodes: 512
+  max_degree: 8
+  max_cheb_order: 8
+  num_channels: 3
+  max_topo_ops: 8
+  topo_every: 10
+  graph: petersen
+
+search:
+  num_generations: 100
+  batch_size: 64
+  sim_steps: 500
+  seed: 42
+  graph_idx: 0
+  mode: map_elites
+
+map_elites:
+  bd1_min: -3.0
+  bd1_max: 7.0
+  bd1_bins: 20
+  bd2_min: 0.0
+  bd2_max: 0.25
+  bd2_bins: 20
+  exploration_fraction: 0.25
+
+wandb:
+  enabled: false
+  project: gra-search
+  entity: null
+  tags: []
+  notes: ""
+  log_every: 10
+  log_archive_every: 50
+
+viz:
+  top_n: 5
+  replay_steps: 500
+  save_dir: results
+  animate: false

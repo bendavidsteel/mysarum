@@ -9,7 +9,9 @@ Implements the original discrete CA model from Cousin & Maignan (2022):
 - Division maintains 3-regularity by redistributing neighbors
 """
 
+import json
 from functools import partial
+from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
@@ -198,8 +200,46 @@ GRAPH_BUILDERS = {
 }
 
 
+def _make_state_from_json(rng: jnp.ndarray, graph_idx: int = 0) -> SimState:
+    """Load a 3-regular seed graph from graphs.json."""
+    path = Path(__file__).parent / "graphs.json"
+    with open(path) as f:
+        graphs = json.load(f)
+    g = graphs[graph_idx % len(graphs)]
+    n = len(g["state"])
+
+    nb = np.full((MAX_NODES, DEGREE), EMPTY, dtype=np.int32)
+    deg = np.zeros(MAX_NODES, dtype=np.int32)
+    for a, b in g["edgelist"]:
+        if a < MAX_NODES and b < MAX_NODES:
+            if deg[a] < DEGREE:
+                nb[a, deg[a]] = b
+                deg[a] += 1
+            if deg[b] < DEGREE:
+                nb[b, deg[b]] = a
+                deg[b] += 1
+
+    states = np.zeros(MAX_NODES, dtype=np.int32)
+    states[:n] = np.array(g["state"], dtype=np.int32)
+
+    active = np.zeros(MAX_NODES, dtype=bool)
+    active[:n] = True
+
+    return SimState(
+        node_states=jnp.array(states),
+        node_active=jnp.array(active),
+        neighbors=jnp.array(nb),
+        num_active=jnp.array(n, dtype=jnp.int32),
+        rng=rng,
+    )
+
+
 def make_init_state(rng: jnp.ndarray, graph: str = "petersen") -> SimState:
-    """Create an initial state from one of the built-in seed graphs."""
+    """Create an initial state from a built-in or graphs.json seed graph."""
+    if graph.startswith("json"):
+        # "json" or "json:3" to pick index
+        idx = int(graph.split(":")[1]) if ":" in graph else 0
+        return _make_state_from_json(rng, idx)
     builder = GRAPH_BUILDERS.get(graph, make_petersen_state)
     return builder(rng)
 

@@ -84,7 +84,6 @@ def check_reciprocity(state):
 
 def draw_snapshot(ax, G, colors, label_map, title, broken, orphans):
     """Draw one graph snapshot with labels and status."""
-    ax.set_facecolor("#0a0a14")
     n = G.number_of_nodes()
 
     if n == 0:
@@ -93,18 +92,26 @@ def draw_snapshot(ax, G, colors, label_map, title, broken, orphans):
         ax.axis("off")
         return
 
-    pos = nx.spring_layout(G, iterations=120, seed=42,
-                           k=2.0 / max(np.sqrt(n), 1))
+    from viz import compute_layout
+    pos = compute_layout(G, seed=42)
 
-    edge_alpha = np.clip(2.0 / np.sqrt(max(n, 1)), 0.2, 0.7)
+    edge_width = max(0.4, min(1.5, 60.0 / n))
+    edge_alpha = max(0.2, min(0.6, 50.0 / n))
+
+    edge_colors_list = []
+    for u, v in G.edges():
+        c = (colors[u] + colors[v]) / 2
+        c = np.clip(c * 0.7, 0, 1)
+        edge_colors_list.append(c)
+
     nx.draw_networkx_edges(G, pos, ax=ax, alpha=edge_alpha,
-                           edge_color="#1a8aaa", width=1.2)
+                           edge_color=edge_colors_list if edge_colors_list else "#888",
+                           width=edge_width)
 
-    node_size = np.clip(3000 / max(n, 1), 30, 400)
-    bright = colors * 0.5 + 0.5
+    node_size = max(8, min(80, 6000.0 / n))
     nx.draw_networkx_nodes(G, pos, ax=ax, node_size=node_size,
-                           node_color=bright, edgecolors="white",
-                           linewidths=0.4)
+                           node_color=colors, edgecolors="none",
+                           linewidths=0)
 
     if n <= 80:
         labels = {k: str(v) for k, v in label_map.items()}

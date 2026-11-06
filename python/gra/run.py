@@ -42,7 +42,24 @@ def main(cfg: DictConfig):
 def search(cfg: DictConfig):
     sim_type = cfg.sim.get("type", "continuous")
 
-    if sim_type == "discrete":
+    if sim_type == "discrete_merge":
+        from search_discrete_merge import run_search, plot_archive, show_top_results
+        import sim_discrete_merge as sim_mod
+        sim_mod.configure(cfg)
+        archive = run_search(cfg)
+
+        save_path = Path("archive.pkl")
+        with open(save_path, "wb") as f:
+            pickle.dump(archive, f)
+        print(f"\nArchive saved to {save_path}")
+
+        plot_archive(archive, save_path="archive.png")
+        show_top_results(archive, n=cfg.viz.top_n,
+                         graph=cfg.sim.get("graph", "petersen"),
+                         sim_steps=cfg.viz.replay_steps,
+                         save_dir=cfg.viz.save_dir)
+
+    elif sim_type == "discrete":
         from search_discrete import run_search, plot_archive, show_top_results
         import sim_discrete as sim_mod
         sim_mod.configure(cfg)
@@ -86,7 +103,18 @@ def replay(cfg: DictConfig):
 
     sim_type = cfg.sim.get("type", "continuous")
 
-    if sim_type == "discrete":
+    if sim_type == "discrete_merge":
+        import sim_discrete_merge as sim_mod
+        sim_mod.configure(cfg)
+        from search_discrete_merge import configure_search, plot_archive, show_top_results
+        configure_search(cfg)
+        plot_archive(archive, save_path="archive.png")
+        show_top_results(archive, n=cfg.viz.top_n,
+                         graph=cfg.sim.get("graph", "petersen"),
+                         sim_steps=cfg.viz.replay_steps,
+                         save_dir=cfg.viz.save_dir)
+
+    elif sim_type == "discrete":
         import sim_discrete as sim_mod
         sim_mod.configure(cfg)
         from search_discrete import configure_search, plot_archive, show_top_results
@@ -107,7 +135,7 @@ def replay(cfg: DictConfig):
         plot_archive(archive, save_path="archive.png")
 
         if cfg.viz.animate:
-            top = archive.best_cells(cfg.viz.top_n)
+            top = archive.diverse_cells(cfg.viz.top_n)
             for rank, (r, c, fitness) in enumerate(top):
                 params = jax.tree.map(lambda arr: arr[r, c], archive.params)
                 print(f"\nAnimating rank {rank+1} (fitness={fitness:.2f})...")

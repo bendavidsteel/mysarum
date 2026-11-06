@@ -107,6 +107,27 @@ class Archive:
                 results.append((r, c, f))
         return results
 
+    def diverse_cells(self, n=5, min_dist=3):
+        """Select top-fitness cells with minimum BD grid distance between them."""
+        flat = np.array(self.fitness.flatten())
+        order = np.argsort(-flat)
+        selected = []
+        for idx in order:
+            f = float(flat[idx])
+            if f <= -1e6:
+                break
+            r, c = divmod(int(idx), BD2_BINS)
+            too_close = False
+            for sr, sc, _ in selected:
+                if abs(r - sr) + abs(c - sc) < min_dist:
+                    too_close = True
+                    break
+            if not too_close:
+                selected.append((r, c, f))
+            if len(selected) >= n:
+                break
+        return selected
+
 
 # ── Fitness evaluation ───────────────────────────────────────────────────────
 
@@ -548,10 +569,11 @@ def show_top_results(archive, n=5, graph="petersen",
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import networkx as nx
+    from viz import force_layout, compute_layout
 
     os.makedirs(save_dir, exist_ok=True)
-    top = archive.best_cells(n)
-    print(f"\nReplaying top {len(top)} rules (saving to {save_dir}/)...")
+    top = archive.diverse_cells(n)
+    print(f"\nReplaying top {len(top)} diverse rules (saving to {save_dir}/)...")
 
     for rank, (r, c, fitness) in enumerate(top):
         rule_n = int(archive.summary["rule_number"][r, c])
@@ -601,22 +623,28 @@ def show_top_results(archive, n=5, graph="petersen",
             G, colors = state_to_networkx(snap_state)
             nn = G.number_of_nodes()
 
-            if 0 < nn <= 2000:
-                pos = nx.spring_layout(
-                    G, iterations=max(30, 150 - nn // 5), seed=42,
-                    k=1.5 / max(np.sqrt(nn), 1))
+            if 0 < nn <= 1500:
+                pos = compute_layout(G, seed=42)
             else:
                 pos = {}
 
             if nn > 0 and pos:
-                node_size = np.clip(2000 / max(nn, 1), 8, 200)
-                edge_width = np.clip(3.0 / np.sqrt(max(nn, 1)), 0.2, 2.0)
-                edge_alpha = np.clip(1.5 / np.sqrt(max(nn, 1)), 0.1, 0.5)
+                edge_width = max(0.4, min(1.5, 60.0 / nn))
+                edge_alpha = max(0.2, min(0.6, 50.0 / nn))
+
+                edge_colors = []
+                for u, v in G.edges():
+                    c = (colors[u] + colors[v]) / 2
+                    c = np.clip(c * 0.7, 0, 1)
+                    edge_colors.append(c)
+
                 nx.draw_networkx_edges(G, pos, ax=ax, alpha=edge_alpha,
-                                       edge_color="#888", width=edge_width)
+                                       edge_color=edge_colors if edge_colors else "#888",
+                                       width=edge_width)
+                node_size = max(8, min(80, 6000.0 / nn))
                 nx.draw_networkx_nodes(G, pos, ax=ax, node_size=node_size,
-                                       node_color=colors, edgecolors="gray",
-                                       linewidths=0.3)
+                                       node_color=colors, edgecolors="none",
+                                       linewidths=0)
             elif nn == 0:
                 ax.text(0.5, 0.5, "DEAD", ha="center", va="center",
                         fontsize=16, color="red", transform=ax.transAxes)
@@ -636,6 +664,6 @@ def show_top_results(archive, n=5, graph="petersen",
             fontsize=13)
         plt.tight_layout()
         path = f"{save_dir}/rank{rank + 1}_rule{rule_n}.png"
-        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.savefig(path, dpi=200, bbox_inches="tight")
         print(f"  Saved to {path}")
         plt.close(fig)

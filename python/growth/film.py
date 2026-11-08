@@ -68,6 +68,7 @@ def main():
     ap.add_argument("--results", nargs="*", default=[], help="imitation result.json files")
     ap.add_argument("--genome", default="nca")
     ap.add_argument("--max_verts", type=int, default=40000)
+    ap.add_argument("--branch_verts", type=int, default=None, help="budget for branching forms (as QD's)")
     ap.add_argument("--max_ticks", type=int, default=1000)
     ap.add_argument("--every", type=int, default=4, help="ticks per frame")
     ap.add_argument("--size", type=int, default=640)
@@ -115,7 +116,7 @@ def main():
                 live[i].append(snapshot(sim, i))
 
     res = evaluate.grow_batch(np.array(genomes), max_verts=a.max_verts, max_ticks=a.max_ticks,
-                              seed=a.seed, kind=a.genome, on_tick=record, retire=a.live == 0,
+                              branch_verts=a.branch_verts, seed=a.seed, kind=a.genome, on_tick=record, retire=a.live == 0,
                               on_end=animate if a.live and a.genome == "nca" else None)
     for name, fr, lv, r in zip(names, shots, live, res):
         if r["dead"]:

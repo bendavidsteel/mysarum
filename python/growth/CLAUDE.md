@@ -29,7 +29,7 @@ judged from renders by image models.
 - Gray-Scott morphogens (`U`, `V`) run on the normalised graph Laplacian when
   `SimConfig.morph_steps > 0`.
 - Individuals that go non-finite are quarantined (frozen), not fatal.
-- `nca.py` — neural graph CA: a per-vertex state (12 channels in [-1,1]) updated
+- `nca.py` — neural graph CA: a per-vertex state (30 channels in [-1,1], the last 12 hidden) updated
   by a per-individual MLP over own state, neighbour mean and local cues
   (distance, curvature, height, normal, boundary, noise, light), plus fixed
   per-channel diffusion. Channel 0 → growth rate, 1 → anisotropy along ∇d,
@@ -42,7 +42,7 @@ judged from renders by image models.
   them in a surface frame (normal, ∇distance) instead. Gene `nca_fire` makes
   updates asynchronous (each vertex fires with probability < 1, as in MeshNCA).
   `nca.upgrade` pads older genomes through each past layout (`LAYOUTS`). Attach with
-  `Sim.attach_nca`. Its genome is 17 physics genes in [0,1] + ~1.2k raw MLP
+  `Sim.attach_nca`. Its genome is 39 physics genes in [0,1] + ~10k raw MLP (one hidden layer of 48)
   weights; seeds add `stalk`.
 - `render.py` — Warp BVH ray tracer: AO, soft key-light shadow, two-tone
   front/back faces; optional per-vertex material (thin-film iridescence,

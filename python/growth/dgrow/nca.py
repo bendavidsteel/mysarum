@@ -39,8 +39,8 @@ import torch
 from . import genome as PG
 from .sim import Params
 
-C = 21
-HID = 24
+C = 30
+HID = 48
 N_CUE = 8
 N_SH = 8  # real spherical harmonics, degrees 1 and 2
 CH_GROW, CH_ANISO, CH_CURL, CH_TROPIC = 0, 1, 2, 6
@@ -50,7 +50,8 @@ CH_BUMP = 17  # surface height for bump shading
 N_OUT = 18  # channels with a fixed meaning; the rest are hidden
 CH_RGB = slice(3, 6)
 # The polarity channel diffuses faster so its gradient is smooth enough to steer by.
-DIFF = [0.05] * 7 + [0.2] + [0.05] * 10 + list(np.linspace(0.0, 0.5, C - N_OUT))
+# Hidden channels diffuse at a spread of rates; the first three kept theirs when v8 added nine.
+DIFF = [0.05] * 7 + [0.2] + [0.05] * 10 + [0.0, 0.25, 0.5] + list(np.linspace(0.025, 0.475, C - N_OUT - 3))
 SH_CH = [CH_GROW, CH_POL] + list(range(N_OUT, C))
 K_SH = len(SH_CH) * N_SH
 P_IN = 2 * C + N_CUE + K_SH
@@ -273,31 +274,44 @@ def decode(g):
     return seed, p, ctrl
 
 
-def _n_w(c, k):
-    return (2 * c + N_CUE + k) * HID + HID + HID * c + c
+def _n_w(c, k, h):
+    return (2 * c + N_CUE + k) * h + h + h * c + c
 
 
-# Past (channels, SH inputs) layouts, newest first, and where each next one inserted
-# its new fixed channels: v4 added materials at 13, v5 SH inputs, v6 height at 17.
-LAYOUTS = [(C, K_SH), (20, K_SH), (20, 0), (16, 0)]
-NEW_AT = {(20, K_SH): 17, (20, 0): None, (16, 0): 13}
+# Past (channels, SH inputs, hidden units) layouts, newest first, and what the next
+# one added: v4 materials at 13, v5 SH inputs, v6 height at 17, v8 nine hidden
+# channels at the end (with their SH inputs) and twice the hidden units.
+LAYOUTS = [(C, K_SH, HID), (21, 40, 24), (20, 40, 24), (20, 0, 24), (16, 0, 24)]
+NEW_AT = {(21, 40, 24): "widen", (20, 40, 24): 17, (20, 0, 24): "sh", (16, 0, 24): 13}
 
 
-def _step_up(w, c, k):
-    """Weights in layout (c, k) -> the next layout: new channels / SH inputs zero."""
+def _step_up(w, c, k, h):
+    """Weights in layout (c, k, h) -> the next layout: weights into and out of new
+    channels, SH inputs and hidden units zero."""
     p = 2 * c + N_CUE + k
-    W1 = w[:p * HID].reshape(p, HID)
-    b1, W2, b2 = w[p * HID:p * HID + HID], w[p * HID + HID:p * HID + HID + HID * c].reshape(HID, c), \
-        w[p * HID + HID + HID * c:]
-    o = NEW_AT[(c, k)]
+    W1 = w[:p * h].reshape(p, h)
+    b1, W2, b2 = w[p * h:p * h + h], w[p * h + h:p * h + h + h * c].reshape(h, c), w[p * h + h + h * c:]
+    o = NEW_AT[(c, k, h)]
+    if o == "widen":
+        # Channels and hidden units appended at the end; SH inputs are harmonic-major
+        # (harmonic, SH channel), so new channels' harmonics interleave.
+        c2, h2, n_sh = C, HID, k // N_SH
+        S, nb, cue, sh = W1[:c], W1[c:2 * c], W1[2 * c:2 * c + N_CUE], W1[2 * c + N_CUE:]
+        sh = np.pad(sh.reshape(N_SH, n_sh, h), ((0, 0), (0, len(SH_CH) - n_sh), (0, 0))).reshape(-1, h)
+        W1 = np.concatenate([np.pad(S, ((0, c2 - c), (0, 0))), np.pad(nb, ((0, c2 - c), (0, 0))), cue, sh])
+        W1 = np.pad(W1, ((0, 0), (0, h2 - h))) * math.sqrt(len(W1) / p)
+        W2 = np.pad(W2, ((0, h2 - h), (0, c2 - c))) * math.sqrt(h2 / h)
+        return np.concatenate([W1.ravel(), np.pad(b1, (0, h2 - h)), W2.ravel(), np.pad(b2, (0, c2 - c))]), c2, \
+            len(SH_CH) * N_SH, h2
     a = {13: 4, 17: 1}.get(o, 0)
     pad = lambda x, axis: np.insert(x, [o] * a, 0.0, axis=axis) if a else x
-    k2 = K_SH if o is None else k
+    # v5's SH inputs: growth, polarity and the three hidden channels of then.
+    k2 = 5 * N_SH if o == "sh" else k
     W1 = np.concatenate([pad(W1[:c], 0), pad(W1[c:2 * c], 0), W1[2 * c:2 * c + N_CUE], W1[2 * c + N_CUE:],
-                         np.zeros((k2 - k, HID))])
+                         np.zeros((k2 - k, h))])
     # NCA scales W1 by 1/sqrt(inputs); keep the effective weights.
     W1 = W1 * math.sqrt(len(W1) / p)
-    return np.concatenate([W1.ravel(), b1, pad(W2, 1).ravel(), pad(b2, 0)]), c + a, k2
+    return np.concatenate([W1.ravel(), b1, pad(W2, 1).ravel(), pad(b2, 0)]), c + a, k2, h
 
 
 def upgrade(g):
@@ -305,11 +319,11 @@ def upgrade(g):
     added: new genes off (0); weights into and out of new channels and from the
     SH inputs 0, so the old form grows, and renders, unchanged."""
     g = np.asarray(g, dtype=float)
-    c, k = next(ck for ck in LAYOUTS if 0 < len(g) - _n_w(*ck) <= D_PHYS)
-    d = len(g) - _n_w(c, k)
+    c, k, h = next(L for L in LAYOUTS if 0 < len(g) - _n_w(*L) <= D_PHYS)
+    d = len(g) - _n_w(c, k, h)
     w = g[d:]
-    while (c, k) != (C, K_SH):
-        w, c, k = _step_up(w, c, k)
+    while (c, k, h) != (C, K_SH, HID):
+        w, c, k, h = _step_up(w, c, k, h)
     return np.concatenate([g[:d], np.zeros(D_PHYS - d), w])
 
 

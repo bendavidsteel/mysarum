@@ -17,11 +17,18 @@ import numpy as np
 BG = "#0b0f14"
 GRID = "#1b2430"
 TRAIL = "#e8c547"
+FOOD = "#4fd6a0"
 CHUNK = 120  # frames per job
 
 
 class SwimmerView:
-    """One swimmer panel. The camera follows the body; the grid is fixed in the fluid."""
+    """One swimmer panel. The camera follows the body; the grid is fixed in the fluid.
+
+    Optional entries of sd: `view` (cx, cy, half width) fixes the camera; `coms`
+    is a list of centre-of-mass traces, one trail each, when the panel holds
+    several bodies; `source` (T, 3) is a nutrient source (x, y, range) per step,
+    drawn as a glow that fades out at its range.
+    """
 
     def __init__(self, ax, sd, every, label=None):
         from matplotlib.collections import LineCollection
@@ -33,7 +40,16 @@ class SwimmerView:
         self.edges = LineCollection([], zorder=2)
         ax.add_collection(self.grid)
         ax.add_collection(self.edges)
-        (self.trail,) = ax.plot([], [], color=TRAIL, lw=1.0, alpha=0.6, zorder=1)
+        self.trails = [ax.plot([], [], color=TRAIL, lw=1.0, alpha=0.6, zorder=1)[0]
+                       for _ in sd.get("coms", [None])]
+        if "source" in sd:
+            from matplotlib.colors import to_rgb
+            g = np.linspace(-1, 1, 256)
+            glow = np.zeros((256, 256, 4))
+            glow[..., :3] = to_rgb(FOOD)
+            glow[..., 3] = 0.45 * np.clip(1 - np.hypot(g[:, None], g[None]), 0, 1)
+            self.glow = ax.imshow(glow, extent=(-1, 1, -1, 1), zorder=0.5, interpolation="bilinear")
+            self.food = ax.scatter([0], [0], s=30, color=FOOD, edgecolors="white", linewidths=0.6, zorder=4)
         n = int(sd["active"].sum())
         self.nodes = ax.scatter(np.zeros(n), np.zeros(n), s=12, linewidths=0, zorder=3)
         if label:
@@ -45,6 +61,8 @@ class SwimmerView:
         sd, ax = self.sd, self.ax
         com, pos, extent, edges, active = sd["com"], sd["pos"], sd["extent"], sd["edges"], sd["active"]
         cx, cy = com[t]
+        if "view" in sd:
+            cx, cy, extent = sd["view"]
         ax.set_xlim(cx - extent, cx + extent)
         ax.set_ylim(cy - extent, cy + extent)
         gs = max(round(extent / 4), 1)
@@ -53,7 +71,12 @@ class SwimmerView:
         self.grid.set_segments(
             [((x, cy - extent), (x, cy + extent)) for x in xs]
             + [((cx - extent, y), (cx + extent, y)) for y in ys])
-        self.trail.set_data(com[:t + 1:self.every, 0], com[:t + 1:self.every, 1])
+        for trail, c in zip(self.trails, sd.get("coms", [com])):
+            trail.set_data(c[:t + 1:self.every, 0], c[:t + 1:self.every, 1])
+        if "source" in sd:
+            sx, sy, rng = sd["source"][t]
+            self.glow.set_extent((sx - rng, sx + rng, sy - rng, sy + rng))
+            self.food.set_offsets([(sx, sy)])
         # colour = CA channels 0-2 as RGB; edge width = muscle contraction
         p, rgb = pos[i], 0.25 + 0.75 * np.clip(sd["x"][i], 0, 1)
         a = sd["act"][i][edges[:, 0], edges[:, 1]]

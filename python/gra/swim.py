@@ -78,15 +78,29 @@ def relax(pos, nbrs, deg, active, dt=0.05, k=2.0, charge=0.3):
     d = pos[safe] - pos[:, None]
     dist = jnp.sqrt((d ** 2).sum(-1) + 1e-6)
     f = (k * valid * (dist - 1.0) / dist)[..., None] * d
-    f = f.sum(1)
-    diff = pos[:, None] - pos[None]
-    r2 = (diff ** 2).sum(-1)
-    pair = active[:, None] & active[None]
-    f = f + charge * ((pair / (1.0 + r2))[..., None] * diff).sum(1)
+    f = f.sum(1) + repulsion(pos, (active[:, None] & active[None]).astype(jnp.float32),
+                             active.astype(jnp.float32), charge)
     step = dt * f
     norm = jnp.sqrt((step ** 2).sum(-1, keepdims=True) + 1e-12)
     step = step * jnp.minimum(1.0, 0.2 / norm)
     return jnp.where(active[:, None], pos + step, pos)
+
+
+R_CUT = 8.0  # nodes further apart than this don't repel, so edge lengths don't grow with body size
+
+
+def repulsion(pos, pair, af, charge):
+    """Sum over pairs within R_CUT of charge * (p_i - p_j) * (1 - r_ij^2 / R_CUT^2)^2 / (1 + r_ij^2).
+
+    Written as two matrix products, never forming the (n, n, 2) offsets:
+    ~4x faster than the direct form on CPU. Positions are centred first so
+    |p|^2 stays small and r^2 = |p_i|^2 + |p_j|^2 - 2 p_i.p_j keeps its precision.
+    """
+    c = pos - (pos * af[:, None]).sum(0) / jnp.maximum(af.sum(), 1.0)
+    sq = (c ** 2).sum(-1)
+    r2 = jnp.maximum(sq[:, None] + sq[None] - 2.0 * c @ c.T, 0.0)
+    w = pair * jnp.maximum(1.0 - r2 / R_CUT ** 2, 0.0) ** 2 / (1.0 + r2)
+    return charge * (c * w.sum(1)[:, None] - w @ c)
 
 
 def place_new(pos, prev_active, state, key):
@@ -178,12 +192,8 @@ class Body(NamedTuple):
     gra: np.ndarray     # (N, 3) frozen GRA channel states
 
 
-def extract_body(pos, active, nbrs, deg, gra):
-    """Largest connected component, mutual edges only, reindexed from 0.
-
-    Edges must be mutual or spring forces don't cancel and the body can push
-    itself along through its own bookkeeping.
-    """
+def body_component(active, nbrs, deg):
+    """Node ids of the largest connected component over mutual edges, and the graph."""
     import networkx as nx
     g = nx.Graph()
     idx = np.nonzero(active)[0]
@@ -193,8 +203,19 @@ def extract_body(pos, active, nbrs, deg, gra):
             if j >= 0 and j != i and active[j] and i in nbrs[j, :deg[j]]:
                 g.add_edge(int(i), int(j))
     if g.number_of_nodes() == 0:
+        return None, g
+    return sorted(max(nx.connected_components(g), key=len)), g
+
+
+def extract_body(pos, active, nbrs, deg, gra):
+    """Largest connected component, mutual edges only, reindexed from 0.
+
+    Edges must be mutual or spring forces don't cancel and the body can push
+    itself along through its own bookkeeping.
+    """
+    comp, g = body_component(active, nbrs, deg)
+    if comp is None:
         return None
-    comp = sorted(max(nx.connected_components(g), key=len))
     remap = {old: new for new, old in enumerate(comp)}
     n = len(comp)
     b_nbrs = np.full((N, D), -1, np.int32)
@@ -230,9 +251,13 @@ def run_bucketed(fn, bodies, *args):
         lo = size
         if len(idx) == 0:
             continue
-        sub = Body(*(jnp.asarray(x[idx][:, :size]) for x in bodies))
-        sub_args = jax.tree.map(lambda x: jnp.asarray(x)[idx], args)
-        res = jax.device_get(_batched_cache(fn)(sub, *sub_args))
+        m = len(idx)
+        # round the batch up to a coarse grid of sizes so varying counts reuse compiles
+        q = max(2 ** max(int(np.log2(m)) - 2, 0), jax.local_device_count() if ON_CPU else 1)
+        pidx = np.concatenate([idx, np.repeat(idx[-1:], -m % q)])
+        sub = Body(*(jnp.asarray(x[pidx][:, :size]) for x in bodies))
+        sub_args = jax.tree.map(lambda x: jnp.asarray(x)[pidx], args)
+        res = jax.tree.map(lambda r: r[:m], jax.device_get(_batched_cache(fn)(sub, *sub_args)))
         if out is None:
             out = jax.tree.map(lambda r: np.zeros((len(n),) + r.shape[1:], r.dtype), res)
         jax.tree.map(lambda o, r: o.__setitem__(idx, r), out, res)
@@ -337,6 +362,8 @@ class Genome(NamedTuple):
     r0: jnp.ndarray      # ()
     amp: jnp.ndarray     # ()     max fractional change of rest length
     P: jnp.ndarray = None  # (K, 2) node position along / across the body axis -> bias
+    S: jnp.ndarray = None  # (K,)   mean stretch of the node's edges -> bias
+    C: jnp.ndarray = None  # (K,)   nutrient concentration at the node -> bias (only when there is a source)
 
 
 def sample_genome(key, k_channels=K):
@@ -353,23 +380,28 @@ def sample_genome(key, k_channels=K):
         r0=u(k[6], (), -1.0, 1.0),
         amp=u(k[7], (), 0.1, 0.4),
         P=u(k[8], (c, 2), -3.0, 3.0),
+        S=u(jax.random.fold_in(key, 9), (c,), -3.0, 3.0),
     )
 
 
-def upgrade_genome(g, k_channels=K):
-    """Pad a genome to k_channels and add a zero position input (P), as numpy.
+def upgrade_genome(g, k_channels=K, chem=False):
+    """Pad a genome to k_channels and add zero position (P) and stretch (S) inputs, as numpy.
 
-    The new channels have no coupling and no readout and P is zero, so the
-    muscles behave as before apart from the random initial CA state.
+    The new channels have no coupling and no readout and P and S are zero, so
+    the muscles behave as before apart from the random initial CA state.
+    chem also adds a zero nutrient input (C).
     """
     g = jax.tree.map(np.asarray, g)
     k0 = g.b.shape[0]
     pad = k_channels - k0
     p1 = lambda v: np.pad(v, (0, pad))
     P = np.zeros((k0, 2), np.float32) if g.P is None else g.P
+    S = np.zeros(k0, np.float32) if g.S is None else g.S
+    C = np.zeros(k0, np.float32) if g.C is None and chem else g.C
     return Genome(A=np.pad(g.A, ((0, pad), (0, pad))), a_self=p1(g.a_self),
                   U=np.pad(g.U, ((0, pad), (0, 0))), b=p1(g.b), log_tau=p1(g.log_tau),
-                  r=p1(g.r), r0=g.r0, amp=g.amp, P=np.pad(P, ((0, pad), (0, 0))))
+                  r=p1(g.r), r0=g.r0, amp=g.amp, P=np.pad(P, ((0, pad), (0, 0))), S=p1(S),
+                  C=None if C is None else p1(C))
 
 
 def mutate_genome(g, key, scale=0.15):
@@ -387,6 +419,16 @@ C_INT = 1.0      # internal damping along springs
 # growth forces scaled up together, so the grown shape stays the rest shape
 CHARGE = K_SPRING * 0.3 / 2.0
 C_T, C_N, C_Q = 0.1, 1.0, 1.0  # tangential, normal linear, normal quadratic drag
+SENSE = 4.0      # gain on edge stretch (fractional) before it enters the CA
+# A muscle's stroke is a fraction of its edge's settled length, so big bodies
+# strain as much as small ones. False: a fraction of the unit rest length.
+STROKE_BY_LENGTH = True
+
+
+def set_legacy():
+    """The physics before stretch-scaled muscles and the repulsion cutoff, for older result files."""
+    global R_CUT, STROKE_BY_LENGTH
+    R_CUT, STROKE_BY_LENGTH = np.inf, False
 
 
 def set_drag(drag):
@@ -409,7 +451,14 @@ def body_axes(rest, af):
     return proj / (jnp.abs(proj).max(0) + 1e-6)
 
 
-def swim(body, g, key, steps, record_every=0, drag=None, truncate_at=None):
+def nutrient(pos, source):
+    """Concentration at each position for a source (x, y, range): 1 at the source, falling
+    linearly to 0 at `range`."""
+    r = jnp.sqrt(((pos - source[:2]) ** 2).sum(-1) + 1e-6)
+    return jnp.maximum(1.0 - r / source[2], 0.0)
+
+
+def swim(body, g, key, steps, record_every=0, drag=None, truncate_at=None, gait_bins=0, source=None):
     """Integrate the muscle CA + mass-spring body.
 
     Returns (trace, recordings, final pos); trace is (steps, 3) of centre of
@@ -418,67 +467,94 @@ def swim(body, g, key, steps, record_every=0, drag=None, truncate_at=None):
 
     Every node runs the same rate rule. Channels only mix across edges, so a
     lone node relaxes to a fixed point and any rhythm needs a loop through
-    neighbours. drag (CT, CN, CQ) defaults to the module fluid; passing it lets
+    neighbours or through the body: each node senses the mean stretch of its
+    edges (Genome.S), and with a nutrient `source` (x, y, range) the concentration
+    where it is (Genome.C). drag (CT, CN, CQ) defaults to the module fluid; passing it lets
     one batch mix fluids. truncate_at cuts gradients through the state at that
-    step (truncated backprop through time).
+    step (truncated backprop through time). gait_bins > 0 appends to the trace
+    the mean muscle drive in that many bins along the body's long axis.
     """
-    c_t, c_n, c_q = (C_T, C_N, C_Q) if drag is None else drag
-    active = body.active
-    af = active.astype(jnp.float32)
-    safe, valid = _gather(body.nbrs, body.deg, active)
-    vf = valid.astype(jnp.float32)
-    L0 = 1.0
-    bias = body.gra @ g.U.T + g.b + body_axes(body.pos, af) @ g.P.T  # (N, K)
-    tau = jnp.exp(g.log_tau)
-    deg = jnp.maximum(vf.sum(1), 1.0)
-    pair = (active[:, None] & active[None]).astype(jnp.float32)
-
-    def repulsion(p):
-        diff = p[:, None] - p[None]
-        return CHARGE * ((pair / (1.0 + (diff ** 2).sum(-1)))[..., None] * diff).sum(1)
-
+    drag = jnp.asarray((C_T, C_N, C_Q)) if drag is None else drag
+    prep = swim_prep(body, g, source)
+    af = prep["af"]
+    rest0 = jnp.asarray(body.pos) * af[:, None]
+    if gait_bins:
+        ax = body_axes(body.pos, af)[:, 0]
+        hot = jax.nn.one_hot(jnp.clip(((ax + 1) / 2 * gait_bins).astype(jnp.int32), 0, gait_bins - 1),
+                             gait_bins) * af[:, None]
+        hot = hot / jnp.maximum(hot.sum(0), 1.0)
 
     def step(carry, t):
         if truncate_at is not None:
             carry = jax.tree.map(
                 lambda c: jnp.where(t == truncate_at, jax.lax.stop_gradient(c), c), carry)
-        pos, vel, x = carry
-        nb = (x[safe] * vf[..., None]).sum(1) / deg[:, None]
-        h = nb @ g.A.T + g.a_self * x + bias
-        x = x + DT * (-x + jax.nn.sigmoid(h)) / tau
-        m = jnp.tanh(4.0 * (x - 0.5) @ g.r + g.r0)
-        act = 0.5 * (m[:, None] + m[safe])
-        rest = L0 * (1.0 + g.amp * act)
-
-        d = pos[safe] - pos[:, None]
-        dist = jnp.sqrt((d ** 2).sum(-1) + 1e-6)
-        u = d / dist[..., None]
-        dv = vel[safe] - vel[:, None]
-        f_mag = K_SPRING * (dist - rest) + C_INT * (dv * u).sum(-1)
-        f = ((vf * f_mag)[..., None] * u).sum(1) + repulsion(pos)
-
-        # resistive drag on each node from its incident edge segments
-        vt = (vel[:, None] * u).sum(-1, keepdims=True) * u
-        vn = vel[:, None] - vt
-        vn_mag = jnp.sqrt((vn ** 2).sum(-1, keepdims=True) + 1e-9)
-        drag = -(0.5 * dist * vf)[..., None] * (c_t * vt + c_n * vn + c_q * vn_mag * vn)
-        f = f + drag.sum(1)
-
-        vel = (vel + DT * f) * af[:, None]
-        pos = pos + DT * vel
+        pos, vel, x, act = swim_step(prep, g, drag, *carry)
         com = (pos * af[:, None]).sum(0) / af.sum()
         rel = (pos - com) * af[:, None]
         theta = jnp.arctan2((rest0[:, 0] * rel[:, 1] - rest0[:, 1] * rel[:, 0]).sum(),
                             (rest0 * rel).sum())
         rec = (pos, x[:, :3], act) if record_every else None
-        return (pos, vel, x), (jnp.concatenate([com, theta[None]]), rec)
+        out = [com, theta[None]]
+        if gait_bins:
+            out.append(((act * prep["vf"]).sum(1) / prep["deg"]) @ hot)
+        return (pos, vel, x), (jnp.concatenate(out), rec)
 
-    n = body.pos.shape[0]
-    rest0 = jnp.asarray(body.pos) * af[:, None]
-    x0 = jax.random.uniform(key, (N, g.b.shape[-1]))[:n]  # same init whatever the buffer size
-    init = (jnp.asarray(body.pos), jnp.zeros((n, 2)), x0)
-    (pos, _, _), (com, rec) = jax.lax.scan(step, init, jnp.arange(steps))
+    (pos, _, _), (com, rec) = jax.lax.scan(step, swim_init(body, g, key), jnp.arange(steps))
     return com, rec, pos
+
+
+def swim_init(body, g, key):
+    """(pos, vel, CA state) at rest; the CA draw is the same whatever the buffer size."""
+    n = body.pos.shape[0]
+    x0 = jax.random.uniform(key, (N, g.b.shape[-1]))[:n]
+    return jnp.asarray(body.pos), jnp.zeros((n, 2)), x0
+
+
+def swim_prep(body, g, source=None):
+    """Per-body constants of the swim step."""
+    active = body.active
+    af = active.astype(jnp.float32)
+    safe, valid = _gather(body.nbrs, body.deg, active)
+    vf = valid.astype(jnp.float32)
+    rest = jnp.asarray(body.pos)
+    return dict(af=af, safe=safe, vf=vf, deg=jnp.maximum(vf.sum(1), 1.0),
+                pair=(active[:, None] & active[None]).astype(jnp.float32),
+                len0=jnp.sqrt(((rest[safe] - rest[:, None]) ** 2).sum(-1) + 1e-6),  # settled edge lengths
+                sense=SENSE * (0.0 if g.S is None else g.S), source=source,
+                bias=body.gra @ g.U.T + g.b + body_axes(body.pos, af) @ g.P.T)  # (N, K)
+
+
+def swim_step(prep, g, drag, pos, vel, x, f_ext=0.0):
+    """One step of the muscle CA and the mass-spring body; f_ext is an extra per-node force."""
+    c_t, c_n, c_q = drag
+    af, safe, vf, deg, len0 = prep["af"], prep["safe"], prep["vf"], prep["deg"], prep["len0"]
+    d = pos[safe] - pos[:, None]
+    dist = jnp.sqrt((d ** 2).sum(-1) + 1e-6)
+    u = d / dist[..., None]
+
+    stretch = (vf * (dist / len0 - 1.0)).sum(1) / deg
+    nb = (x[safe] * vf[..., None]).sum(1) / deg[:, None]
+    h = nb @ g.A.T + g.a_self * x + prep["bias"] + stretch[:, None] * prep["sense"]
+    if prep["source"] is not None:
+        h = h + nutrient(pos, prep["source"])[:, None] * g.C
+    x = x + DT * (-x + jax.nn.sigmoid(h)) / jnp.exp(g.log_tau)
+    m = jnp.tanh(4.0 * (x - 0.5) @ g.r + g.r0)
+    act = 0.5 * (m[:, None] + m[safe])
+    rest = 1.0 + g.amp * act * (len0 if STROKE_BY_LENGTH else 1.0)
+
+    dv = vel[safe] - vel[:, None]
+    f_mag = K_SPRING * (dist - rest) + C_INT * (dv * u).sum(-1)
+    f = ((vf * f_mag)[..., None] * u).sum(1)
+    f = f + repulsion(pos, prep["pair"], af, CHARGE)
+
+    # resistive drag on each node from its incident edge segments
+    vt = (vel[:, None] * u).sum(-1, keepdims=True) * u
+    vn = vel[:, None] - vt
+    vn_mag = jnp.sqrt((vn ** 2).sum(-1, keepdims=True) + 1e-9)
+    f = f - ((0.5 * dist * vf)[..., None] * (c_t * vt + c_n * vn + c_q * vn_mag * vn)).sum(1)
+
+    vel = (vel + DT * (f + f_ext)) * af[:, None]
+    return pos + DT * vel, vel, x, act
 
 
 def swim_score(com):
@@ -716,6 +792,8 @@ def common_args():
     ap.add_argument("--drag", type=float, nargs=3, default=(C_T, C_N, C_Q),
                     metavar=("CT", "CN", "CQ"),
                     help="tangential, normal linear, normal quadratic drag")
+    ap.add_argument("--legacy", action="store_true",
+                    help="physics of result files made before stretch-scaled muscles and the repulsion cutoff")
     return ap
 
 
@@ -723,6 +801,8 @@ def configure(args):
     global OUT
     OUT = args.out_dir
     set_drag(args.drag)
+    if args.legacy:
+        set_legacy()
     print(f"backend {jax.default_backend()} ({jax.local_device_count()} devices)", flush=True)
 
 

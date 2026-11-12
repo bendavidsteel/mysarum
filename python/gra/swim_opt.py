@@ -29,17 +29,20 @@ from swim_qd import describe
 K8 = 8
 ARMS = ("base", "pos", "pos8")
 # rough per-field step sizes, so CMA-ES works in a roughly isotropic space
-SCALE = dict(A=4.0, a_self=2.0, U=2.0, b=2.0, log_tau=0.5, r=0.3, r0=0.3, amp=0.1, P=1.0)
+SCALE = dict(A=4.0, a_self=2.0, U=2.0, b=2.0, log_tau=0.5, r=0.3, r0=0.3, amp=0.1, P=1.0, S=1.0, C=4.0)
 
 
 def _flatten(g):
-    return np.concatenate([np.ravel(getattr(g, f)) for f in sw.Genome._fields])
+    """Flat vector of the fields the genome has (a missing input, like C, is None)."""
+    return np.concatenate([np.ravel(v) for v in g if v is not None])
 
 
 def _layout(g):
     """Per-field shapes and offsets of the flat vector."""
     out, i = {}, 0
     for f in sw.Genome._fields:
+        if getattr(g, f) is None:
+            continue
         shape = np.shape(getattr(g, f))
         size = int(np.prod(shape))
         out[f] = (i, i + size, shape)
@@ -65,7 +68,7 @@ def free_mask(layout, arm, k0=4):
         if arm == "base" and f == "P":
             mf[:] = False
         m[f] = mf.ravel()
-    return np.concatenate([m[f] for f in sw.Genome._fields])
+    return np.concatenate([m[f] for f in layout])
 
 
 def scale_vector(layout):
@@ -118,9 +121,13 @@ def clip(g):
     return g._replace(log_tau=jnp.clip(g.log_tau, -1.5, 1.5), amp=jnp.clip(g.amp, 0.02, 0.45))
 
 
-def make_eval(steps):
+def make_eval(steps, scaled=False):
+    """scaled: swim longer on bigger size buckets, as swim_coevo does."""
+    from swim_coevo import STEP_SCALE
+
     def fn(body, genome, key, drag):
-        trace, _, pos = sw.swim(body, clip(genome), key, steps, drag=drag)
+        n_steps = int(steps * STEP_SCALE[body.pos.shape[0]]) if scaled else steps
+        trace, _, pos = sw.swim(body, clip(genome), key, n_steps, drag=drag)
         rel0 = body.pos * body.active[:, None]
         extent0 = jnp.sqrt((rel0 ** 2).sum(-1)).max()
         speed, straight, _, ok = describe(trace, pos, body.active, extent0)
@@ -147,8 +154,32 @@ def load_seeds(fluids, per_fluid):
     return seeds
 
 
+def load_coevo_seeds(tag, sizes, per_size):
+    """Per swim_coevo size class: the most elongated bodies, plus the fastest body as a control.
+    Each starts from the best controller found on it."""
+    import swim_coevo as sc
+    with open(sw.OUT / f"coevo_{tag}.pkl", "rb") as f:
+        res = pickle.load(f)
+    best_on = {}
+    for c, e in res["archive"].items():
+        if e["body"] not in best_on or best_on[e["body"]][1]["speed"] < e["speed"]:
+            best_on[e["body"]] = (c, e)
+    seeds = []
+    for k in sizes:
+        mine = [(c, e) for c, e in best_on.values() if c[0] == k]
+        pick = sorted(mine, key=lambda ce: -ce[1]["aspect"])[:per_size]
+        fastest = max(mine, key=lambda ce: ce[1]["speed"])
+        pick += [fastest] if fastest not in pick else []
+        for c, e in pick:
+            rec = res["bodies"][e["body"]]
+            seeds.append(dict(fluid=f"a{e['aspect']:.1f}", drag=res["drag"], grower=rec, n=rec["n"], key=e["key"],
+                              genome=e["genome"], qd_speed=e["speed"], length=e["length"]))
+    return seeds
+
+
 def run_search(args):
-    seeds = load_seeds(args.fluids, args.per_fluid)
+    seeds = load_coevo_seeds(args.coevo, args.sizes, args.per_size) if args.coevo \
+        else load_seeds(args.fluids, args.per_fluid)
     layout = _layout(seeds[0]["genome"])
     scale = scale_vector(layout)
     probs = [dict(seed=s, arm=a, x0=_flatten(s["genome"]), mask=free_mask(layout, a))
@@ -162,7 +193,7 @@ def run_search(args):
 
     bodies = sw.stack_bodies([p["seed"]["grower"]["body"] for p in probs for _ in range(L)])
     drags = np.repeat(np.array([p["seed"]["drag"] for p in probs], np.float32), L, 0)
-    evaluate = make_eval(args.steps)
+    evaluate = make_eval(args.steps, scaled=bool(args.coevo))
     key = jax.random.PRNGKey(args.seed)
     t0 = time.time()
     for gen in range(args.gens):
@@ -215,8 +246,10 @@ def final_eval(args, probs, layout, evaluate, n_keys=8):
         p["seed_speed"], p["opt_speed"] = float(sp[0].mean()), float(sp[1].mean())
         p["opt_speed_min"], p["opt_straight"] = float(sp[1].min()), float(st[1].mean())
         s = p["seed"]
+        bl = f"  BL/1000 {p['seed_speed'] / s['length']:.3f} -> {p['opt_speed'] / s['length']:.3f}" \
+            if "length" in s else ""
         print(f"{s['fluid']:12s} {s['n']:4d} {p['arm']:5s} {p['seed_speed']:6.2f} {p['opt_speed']:6.2f} "
-              f"{p['opt_speed'] / max(p['seed_speed'], 1e-3):5.1f}  {p['opt_straight']:.2f}")
+              f"{p['opt_speed'] / max(p['seed_speed'], 1e-3):5.1f}  {p['opt_straight']:.2f}{bl}")
     for a in args.arms:
         ps = [p for p in probs if p["arm"] == a]
         print(f"arm {a:5s}  mean seed {np.mean([p['seed_speed'] for p in ps]):5.2f}  "
@@ -265,6 +298,9 @@ def main():
     s = sub.add_parser("search", parents=[common])
     s.add_argument("--fluids", nargs="+", default=["water_sized", "stokes", "isotropic", "eel"])
     s.add_argument("--per-fluid", type=int, default=2)
+    s.add_argument("--coevo", default=None, help="swim_coevo tag: optimise its elongated bodies instead")
+    s.add_argument("--sizes", type=int, nargs="+", default=[3, 4], help="swim_coevo size classes")
+    s.add_argument("--per-size", type=int, default=3)
     s.add_argument("--arms", nargs="+", default=list(ARMS), choices=ARMS)
     s.add_argument("--gens", type=int, default=150)
     s.add_argument("--lam", type=int, default=24)

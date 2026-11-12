@@ -6,6 +6,7 @@ requires-python = ">=3.11,<3.14"
 dependencies = [
     "jax[cuda12]",
     "numpy",
+    "numba",
     "matplotlib",
     "networkx",
     "hydra-core",

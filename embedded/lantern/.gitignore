@@ -1,3 +1,4 @@
 /.pio
 /mapping/view_*
 __pycache__/
+/sim/build
